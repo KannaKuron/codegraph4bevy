@@ -182,7 +182,7 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 | Python | Django ORM | QuerySet → SQL compiler | R | ✅ |
 | Python | Django / DRF (views) | url → view → model | R + X | ✅ url→view (`path`/`url`/`as_view`) + **DRF `router.register`→ViewSet** (realworld S / wagtail M / saleor L); ORM QuerySet→SQL (prior work). 🔬 signals (`post_save`→receiver), DRF viewset CRUD actions (inherited), saleor GraphQL resolvers |
 | Python | Flask / FastAPI | request → route → dependency | R | 🔬 (routes done) |
-| Go | Gin / net/http | request → handler chain | ? | ⬜ |
+| Go | Gin / chi / net-http | request → route → handler → service | X | ✅ **routes on ANY group var** (`v1.GET`, `PublicGroup.GET`) not just `r/router` (gin-vue-admin S→M 4→259 / realworld S / gitness L) — was missing all group-routed apps; named handlers resolve precisely. 🔬 inline `func(c){}` handlers (anonymous, body lost), gitness chi custom (26/321) |
 | Rust | Axum / Cargo workspace | request → handler; trait dispatch | R | 🔬 (workspaces done) |
 | Java | Spring | request → @RestController → @Autowired service → repo | R + X | ✅ **bare `@GetMapping`/`@PostMapping` + class `@RequestMapping` prefix join → route→method** (realworld S / mall M / halo L) — was missing all path-less method mappings; DI controller→service resolves (name + dir). 🔬 Spring Data JPA derived queries (`findByEmail`) — metaprogramming frontier |
 | Kotlin | (coroutines / DI) | flow/callback dispatch | ? | ⬜ |
@@ -302,6 +302,16 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
   51–60s** vs without **4–6 / 3–5 / 60–74s**. No node explosion. Residuals: firefly resolves only 3/568
   (its fluent `->uses()` / `['uses'=>...]` handler format isn't parsed); Eloquent dynamic finders
   (metaprogramming frontier).
+- **Gin / chi (validated 2026-05-23, realworld S / gin-vue-admin M / gitness L) — group-var routing fix.**
+  The route regex matched only `(router|r|mux|app|e).METHOD(...)`, but real apps route on GROUP vars
+  (`v1.GET`, `PublicGroup.GET`, `userRouter.POST`), so group-routed apps connected almost nothing
+  (gin-vue-admin: **4 routes for 625 files**). Fix (`frameworks/go.ts`): broaden the receiver to ANY
+  identifier — the verb + string-path + handler-arg gates keep it route-specific (`http.Get(url)` has no
+  handler arg → excluded). gin-vue-admin **4→259** routes (257 resolve precisely: `POST createInfo →
+  CreateInfo`); realworld stable (no regression); no garbage. **Agent A/B (create-user flow): codegraph
+  0 reads / 0 grep / 26–30s vs without 3 / 3 / 52–53s — cleanest backend win yet (0/0, 2× faster).**
+  Residuals: inline `func(c *gin.Context){}` handlers (anonymous, body lost — like Express before its fix);
+  gitness's chi custom handlers (26/321).
 - **Difficulty gradient is real:** named-ref dispatch (resolver) is cheap; anonymous
   callback dispatch (synthesizer) is medium; **anonymous-arrow handlers are the hard
   remaining gap** (no identity → need synthesizer link-through-body, not yet built).
