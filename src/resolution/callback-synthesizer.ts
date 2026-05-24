@@ -531,9 +531,10 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
 // .run_if(resource_exists::<X>()), synthesize a calls edge A→B so trace
 // can follow the dataflow through the ECS command queue.
 // Group 1 = turbofish type (commands.insert_resource::<Type>(...)),
-// group 2 = constructor arg (commands.insert_resource(MyRes{...})).
-const INSERT_RESOURCE_RE = /commands\.insert_resource\s*(?:::\s*<([^>]+)>\s*)?\(\s*(\w+)\s*\)/g;
-const RESOURCE_EXISTS_RE = /run_if\s*\(\s*resource_exists\s*::\s*<\s*([\w:<>, ]+)\s*>\s*\)/g;
+// group 2 = constructor arg (base type, stops before ::Variant).
+// Uses Unicode-aware [\p{L}\p{N}_] so CJK type names (e.g. 设置界面_确认保存_触发信号_资源) match.
+const INSERT_RESOURCE_RE = /commands\s*\.\s*insert_resource\s*(?:::\s*<([\p{L}\p{N}_<>,: >]+)>\s*)?\(\s*([\p{L}\p{N}_]+)(?:::[\p{L}\p{N}_]+(?:\([^)]*\))?)*\s*[;{)]/gu;
+const RESOURCE_EXISTS_RE = /run_if\s*\(\s*resource_exists\s*::\s*<\s*([\p{L}\p{N}_<>,: >]+)\s*>\s*\)/gu;
 
 function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
@@ -557,7 +558,7 @@ function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
     let m: RegExpExecArray | null;
     while ((m = INSERT_RESOURCE_RE.exec(content))) {
       // Prefer turbofish type (group 1), fall back to constructor arg (group 2)
-      const typeName = (m[1] || m[2])!;
+      const typeName = (m[1] || m[2])!.trim();
       const line = content.substring(0, m.index).split('\n').length;
       for (const fn of fns) {
         if (fn.startLine <= line && fn.endLine >= line) {
@@ -570,7 +571,7 @@ function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
 
     RESOURCE_EXISTS_RE.lastIndex = 0;
     while ((m = RESOURCE_EXISTS_RE.exec(content))) {
-      const typeName = m[1]!;
+      const typeName = m[1]!.trim();
       const line = content.substring(0, m.index).split('\n').length;
       for (const fn of fns) {
         if (fn.startLine <= line && fn.endLine >= line) {

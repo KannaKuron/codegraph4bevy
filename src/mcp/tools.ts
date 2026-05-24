@@ -268,6 +268,7 @@ export interface ToolDefinition {
     type: 'object';
     properties: Record<string, PropertySchema>;
     required?: string[];
+    anyOf?: Array<{ required: string[] }>;
   };
 }
 
@@ -380,6 +381,11 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: 'Name of the function, method, or class to find callers for',
         },
+        symbols: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Batch query: multiple symbol names to find callers for. Results grouped by symbol. Use instead of calling codegraph_callers N times. When both "symbol" and "symbols" are provided, "symbols" takes precedence.',
+        },
         limit: {
           type: 'number',
           description: 'Maximum number of callers to return (default: 20)',
@@ -387,7 +393,11 @@ export const tools: ToolDefinition[] = [
         },
         projectPath: projectPathProperty,
       },
-      required: ['symbol'],
+      required: [],
+      anyOf: [
+        { required: ['symbol'] },
+        { required: ['symbols'] },
+      ],
     },
   },
   {
@@ -440,6 +450,11 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: 'Name of the symbol to get details for',
         },
+        symbols: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Batch query: multiple symbol names to get details for. Results grouped by symbol. Use instead of calling codegraph_node N times. When both "symbol" and "symbols" are provided, "symbols" takes precedence.',
+        },
         includeCode: {
           type: 'boolean',
           description: 'Include full source code (default: false to minimize context)',
@@ -447,7 +462,11 @@ export const tools: ToolDefinition[] = [
         },
         projectPath: projectPathProperty,
       },
-      required: ['symbol'],
+      required: [],
+      anyOf: [
+        { required: ['symbol'] },
+        { required: ['symbols'] },
+      ],
     },
   },
   {
@@ -544,7 +563,7 @@ export const tools: ToolDefinition[] = [
         },
         symbols: {
           type: 'array',
-          description: 'Batch query: multiple symbol names to find usages for. Results grouped by symbol. Use instead of calling codegraph_usages N times.',
+          description: 'Batch query: multiple symbol names to find usages for. Results grouped by symbol. Use instead of calling codegraph_usages N times. When both "symbol" and "symbols" are provided, "symbols" takes precedence.',
           items: { type: 'string' },
         },
         kind: {
@@ -560,6 +579,10 @@ export const tools: ToolDefinition[] = [
         projectPath: projectPathProperty,
       },
       required: [],
+      anyOf: [
+        { required: ['symbol'] },
+        { required: ['symbols'] },
+      ],
     },
   },
   {
@@ -1026,11 +1049,23 @@ export class ToolHandler {
    * Handle codegraph_callers
    */
   private async handleCallers(args: Record<string, unknown>): Promise<ToolResult> {
+    const limit = clamp((args.limit as number) || 20, 1, 100);
+
+    // Batch mode: symbols array — check BEFORE getCodeGraph (args check needs no DB)
+    const symbolsArr = args.symbols as string[] | undefined;
+    if (symbolsArr && Array.isArray(symbolsArr) && symbolsArr.length > 0) {
+      const cg = this.getCodeGraph(args.projectPath as string | undefined);
+      return this.handleBatchCallers(cg, symbolsArr, limit);
+    }
+
+    if (args.symbols !== undefined && !Array.isArray(args.symbols)) {
+      return this.errorResult('symbols must be an array of strings, e.g. symbols: ["X","Y","Z"]');
+    }
+
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
-    const limit = clamp((args.limit as number) || 20, 1, 100);
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
@@ -1080,6 +1115,68 @@ export class ToolHandler {
 
     lines.push(allMatches.note);
     return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  /**
+   * Handle batch codegraph_callers — multiple symbols in one call
+   */
+  private handleBatchCallers(cg: CodeGraph, symbols: string[], limit: number): ToolResult {
+    const batchLimit = Math.min(symbols.length, 20);
+    const allLines: string[] = [`## Batch Callers (${batchLimit} symbols)`, ''];
+    const fileCache = new Map<string, string[]>();
+    let totalCallers = 0;
+
+    for (const symbol of symbols.slice(0, batchLimit)) {
+      const valid = this.validateString(symbol, 'symbols');
+      if (typeof valid !== 'string') {
+        allLines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
+        allLines.push('');
+        continue;
+      }
+      const allMatches = this.findAllSymbols(cg, valid);
+      if (allMatches.nodes.length === 0) {
+        allLines.push(`### ${valid}: not found`);
+        allLines.push('');
+        continue;
+      }
+
+      const callSites: Array<{ caller: Node; edge: Edge }> = [];
+      const seen = new Set<string>();
+      for (const node of allMatches.nodes) {
+        for (const c of cg.getCallers(node.id)) {
+          const key = `${c.node.id}:${c.edge.line ?? c.node.startLine}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            callSites.push({ caller: c.node, edge: c.edge });
+          }
+        }
+      }
+
+      const perLimit = Math.max(3, Math.ceil(limit / batchLimit));
+      const shown = callSites.slice(0, perLimit);
+      allLines.push(`### ${valid} (${shown.length} shown, ${callSites.length} total)`);
+      allLines.push('');
+      for (const cs of shown) {
+        const defLine = cs.caller.startLine ? `:${cs.caller.startLine}` : '';
+        const callLine = cs.edge.line ?? cs.caller.startLine;
+        const fileRef = `${cs.caller.filePath}:${callLine}`;
+        const snippet = this.sourceLineAt(cg, fileRef, fileCache);
+        allLines.push(`- **${cs.caller.name}** (${cs.caller.kind})`);
+        allLines.push(`  def: ${cs.caller.filePath}${defLine}`);
+        allLines.push(`  call: ${cs.caller.filePath}:${callLine}${snippet ? ` — \`${snippet}\`` : ''}`);
+        allLines.push('');
+      }
+      if (callSites.length > perLimit) {
+        allLines.push(`... and ${callSites.length - perLimit} more callers`);
+        allLines.push('');
+      }
+      if (allMatches.note) allLines.push(allMatches.note);
+      totalCallers += callSites.length;
+    }
+
+    allLines.push('---');
+    allLines.push(`Total: ${totalCallers} callers across ${batchLimit} symbols`);
+    return this.textResult(this.truncateOutput(allLines.join('\n')));
   }
 
   /**
@@ -1192,18 +1289,24 @@ export class ToolHandler {
    * (calls, references, type_of, instantiates, etc.), grouped by file.
    */
   private async handleUsages(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const kindFilter = args.kind as string | undefined;
 
-    // Batch mode: symbols array — check BEFORE validating single symbol
+    // Batch mode: symbols array — check BEFORE getCodeGraph (args check needs no DB)
     const symbolsArr = args.symbols as string[] | undefined;
     if (symbolsArr && Array.isArray(symbolsArr) && symbolsArr.length > 0) {
+      const cg = this.getCodeGraph(args.projectPath as string | undefined);
       return this.handleBatchUsages(cg, symbolsArr, limit, kindFilter);
+    }
+
+    if (args.symbols !== undefined && !Array.isArray(args.symbols)) {
+      return this.errorResult('symbols must be an array of strings, e.g. symbols: ["X","Y","Z"]');
     }
 
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
@@ -2255,12 +2358,23 @@ export class ToolHandler {
    * Handle codegraph_node
    */
   private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
+    const includeCode = args.includeCode === true;
+
+    // Batch mode: symbols array — check BEFORE getCodeGraph (args check needs no DB)
+    const symbolsArr = args.symbols as string[] | undefined;
+    if (symbolsArr && Array.isArray(symbolsArr) && symbolsArr.length > 0) {
+      const cg = this.getCodeGraph(args.projectPath as string | undefined);
+      return this.handleBatchNode(cg, symbolsArr, includeCode);
+    }
+
+    if (args.symbols !== undefined && !Array.isArray(args.symbols)) {
+      return this.errorResult('symbols must be an array of strings, e.g. symbols: ["X","Y","Z"]');
+    }
+
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
-    // Default to false to minimize context usage
-    const includeCode = args.includeCode === true;
 
     const match = this.findSymbol(cg, symbol);
     if (!match) {
@@ -2288,6 +2402,49 @@ export class ToolHandler {
     const trail = this.formatTrail(cg, match.node);
     const formatted = this.formatNodeDetails(match.node, code, outline) + trail + match.note;
     return this.textResult(this.truncateOutput(formatted));
+  }
+
+  /**
+   * Handle batch codegraph_node — multiple symbols in one call
+   */
+  private async handleBatchNode(cg: CodeGraph, symbols: string[], includeCode: boolean): Promise<ToolResult> {
+    const batchLimit = Math.min(symbols.length, 20);
+    const allLines: string[] = [`## Batch Node Details (${batchLimit} symbols)`, ''];
+
+    for (const symbol of symbols.slice(0, batchLimit)) {
+      const valid = this.validateString(symbol, 'symbols');
+      if (typeof valid !== 'string') {
+        allLines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
+        allLines.push('');
+        continue;
+      }
+      const match = this.findSymbol(cg, valid);
+      if (!match) {
+        allLines.push(`### ${valid}: not found`);
+        allLines.push('');
+        continue;
+      }
+
+      let code: string | null = null;
+      let outline: string | null = null;
+      if (includeCode) {
+        if (CONTAINER_NODE_KINDS.has(match.node.kind)) {
+          outline = this.buildContainerOutline(cg, match.node);
+        }
+        if (!outline) {
+          code = await cg.getCode(match.node.id);
+        }
+      }
+
+      const trail = this.formatTrail(cg, match.node);
+      const formatted = this.formatNodeDetails(match.node, code, outline) + trail + match.note;
+      allLines.push(formatted);
+      allLines.push('');
+    }
+
+    allLines.push('---');
+    allLines.push(`Total: ${batchLimit} symbols`);
+    return this.textResult(this.truncateOutput(allLines.join('\n')));
   }
 
   /**
@@ -2888,10 +3045,42 @@ export class ToolHandler {
       byFile.set(node.filePath, existing);
     }
 
+    // Build nodeId → incoming edge kinds mapping for risk classification
+    const nodeIncomingKinds = new Map<string, EdgeKind[]>();
+    for (const e of impact.edges) {
+      if (e.kind === 'contains') continue;
+      const kinds = nodeIncomingKinds.get(e.target) || [];
+      kinds.push(e.kind);
+      nodeIncomingKinds.set(e.target, kinds);
+    }
+
+    // Overall risk breakdown (count symbols, not edges)
+    let totalHigh = 0, totalMedium = 0, totalLow = 0;
+    for (const [nodeId, kinds] of nodeIncomingKinds.entries()) {
+      if (kinds.length === 0) continue;
+      if (nodeId.startsWith('file:') || rootSet.has(nodeId)) continue;
+      let hasHigh = false, hasMedium = false;
+      for (const k of kinds) {
+        const risk = this.classifyEdgeRisk(k);
+        if (risk === 'high') hasHigh = true;
+        else if (risk === 'medium') hasMedium = true;
+      }
+      if (hasHigh) totalHigh++;
+      else if (hasMedium) totalMedium++;
+      else totalLow++;
+    }
+
     const lines: string[] = [
       `## Impact: "${symbol}" affects ${nodeCount} symbols`,
       '',
     ];
+    if (totalHigh > 0 || totalMedium > 0 || totalLow > 0) {
+      const parts: string[] = [];
+      if (totalHigh > 0) parts.push(`${totalHigh} high-risk`);
+      if (totalMedium > 0) parts.push(`${totalMedium} medium-risk`);
+      if (totalLow > 0) parts.push(`${totalLow} low-risk`);
+      lines.push(`**Risk breakdown:** ${parts.join(', ')}`, '');
+    }
 
     for (const level of levels) {
       // Deduplicate file entries
@@ -2910,7 +3099,46 @@ export class ToolHandler {
       let levelNodeCount = 0;
       for (const f of files) levelNodeCount += f.nodes.length;
 
-      lines.push(`### ${level.label} — ${level.desc} (${levelNodeCount} symbols)`);
+      // Per-level risk breakdown (count symbols, not edges)
+      const levelNodeIds = new Set(files.flatMap(f => f.nodes.map(n => n.id)));
+      let lvlHigh = 0, lvlMedium = 0, lvlLow = 0;
+      const lvlByKind = new Map<string, number>();
+      for (const nid of levelNodeIds) {
+        const kinds = nodeIncomingKinds.get(nid) || [];
+        if (kinds.length === 0) continue;
+        let hasHigh = false, hasMedium = false;
+        const seenKinds = new Set<string>();
+        for (const k of kinds) {
+          if (seenKinds.has(k)) continue;
+          seenKinds.add(k);
+          const risk = this.classifyEdgeRisk(k);
+          if (risk === 'high') hasHigh = true;
+          else if (risk === 'medium') hasMedium = true;
+          lvlByKind.set(k, (lvlByKind.get(k) || 0) + 1);
+        }
+        if (hasHigh) lvlHigh++;
+        else if (hasMedium) lvlMedium++;
+        else lvlLow++;
+      }
+      const riskParts: string[] = [];
+      if (lvlHigh > 0) {
+        const highKinds = [...lvlByKind.entries()]
+          .filter(([k]) => this.classifyEdgeRisk(k as EdgeKind) === 'high')
+          .sort((a, b) => b[1] - a[1])
+          .map(([k, c]) => `${c} ${k}`).join(', ');
+        riskParts.push(`${lvlHigh} high-risk (${highKinds})`);
+      }
+      if (lvlMedium > 0) {
+        const medKinds = [...lvlByKind.entries()]
+          .filter(([k]) => this.classifyEdgeRisk(k as EdgeKind) === 'medium')
+          .sort((a, b) => b[1] - a[1])
+          .map(([k, c]) => `${c} ${k}`).join(', ');
+        riskParts.push(`${lvlMedium} medium-risk (${medKinds})`);
+      }
+      if (lvlLow > 0) riskParts.push(`${lvlLow} low-risk`);
+      const riskSuffix = riskParts.length > 0 ? ` [${riskParts.join('; ')}]` : '';
+
+      lines.push(`### ${level.label} — ${level.desc} (${levelNodeCount} symbols)${riskSuffix}`);
       lines.push('');
       for (const { filePath, nodes } of files) {
         const nodeList = nodes.slice(0, 10).map(n => `${n.name}:${n.startLine}`).join(', ');
@@ -2921,6 +3149,35 @@ export class ToolHandler {
     }
 
     return lines.join('\n');
+  }
+
+  /**
+   * Classify an edge kind by risk level for impact analysis.
+   *
+   * When adding a new EdgeKind, add a case here so it isn't silently
+   * treated as low risk.
+   */
+  private classifyEdgeRisk(kind: EdgeKind): 'high' | 'medium' | 'low' {
+    switch (kind) {
+      case 'calls':
+      case 'extends':
+      case 'implements':
+      case 'overrides':
+      case 'pattern_match':
+        return 'high';
+      case 'instantiates':
+      case 'imports':
+      case 'exports':
+      case 'decorates':
+        return 'medium';
+      case 'references':
+      case 'type_of':
+      case 'returns':
+        return 'low';
+      default:
+        console.warn(`classifyEdgeRisk: unknown EdgeKind "${kind}" — treating as low risk`);
+        return 'low';
+    }
   }
 
   /**
@@ -3008,8 +3265,14 @@ export class ToolHandler {
     const allLines: string[] = [`## Batch Usages (${batchLimit} symbols)`, ""];
     let totalUsages = 0;
     for (const symbol of symbols.slice(0, batchLimit)) {
-      const allMatches = this.findAllSymbols(cg, symbol);
-      if (allMatches.nodes.length === 0) { allLines.push(`### ${symbol}: not found`); allLines.push(""); continue; }
+      const valid = this.validateString(symbol, 'symbols');
+      if (typeof valid !== 'string') {
+        allLines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
+        allLines.push("");
+        continue;
+      }
+      const allMatches = this.findAllSymbols(cg, valid);
+      if (allMatches.nodes.length === 0) { allLines.push(`### ${valid}: not found`); allLines.push(""); continue; }
       const seen = new Set<string>();
       const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
       for (const node of allMatches.nodes) {
@@ -3023,8 +3286,9 @@ export class ToolHandler {
         }
       }
       const perLimit = Math.max(3, Math.ceil(limit / batchLimit));
-      allLines.push(this.formatUsageResults(symbol, usages, perLimit));
+      allLines.push(this.formatUsageResults(valid, usages, perLimit));
       allLines.push("");
+      if (allMatches.note) allLines.push(allMatches.note);
       totalUsages += usages.length;
     }
     allLines.push("---");

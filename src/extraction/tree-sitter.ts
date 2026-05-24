@@ -464,9 +464,27 @@ export class TreeSitterExtractor {
     // wherever they appear (signatures AND expression bodies). Captures type
     // arguments like `Action<导航上>` and turbofish `Action::<导航上>::new()`.
     else if ((nodeType === 'generic_type' || nodeType === 'scoped_type_identifier') && this.nodeStack.length > 0) {
-      const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
-      if (fromNodeId && !fromNodeId.startsWith('file:')) {
-        this.extractTypeRefsFromSubtree(node, fromNodeId);
+      // Skip if direct child of impl_item — extractRustImplItem handles type refs
+      if (node.parent?.type !== 'impl_item') {
+        const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+        if (fromNodeId && !fromNodeId.startsWith('file:')) {
+          this.extractTypeRefsFromSubtree(node, fromNodeId);
+        }
+      }
+    }
+    // type_arguments in expression context (e.g., turbofish Action::<导航上>::new())
+    // — the type_arguments node is a direct child of scoped_identifier here, not
+    // nested under generic_type, so the generic_type handler above misses it.
+    else if (nodeType === 'type_arguments' && this.language === 'rust' && this.nodeStack.length > 0) {
+      const parent = node.parent;
+      if (parent && (parent.type === 'generic_type' || parent.type === 'scoped_type_identifier')) {
+        // Already handled by the parent node handler via extractTypeRefsFromSubtree
+      } else {
+        const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+        if (fromNodeId && !fromNodeId.startsWith('file:')) {
+          this.extractTypeRefsFromSubtree(node, fromNodeId, true);
+        }
+        skipChildren = true;
       }
     }
     // macro_definition: extract pattern_match references from token_tree bodies.
@@ -1597,6 +1615,40 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
       });
+    } else if (this.language === 'rust' && node.type === 'let_declaration') {
+      // Rust let bindings: extract type refs from the type annotation so
+      // that generic parameters (e.g. `let x: Query<&MyType>`) create
+      // references edges — impact analysis traces dependencies through locals.
+      const patternNode = getChildByField(node, 'pattern');
+      if (patternNode && patternNode.type === 'identifier') {
+        const name = getNodeText(patternNode, this.source);
+        const varNode = this.createNode(kind, name, patternNode, { docstring, isExported });
+        if (varNode) {
+          const typeNode = getChildByField(node, 'type');
+          if (typeNode) {
+            this.extractTypeRefsFromSubtree(typeNode, varNode.id);
+          }
+          const valueNode = getChildByField(node, 'value');
+          if (valueNode) {
+            this.visitNode(valueNode);
+          }
+        }
+      } else {
+        // Destructuring bindings (tuple_pattern, struct_pattern, etc.): no
+        // variable node to create, but still extract type refs and manually
+        // walk the value subtree so call expressions inside it are discovered.
+        const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+        if (fromNodeId && !fromNodeId.startsWith('file:')) {
+          const typeNode = getChildByField(node, 'type');
+          if (typeNode) {
+            this.extractTypeRefsFromSubtree(typeNode, fromNodeId);
+          }
+          const valueNode = getChildByField(node, 'value');
+          if (valueNode) {
+            this.visitNode(valueNode);
+          }
+        }
+      }
     } else if (this.language === 'rust' && (node.type === 'const_item' || node.type === 'static_item')) {
       // Rust const/static items: extract type refs from the type annotation
       // and enum variant references from the initializer value so that
@@ -2803,6 +2855,17 @@ export class TreeSitterExtractor {
         line: traitNode.startPosition.row + 1,
         column: traitNode.startPosition.column,
       });
+      // Emit references for type arguments in the implementing type
+      // (e.g., impl<T> Trait for MyStruct<T> — reference the type params).
+      if (typeNode.type === 'generic_type') {
+        const typeArgs = typeNode.namedChildren.find(
+          (c: SyntaxNode) => c.type === 'type_arguments'
+        );
+        if (typeArgs) {
+          this.extractTypeRefsFromSubtree(typeArgs, typeNodeId, true);
+        }
+      }
+
       // Enrich the type node's signature so the trait name is FTS-searchable.
       // Makes "codegraph_search Plugin" find `impl Plugin for MyPlugin`.
       const targetNode = this.nodes.find(n => n.id === typeNodeId);
@@ -2896,15 +2959,19 @@ export class TreeSitterExtractor {
   /**
    * Recursively walk a subtree and extract all type_identifier references.
    * Handles unions, intersections, generics, arrays, etc.
+   *
+   * When insideTypeArgs is true (descending into a type_arguments node),
+   * references use 'type_of' edges so resolution can prefer type symbols
+   * (struct, enum, class) over value symbols (enum_member, constant).
    */
-  private extractTypeRefsFromSubtree(node: SyntaxNode, fromNodeId: string): void {
+  private extractTypeRefsFromSubtree(node: SyntaxNode, fromNodeId: string, insideTypeArgs = false): void {
     if (node.type === 'type_identifier') {
       const typeName = getNodeText(node, this.source);
       if (typeName && !this.BUILTIN_TYPES.has(typeName)) {
         this.unresolvedReferences.push({
           fromNodeId,
           referenceName: typeName,
-          referenceKind: 'references',
+          referenceKind: insideTypeArgs ? 'type_of' : 'references',
           line: node.startPosition.row + 1,
           column: node.startPosition.column,
         });
@@ -2925,7 +2992,7 @@ export class TreeSitterExtractor {
           this.unresolvedReferences.push({
             fromNodeId,
             referenceName: typeName,
-            referenceKind: 'references',
+            referenceKind: insideTypeArgs ? 'type_of' : 'references',
             line: last.startPosition.row + 1,
             column: last.startPosition.column,
           });
@@ -2938,7 +3005,8 @@ export class TreeSitterExtractor {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (child) {
-        this.extractTypeRefsFromSubtree(child, fromNodeId);
+        this.extractTypeRefsFromSubtree(child, fromNodeId,
+          insideTypeArgs || child.type === 'type_arguments');
       }
     }
   }
