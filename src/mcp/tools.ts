@@ -5,7 +5,7 @@
  */
 
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
-import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
+import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, EdgeKind } from '../types';
 import { createHash } from 'crypto';
 import {
   constants as fsConstants,
@@ -135,9 +135,9 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
   }
   if (fileCount < 5000) {
     return {
-      maxOutputChars: 13000,
+      maxOutputChars: 22000,
       defaultMaxFiles: 6,
-      maxCharsPerFile: 2500,
+      maxCharsPerFile: 4000,
       gapThreshold: 10,
       maxSymbolsInFileHeader: 8,
       maxEdgesPerRelationshipKind: 8,
@@ -316,6 +316,14 @@ export const tools: ToolDefinition[] = [
           description: 'Filter by node kind',
           enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component'],
         },
+        referencesType: {
+          type: 'string',
+          description: 'Find symbols that reference this type (via type_of/references/returns edges). When set, query is used only as a fallback if referencesType yields no results.',
+        },
+        impl_for: {
+          type: 'string',
+          description: 'Find all types that implement the given trait/interface (via implements edges or unresolved references). When set, query is used only as a fallback if impl_for yields no results.',
+        },
         limit: {
           type: 'number',
           description: 'Maximum results (default: 10)',
@@ -441,10 +449,24 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: 'Symbol names, file names, or short code terms to explore (e.g., "AuthService loginUser session-manager", "GraphTraverser BFS impact traversal.ts"). Use codegraph_search first to find relevant names.',
         },
+        path: {
+          type: 'string',
+          description: 'Limit exploration to files under this directory path (e.g., "src/components")',
+        },
         maxFiles: {
           type: 'number',
           description: 'Maximum number of files to include source code from (default: 12)',
           default: 12,
+        },
+        sourceOnly: {
+          type: 'boolean',
+          description: 'Skip relationship map, return only source code (default: false)',
+          default: false,
+        },
+        strict: {
+          type: 'boolean',
+          description: 'When true, limit results to only files under the path directory (default: false)',
+          default: false,
         },
         projectPath: projectPathProperty,
       },
@@ -490,8 +512,38 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum directory depth to show (default: unlimited)',
         },
+        symbols: {
+          type: 'boolean',
+          description: 'Include top-level symbol names and kinds for each file (default: false)',
+          default: false,
+        },
         projectPath: projectPathProperty,
       },
+    },
+  },
+  {
+    name: 'codegraph_usages',
+    description: 'Find all usages of a symbol (calls, references, pattern matches, type annotations, instantiations). Broader than callers — covers every edge kind that references the symbol.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol: {
+          type: 'string',
+          description: 'Name of the symbol to find usages for',
+        },
+        kind: {
+          type: 'string',
+          description: 'Filter by usage kind (default: all kinds)',
+          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match'],
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum usages to return (default: 20)',
+          default: 20,
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['symbol'],
     },
   },
 ];
@@ -641,8 +693,12 @@ export class ToolHandler {
    * Close all cached project connections
    */
   closeAll(): void {
+    const closed = new Set<CodeGraph>();
     for (const cg of this.projectCache.values()) {
-      cg.close();
+      if (!closed.has(cg)) {
+        closed.add(cg);
+        cg.close();
+      }
     }
     this.projectCache.clear();
   }
@@ -734,6 +790,8 @@ export class ToolHandler {
           return await this.handleStatus(args);
         case 'codegraph_files':
           return await this.handleFiles(args);
+        case 'codegraph_usages':
+          return await this.handleUsages(args);
         default:
           return this.errorResult(`Unknown tool: ${toolName}`);
       }
@@ -753,14 +811,49 @@ export class ToolHandler {
     const kind = args.kind as string | undefined;
     const rawLimit = Number(args.limit) || 10;
     const limit = clamp(rawLimit, 1, 100);
+    const referencesType = args.referencesType as string | undefined;
+    const implFor = args.impl_for as string | undefined;
 
-    const results = cg.searchNodes(query, {
-      limit,
-      kinds: kind ? [kind as NodeKind] : undefined,
-    });
+    let results: SearchResult[];
+    if (implFor) {
+      results = cg.findImplementors(implFor, {
+        limit,
+        kinds: kind ? [kind as NodeKind] : undefined,
+      });
+      if (results.length === 0) {
+        results = cg.searchNodes(implFor, {
+          limit,
+          kinds: kind ? [kind as NodeKind] : undefined,
+        });
+      }
+    } else if (referencesType) {
+      results = cg.findNodesByReferencedType(referencesType, {
+        limit,
+        kinds: kind ? [kind as NodeKind] : undefined,
+      });
+      if (results.length === 0) {
+        results = cg.searchNodes(query, {
+          limit,
+          kinds: kind ? [kind as NodeKind] : undefined,
+        });
+      }
+    } else {
+      results = cg.searchNodes(query, {
+        limit,
+        kinds: kind ? [kind as NodeKind] : undefined,
+      });
+    }
 
     if (results.length === 0) {
-      return this.textResult(`No results found for "${query}"`);
+      let label: string;
+      if (implFor) {
+        label = `No implementors found for trait "${implFor}"`;
+      } else if (referencesType) {
+        label = `No results found for references to type "${referencesType}"`;
+      } else {
+        label = `No results found for "${query}"`;
+      }
+      return this.textResult(label);
     }
 
     const formatted = this.formatSearchResults(results);
@@ -948,6 +1041,87 @@ export class ToolHandler {
   }
 
   /**
+   * Handle codegraph_usages — find all usages of a symbol
+   *
+   * Broader than callers: returns every incoming edge regardless of kind
+   * (calls, references, type_of, instantiates, etc.), grouped by file.
+   */
+  private async handleUsages(args: Record<string, unknown>): Promise<ToolResult> {
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const limit = clamp((args.limit as number) || 20, 1, 100);
+    const kindFilter = args.kind as string | undefined;
+
+    const allMatches = this.findAllSymbols(cg, symbol);
+    if (allMatches.nodes.length === 0) {
+      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+    }
+
+    // Collect all incoming edges across all matching symbols.
+    // Pass kindFilter at DB level to avoid fetching rows that will be discarded.
+    const seen = new Set<string>();
+    const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
+    for (const node of allMatches.nodes) {
+      const edgeKinds = kindFilter ? [kindFilter as EdgeKind] : undefined;
+      for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
+        const key = `${edge.source}:${edge.target}:${edge.kind}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        // Look up the source node (the caller/referencer)
+        const sourceNode = cg.getNode(edge.source);
+        if (sourceNode) {
+          usages.push({
+            sourceNode,
+            targetNode: node,
+            edgeKind: edge.kind,
+            line: edge.line ?? sourceNode.startLine,
+          });
+        }
+      }
+    }
+
+    if (usages.length === 0) {
+      return this.textResult(`No usages found for "${symbol}"${allMatches.note}`);
+    }
+
+    // Group by file
+    const byFile = new Map<string, typeof usages>();
+    for (const u of usages) {
+      const existing = byFile.get(u.sourceNode.filePath) || [];
+      existing.push(u);
+      byFile.set(u.sourceNode.filePath, existing);
+    }
+
+    const lines: string[] = [
+      `## Usages of "${symbol}" (${Math.min(usages.length, limit)} shown, ${usages.length} total)`,
+      '',
+    ];
+
+    let count = 0;
+    for (const [file, fileUsages] of byFile) {
+      if (count >= limit) break;
+      lines.push(`**${file}:**`);
+      for (const u of fileUsages) {
+        if (count >= limit) break;
+        const lineInfo = u.line ? `:${u.line}` : '';
+        lines.push(`- ${u.sourceNode.name} (${u.sourceNode.kind}) ${u.edgeKind}→ ${u.targetNode.name}${lineInfo}`);
+        count++;
+      }
+      lines.push('');
+    }
+
+    if (usages.length > limit) {
+      lines.push(`... and ${usages.length - limit} more usages`);
+    }
+
+    lines.push(allMatches.note);
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  /**
    * Handle codegraph_explore — deep exploration in a single call
    *
    * Strategy: find relevant symbols via graph traversal, group by file,
@@ -959,11 +1133,25 @@ export class ToolHandler {
    * tax on small projects while earning its keep on large ones.
    */
   private async handleExplore(args: Record<string, unknown>): Promise<ToolResult> {
-    const query = this.validateString(args.query, 'query');
-    if (typeof query !== 'string') return query;
+    const rawQuery = this.validateString(args.query, 'query');
+    if (typeof rawQuery !== 'string') return rawQuery;
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
+
+    // P1: Inject path filter into query if provided.
+    // Quote paths containing spaces so the query parser handles them as
+    // a single token: path:"src/some dir/with spaces"
+    const pathFilter = args.path as string | undefined;
+    const needsQuoting = pathFilter && /\s/.test(pathFilter);
+    const pathClause = needsQuoting ? `path:"${pathFilter}"` : `path:${pathFilter}`;
+    const query = pathFilter ? `${pathClause} ${rawQuery}` : rawQuery;
+
+    // P4: Skip relationship map when sourceOnly is true
+    const sourceOnly = args.sourceOnly === true;
+
+    // P1: Strict mode — limit results to files under the path directory
+    const strict = args.strict === true;
 
     // Resolve adaptive output budget from project size. Falls back to the
     // largest-tier defaults if stats aren't available, which preserves
@@ -971,8 +1159,25 @@ export class ToolHandler {
     let budget: ExploreOutputBudget;
     try {
       budget = getExploreOutputBudget(cg.getStats().fileCount);
-    } catch {
-      budget = getExploreOutputBudget(Infinity);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('database is locked') || msg.includes('no such table')) {
+        budget = getExploreOutputBudget(Infinity);
+      } else {
+        throw err;
+      }
+    }
+    // P2: When sourceOnly is true, double the per-file and total output budget
+    // since the relationship map (typically 20-30% of output) is skipped.
+    // Also double the gap threshold so clusters merge more aggressively —
+    // fewer, larger clusters use the budget more efficiently.
+    if (sourceOnly) {
+      budget = {
+        ...budget,
+        maxOutputChars: budget.maxOutputChars * 2,
+        maxCharsPerFile: budget.maxCharsPerFile * 2,
+        gapThreshold: budget.gapThreshold * 2,
+      };
     }
     const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
 
@@ -1019,8 +1224,49 @@ export class ToolHandler {
       fileGroups.set(node.filePath, group);
     }
 
-    // Only include files that have entry points or nodes directly connected to entry points
-    const relevantFiles = [...fileGroups.entries()].filter(([, group]) => group.score >= 3);
+    // Only include files that have entry points or nodes directly connected to entry points.
+    // When a path filter is set, lower the threshold so all files in the directory
+    // are eligible — the user asked for this directory explicitly, and maxFiles
+    // should reflect the actual file count, not an opaque scoring cutoff.
+    const minScore = pathFilter ? 1 : 3;
+    const relevantFiles = [...fileGroups.entries()].filter(([, group]) => group.score >= minScore);
+
+    // When a path filter is set, backfill with all indexed files under that
+    // directory so maxFiles honestly reflects the actual file count. Files
+    // without query-matched symbols get score 0 and sort last.
+    if (pathFilter) {
+      const allFiles = cg.getFiles();
+      const normalizedPath = pathFilter.replace(/\\/g, '/').replace(/\/$/, '') + '/';
+      for (const f of allFiles) {
+        const fp = f.path.replace(/\\/g, '/');
+        if (fp.startsWith(normalizedPath) && !fileGroups.has(f.path)) {
+          const entry: [string, { nodes: Node[]; score: number }] = [f.path, { nodes: [], score: 0 }];
+          fileGroups.set(f.path, entry[1]);
+          relevantFiles.push(entry);
+        }
+      }
+    }
+
+    // P1: Strict mode — when path is set and strict is true, remove files
+    // and subgraph entries outside the path directory so results are scoped.
+    if (strict && pathFilter) {
+      const normalizedStrict = pathFilter.replace(/\\/g, '/').replace(/\/$/, '') + '/';
+      for (let i = relevantFiles.length - 1; i >= 0; i--) {
+        const fp = relevantFiles[i]![0].replace(/\\/g, '/');
+        if (!fp.startsWith(normalizedStrict)) {
+          fileGroups.delete(relevantFiles[i]![0]);
+          relevantFiles.splice(i, 1);
+        }
+      }
+      for (const [nodeId, node] of subgraph.nodes) {
+        if (!node.filePath.replace(/\\/g, '/').startsWith(normalizedStrict)) {
+          subgraph.nodes.delete(nodeId);
+        }
+      }
+      subgraph.edges = subgraph.edges.filter(
+        e => subgraph.nodes.has(e.source) && subgraph.nodes.has(e.target)
+      );
+    }
 
     // Extract query terms for relevance checking
     const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
@@ -1067,7 +1313,7 @@ export class ToolHandler {
       e.kind !== 'contains' // skip contains — it's implied by file grouping
     );
 
-    if (budget.includeRelationships && significantEdges.length > 0) {
+    if (!sourceOnly && budget.includeRelationships && significantEdges.length > 0) {
       lines.push('### Relationships');
       lines.push('');
 
@@ -1521,6 +1767,13 @@ export class ToolHandler {
       return this.textResult(`No files found matching the criteria.`);
     }
 
+    // P5: Fetch top-level symbols when requested
+    const showSymbols = args.symbols === true;
+    let symbolMap: Map<string, Array<{ name: string; kind: string }>> | undefined;
+    if (showSymbols) {
+      symbolMap = this.fetchTopLevelSymbols(cg, files);
+    }
+
     // Format output
     let output: string;
     switch (format) {
@@ -1534,6 +1787,11 @@ export class ToolHandler {
       default:
         output = this.formatFilesTree(files, includeMetadata, maxDepth);
         break;
+    }
+
+    // Append symbols section if requested
+    if (showSymbols && symbolMap && symbolMap.size > 0) {
+      output += '\n\n' + this.formatFileSymbols(symbolMap, files.length);
     }
 
     return this.textResult(this.truncateOutput(output));
@@ -1676,9 +1934,78 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
+  /**
+   * Fetch top-level symbols for a set of files in one bulk query.
+   * Returns a map from file path to its top-level symbol list.
+   */
+  private fetchTopLevelSymbols(
+    cg: CodeGraph,
+    files: Array<{ path: string; language: string; nodeCount: number }>
+  ): Map<string, Array<{ name: string; kind: string }>> {
+    const symbolMap = new Map<string, Array<{ name: string; kind: string }>>();
+    const fileSet = new Set(files.map(f => f.path));
+
+    // Bulk query: get all top-level symbols. Use a high limit so large
+    // repos don't have symbols truncated for files that sort late alphabetically.
+    // Internal limit is 5× this value (searchAllByFilters multiplier).
+    const results = cg.searchNodes('', {
+      kinds: ['function', 'method', 'class', 'struct', 'enum', 'trait', 'interface', 'type_alias', 'module'] as NodeKind[],
+      limit: Math.min(files.length * 10, 5000),
+    });
+
+    // Per-file cap: 10 for small projects, 5 for large (>1000 files)
+    const perFileCap = files.length > 1000 ? 5 : 10;
+
+    for (const r of results) {
+      const fp = r.node.filePath;
+      if (!fileSet.has(fp)) continue;
+
+      let symbols = symbolMap.get(fp);
+      if (!symbols) {
+        symbols = [];
+        symbolMap.set(fp, symbols);
+      }
+      if (symbols.length >= perFileCap) continue;
+
+      const name = r.node.name.length > 30
+        ? r.node.name.slice(0, 27) + '...'
+        : r.node.name;
+      symbols.push({ name, kind: r.node.kind });
+    }
+
+    return symbolMap;
+  }
+
+  /**
+   * Format the file symbols section for codegraph_files output.
+   */
+  private formatFileSymbols(
+    symbolMap: Map<string, Array<{ name: string; kind: string }>>,
+    totalFiles: number
+  ): string {
+    const lines: string[] = ['### Top-Level Symbols', ''];
+
+    const sorted = [...symbolMap.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]));
+
+    for (const [filePath, symbols] of sorted) {
+      if (symbols.length === 0) continue;
+      const symbolList = symbols.map(s => `${s.name} (${s.kind})`).join(', ');
+      lines.push(`- **${filePath}:** ${symbolList}`);
+    }
+
+    const filesWithSymbols = sorted.filter(([, s]) => s.length > 0).length;
+    if (filesWithSymbols < totalFiles) {
+      lines.push('');
+      lines.push(`*${totalFiles - filesWithSymbols} files have no top-level symbols*`);
+    }
+
+    return lines.join('\n');
+  }
+
   // =========================================================================
   // Symbol resolution helpers
-  // =========================================================================
+  // ========================================================================="
 
   /**
    * Find a symbol by name, handling disambiguation when multiple matches exist.
@@ -1809,11 +2136,33 @@ export class ToolHandler {
       return { nodes: [node], note: '' };
     }
 
-    const locations = exactMatches.map(r =>
-      `${r.node.kind} at ${r.node.filePath}:${r.node.startLine}`
-    );
-    const note = `\n\n> **Note:** Aggregated results across ${exactMatches.length} symbols named "${symbol}": ${locations.join(', ')}`;
-    return { nodes: exactMatches.map(r => r.node), note };
+    // Multiple exact matches: rank by reference heat (incoming edge count)
+    // to surface the most-used symbol first and enable auto-disambiguation
+    // when one symbol dominates all others.
+    const withHeat = exactMatches.map(r => ({
+      node: r.node,
+      heat: cg.getIncomingEdgeCount(r.node.id),
+    }));
+    withHeat.sort((a, b) => b.heat - a.heat);
+
+    // When one symbol dominates (>3× the runner-up), note it as the likely
+    // intended target but keep ALL matches in the node list. Aggregation tools
+    // (callers, callees, impact, usages) need the full set to avoid silently
+    // dropping edges from less-used symbols.
+    let note = '';
+    if (withHeat.length >= 2 && withHeat[0]!.heat > withHeat[1]!.heat * 3) {
+      const top = withHeat[0]!.node;
+      const others = withHeat.slice(1).map(r =>
+        `${r.node.kind} at ${r.node.filePath}:${r.node.startLine} (${r.heat} refs)`
+      );
+      note = `\n\n> **Heads-up:** "${symbol}" matched ${exactMatches.length} symbols, ranked by reference heat. \`${top.name}\` (${withHeat[0]!.heat} incoming refs — ${withHeat[0]!.heat > 0 && withHeat[1]!.heat > 0 ? `${Math.round(withHeat[0]!.heat / withHeat[1]!.heat)}×` : 'dominates'} the next best) is almost certainly the intended target. Other matches: ${others.join(', ')}`;
+    } else {
+      const locations = withHeat.map(r =>
+        `${r.node.kind} at ${r.node.filePath}:${r.node.startLine} (${r.heat} refs)`
+      );
+      note = `\n\n> **Note:** Aggregated results across ${exactMatches.length} symbols named "${symbol}", ranked by reference heat (most-referenced first): ${locations.join(', ')}`;
+    }
+    return { nodes: withHeat.map(r => r.node), note };
   }
 
   /**
@@ -1868,12 +2217,27 @@ export class ToolHandler {
       '',
     ];
 
-    // Group by file
-    const byFile = new Map<string, Node[]>();
+    // First pass: collect all non-file nodes
+    const ENVELOPE_KINDS = new Set(['class', 'struct', 'interface', 'enum', 'namespace', 'module', 'trait', 'protocol', 'component']);
+    const rawByFile = new Map<string, Node[]>();
     for (const node of impact.nodes.values()) {
-      const existing = byFile.get(node.filePath) || [];
+      if (node.kind === 'file') continue;
+      const existing = rawByFile.get(node.filePath) || [];
       existing.push(node);
-      byFile.set(node.filePath, existing);
+      rawByFile.set(node.filePath, existing);
+    }
+    // Second pass: drop whole-file envelope nodes when the file has more
+    // specific symbols (methods, fields, etc.). Keep them only when they
+    // are the sole symbol in the file.
+    const byFile = new Map<string, Node[]>();
+    for (const [filePath, fileNodes] of rawByFile) {
+      const specific = fileNodes.filter(n => !ENVELOPE_KINDS.has(n.kind));
+      if (specific.length > 0) {
+        const envelopesToKeep = fileNodes.filter(n => ENVELOPE_KINDS.has(n.kind) && impact.roots.includes(n.id));
+        byFile.set(filePath, [...specific, ...envelopesToKeep]);
+      } else {
+        byFile.set(filePath, fileNodes);
+      }
     }
 
     for (const [file, nodes] of byFile) {

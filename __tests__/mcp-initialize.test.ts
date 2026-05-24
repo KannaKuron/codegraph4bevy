@@ -99,9 +99,18 @@ describe('MCP initialize handshake (issue #172)', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-'));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     if (child && !child.killed) {
-      child.kill('SIGKILL');
+      const exited = new Promise<void>((resolve) => {
+        child!.on('close', () => resolve());
+        child!.kill('SIGKILL');
+      });
+      let timerId: ReturnType<typeof setTimeout>;
+      const timeout = new Promise<void>((resolve) => {
+        timerId = setTimeout(resolve, 5000);
+      });
+      await Promise.race([exited, timeout]);
+      clearTimeout(timerId!);
       child = null;
     }
     fs.rmSync(tempDir, { recursive: true, force: true });

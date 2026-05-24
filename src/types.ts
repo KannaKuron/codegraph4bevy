@@ -57,7 +57,8 @@ export type EdgeKind =
   | 'returns'         // Function returns type
   | 'instantiates'    // Creates instance of class
   | 'overrides'       // Method overrides parent method
-  | 'decorates';      // Decorator applied to symbol
+  | 'decorates'       // Decorator applied to symbol
+  | 'pattern_match';  // Match/if-let pattern references an enum variant
 
 /**
  * Supported programming languages. See NODE_KINDS for why this is a

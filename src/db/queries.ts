@@ -18,7 +18,7 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
-import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
+import { kindBonus, nameMatchBonus, scorePathRelevance, escapeLike, enrichCJKForFTS } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 
 /**
@@ -201,13 +201,13 @@ export class QueryBuilder {
           start_line, end_line, start_column, end_column,
           docstring, signature, visibility,
           is_exported, is_async, is_static, is_abstract,
-          decorators, type_parameters, updated_at
+          decorators, type_parameters, updated_at, fts_tokens
         ) VALUES (
           @id, @kind, @name, @qualifiedName, @filePath, @language,
           @startLine, @endLine, @startColumn, @endColumn,
           @docstring, @signature, @visibility,
           @isExported, @isAsync, @isStatic, @isAbstract,
-          @decorators, @typeParameters, @updatedAt
+          @decorators, @typeParameters, @updatedAt, @ftsTokens
         )
       `);
     }
@@ -251,6 +251,8 @@ export class QueryBuilder {
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
       updatedAt: node.updatedAt ?? Date.now(),
+      // fts_tokens: jieba-segmented tokens for CJK FTS search
+      ftsTokens: enrichCJKForFTS(node.name),
     });
   }
 
@@ -290,6 +292,7 @@ export class QueryBuilder {
           is_abstract = @isAbstract,
           decorators = @decorators,
           type_parameters = @typeParameters,
+          fts_tokens = @ftsTokens,
           updated_at = @updatedAt
         WHERE id = @id
       `);
@@ -324,6 +327,7 @@ export class QueryBuilder {
       isAbstract: node.isAbstract ? 1 : 0,
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
+      ftsTokens: enrichCJKForFTS(node.name),
       updatedAt: node.updatedAt ?? Date.now(),
     });
   }
@@ -559,18 +563,19 @@ export class QueryBuilder {
     const kinds = mergedKinds;
     const languages = mergedLanguages;
 
-    // First try FTS5 with prefix matching
-    let results = text
-      ? this.searchNodesFTS(text, { kinds, languages, limit, offset })
-      // Over-fetch by 5× when running filter-only (no text). The
-      // post-scoring path: + name: filters can be very selective, so
-      // a smaller multiplier risks returning fewer than `limit`
-      // results despite the DB having plenty of matches.
-      : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
-
-    // If no FTS results, try LIKE-based substring search
-    if (results.length === 0 && text.length >= 2) {
-      results = this.searchNodesLike(text, { kinds, languages, limit, offset });
+    // Try FTS5 with prefix matching.
+    // unicode61 tokenizer + jieba fts_tokens handles CJK correctly,
+    // so FTS works for all languages.
+    let results: SearchResult[];
+    if (text) {
+      results = this.searchNodesFTS(text, { kinds, languages, limit, offset });
+      if (results.length === 0 && text.length >= 2) {
+        results = this.searchNodesLike(text, { kinds, languages, limit, offset });
+      }
+    } else {
+      // No text portion — filter-only query (kind:, lang:, path:)
+      // Over-fetch by 5× so post-scoring has enough candidates to narrow from
+      results = this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
     }
 
     // Final fuzzy fallback: scan all known names and keep those within
@@ -779,7 +784,7 @@ export class QueryBuilder {
     const ftsLimit = Math.max(limit * 5, 100);
 
     let sql = `
-      SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2) as score
+      SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2, 1, 15) as score
       FROM nodes_fts
       JOIN nodes ON nodes_fts.id = nodes.id
       WHERE nodes_fts MATCH ?
@@ -819,36 +824,40 @@ export class QueryBuilder {
   private searchNodesLike(query: string, options: SearchOptions): SearchResult[] {
     const { kinds, languages, limit = 100, offset = 0 } = options;
 
+    // LIKE uses ESCAPE '\' so that _ and % in user queries are treated
+    // literally after escapeLike. The = clause uses the raw query since
+    // = does not treat _ / % as wildcards.
+    const escaped = escapeLike(query);
     let sql = `
       SELECT nodes.*,
         CASE
           WHEN name = ? THEN 1.0
-          WHEN name LIKE ? THEN 0.9
-          WHEN name LIKE ? THEN 0.8
-          WHEN qualified_name LIKE ? THEN 0.7
+          WHEN name LIKE ? ESCAPE '\\' THEN 0.9
+          WHEN name LIKE ? ESCAPE '\\' THEN 0.8
+          WHEN qualified_name LIKE ? ESCAPE '\\' THEN 0.7
           ELSE 0.5
         END as score
       FROM nodes
       WHERE (
-        name LIKE ? OR
-        qualified_name LIKE ? OR
-        name LIKE ?
+        name LIKE ? ESCAPE '\\' OR
+        qualified_name LIKE ? ESCAPE '\\' OR
+        name LIKE ? ESCAPE '\\'
       )
     `;
 
     // Pattern variants for better matching
-    const exactMatch = query;
-    const startsWith = `${query}%`;
-    const contains = `%${query}%`;
+    const exactMatch = query;             // raw — = does not use wildcards
+    const startsWith = `${escaped}%`;
+    const contains = `%${escaped}%`;
 
     const params: (string | number)[] = [
-      exactMatch,     // Exact match score
-      startsWith,     // Starts with score
-      contains,       // Contains score
-      contains,       // Qualified name score
-      contains,       // WHERE: name contains
-      contains,       // WHERE: qualified_name contains
-      startsWith,     // WHERE: name starts with
+      exactMatch,     // Exact match score (=)
+      startsWith,     // Starts with score (LIKE ... ESCAPE '\')
+      contains,       // Contains score (LIKE ... ESCAPE '\')
+      contains,       // Qualified name score (LIKE ... ESCAPE '\')
+      contains,       // WHERE: name contains (LIKE ... ESCAPE '\')
+      contains,       // WHERE: qualified_name contains (LIKE ... ESCAPE '\')
+      startsWith,     // WHERE: name starts with (LIKE ... ESCAPE '\')
     ];
 
     if (kinds && kinds.length > 0) {
@@ -976,17 +985,18 @@ export class QueryBuilder {
   ): SearchResult[] {
     const { kinds, languages, limit = 30, excludePrefix } = options;
 
+    const escaped = escapeLike(substring);
     let sql = `
       SELECT nodes.*, 1.0 as score
       FROM nodes
-      WHERE name LIKE ?
+      WHERE name LIKE ? ESCAPE '\\'
     `;
-    const params: (string | number)[] = [`%${substring}%`];
+    const params: (string | number)[] = [`%${escaped}%`];
 
     // Exclude prefix matches (handled by FTS-based prefix search in Step 2b)
     if (excludePrefix) {
-      sql += ` AND name NOT LIKE ?`;
-      params.push(`${substring}%`);
+      sql += ` AND name NOT LIKE ? ESCAPE '\\'`;
+      params.push(`${escaped}%`);
     }
 
     if (kinds && kinds.length > 0) {
@@ -1004,6 +1014,128 @@ export class QueryBuilder {
 
     const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
     return rows.map((row) => ({
+      node: rowToNode(row),
+      score: row.score,
+    }));
+  }
+
+  /**
+   * Find nodes that reference a given type through type_of, references, or returns edges.
+   * For example, find all functions whose parameters include a Commands type.
+   */
+  findNodesByReferencedType(
+    typeName: string,
+    options: SearchOptions & { edgeKinds?: EdgeKind[] } = {}
+  ): SearchResult[] {
+    const { kinds, languages, limit = 50, edgeKinds } = options;
+    const targetKinds = edgeKinds ?? ['type_of', 'references', 'returns'];
+
+    // Build shared filter clauses for both sides of the UNION.
+    let filterSql = '';
+    const filterParams: (string | number)[] = [];
+    if (kinds && kinds.length > 0) {
+      filterSql += ` AND n.kind IN (${kinds.map(() => '?').join(',')})`;
+      filterParams.push(...kinds);
+    }
+    if (languages && languages.length > 0) {
+      filterSql += ` AND n.language IN (${languages.map(() => '?').join(',')})`;
+      filterParams.push(...languages);
+    }
+
+    // Side A: resolved edges — project-internal types with a matching node.
+    // Side B: unresolved references — external/dependency types (e.g. Bevy
+    //   Commands, Res, Query) that were extracted but never resolved to a
+    //   project node. Scored slightly lower so resolved matches sort first.
+    const kindPlaceholders = targetKinds.map(() => '?').join(',');
+    const sql = `
+      SELECT DISTINCT n.*, 1.0 as score
+      FROM nodes n
+      JOIN edges e ON n.id = e.source
+      JOIN nodes t ON e.target = t.id
+      WHERE t.name = ? COLLATE NOCASE
+      AND e.kind IN (${kindPlaceholders})
+      ${filterSql}
+      UNION
+      SELECT DISTINCT n.*, 0.8 as score
+      FROM nodes n
+      JOIN unresolved_refs u ON n.id = u.from_node_id
+      WHERE u.reference_name = ? COLLATE NOCASE
+      AND u.reference_kind IN (${kindPlaceholders})
+      ${filterSql}
+      ORDER BY score DESC, n.name ASC LIMIT ?
+    `;
+
+    const params: (string | number)[] = [
+      typeName, ...targetKinds, ...filterParams,
+      typeName, ...targetKinds, ...filterParams,
+      limit,
+    ];
+
+    const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+    const seen = new Set<string>();
+    const deduped: (NodeRow & { score: number })[] = [];
+    for (const row of rows) {
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        deduped.push(row);
+      }
+    }
+    return deduped.map((row) => ({
+      node: rowToNode(row),
+      score: row.score,
+    }));
+  }
+
+  /**
+   * Find nodes that implement a given trait/interface.
+   * Searches both resolved `implements` edges and `unresolved_refs`
+   * (for external/dependency traits like std::fmt::Display).
+   */
+  findImplementors(
+    traitName: string,
+    options: SearchOptions = {}
+  ): SearchResult[] {
+    const { kinds, languages, limit = 50 } = options;
+
+    let filterSql = '';
+    const filterParams: (string | number)[] = [];
+    if (kinds && kinds.length > 0) {
+      filterSql += ` AND n.kind IN (${kinds.map(() => '?').join(',')})`;
+      filterParams.push(...kinds);
+    }
+    if (languages && languages.length > 0) {
+      filterSql += ` AND n.language IN (${languages.map(() => '?').join(',')})`;
+      filterParams.push(...languages);
+    }
+
+    const sql = `
+      SELECT DISTINCT n.*, 1.0 as score FROM nodes n
+      JOIN edges e ON n.id = e.source
+      JOIN nodes t ON e.target = t.id
+      WHERE t.name = ? COLLATE NOCASE AND e.kind = 'implements' ${filterSql}
+      UNION
+      SELECT DISTINCT n.*, 0.8 as score FROM nodes n
+      JOIN unresolved_refs u ON n.id = u.from_node_id
+      WHERE u.reference_name = ? COLLATE NOCASE AND u.reference_kind = 'implements' ${filterSql}
+      ORDER BY score DESC, n.name ASC LIMIT ?
+    `;
+
+    const params: (string | number)[] = [
+      traitName, ...filterParams,
+      traitName, ...filterParams,
+      limit,
+    ];
+
+    const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+    const seen = new Set<string>();
+    const deduped: (NodeRow & { score: number })[] = [];
+    for (const row of rows) {
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        deduped.push(row);
+      }
+    }
+    return deduped.map((row) => ({
       node: rowToNode(row),
       score: row.score,
     }));
@@ -1100,6 +1232,17 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getEdgesByTarget.all(targetId) as EdgeRow[];
     return rows.map(rowToEdge);
+  }
+
+  /**
+   * Count incoming edges for a node (much faster than getIncomingEdges().length
+   * because it uses COUNT(*) instead of fetching all rows).
+   */
+  getIncomingEdgeCount(targetId: string): number {
+    const row = this.db.prepare(
+      'SELECT COUNT(*) as cnt FROM edges WHERE target = ?'
+    ).get(targetId) as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
   }
 
   /**

@@ -6,6 +6,35 @@
 
 import * as path from 'path';
 import { Node } from '../types';
+import { segmentChinese } from './jieba-helper';
+
+/**
+ * Enrich a CJK identifier name with jieba-segmented tokens for FTS indexing.
+ * "设置界面_插件组" → "设置界面_插件组  设置 界面 插件 组"
+ * The space-separated tokens allow FTS5 (unicode61) to match individual words.
+ * Returns the original string unchanged if no CJK characters are present.
+ */
+export function enrichCJKForFTS(name: string): string {
+  if (!/\p{Script=Han}/u.test(name)) return name;
+  const tokens = segmentChinese(name);
+  if (!tokens || tokens.length === 0) return name;
+  // Filter single-char tokens — they add noise to FTS
+  const meaningful = tokens.filter(t => t.length >= 2);
+  if (meaningful.length === 0) return name;
+  return name + '  ' + meaningful.join(' ');
+}
+
+/**
+ * Escape LIKE wildcard characters (_ and %) in a string.
+ * SQLite LIKE treats _ as "any single character" and % as "any sequence".
+ * Without escaping, searching for "_插件" would match "X插件", not literal "_插件".
+ *
+ * The ESCAPE character (\) must itself be escaped first, otherwise a literal
+ * backslash in the query silently alters or drops the next character.
+ */
+export function escapeLike(str: string): string {
+  return str.replace(/\\/g, '\\\\').replace(/([_%])/g, '\\$1');
+}
 
 /**
  * Common stop words to filter from search queries.
@@ -137,14 +166,51 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
   // Replace underscores and dots with spaces (snake_case, dot.notation)
   const normalised = camelSplit.replace(/[_.]+/g, ' ');
 
-  // Split on any non-alphanumeric character
-  const words = normalised.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  // Split on any non-alphanumeric character (Unicode-aware: preserves CJK, Cyrillic, etc.)
+  const words = normalised.split(/[^\p{L}\p{N}_]+/u).filter(Boolean);
 
   for (const word of words) {
     const lower = word.toLowerCase();
-    if (lower.length < 3) continue;
+    if (lower.length < 2) continue;
     if (STOP_WORDS.has(lower)) continue;
     tokens.add(lower);
+  }
+
+  // For non-ASCII queries (Chinese, Japanese, etc.), also add the raw query
+  // tokens directly — compound/snake patterns above won't match them, and
+  // FTS5 tokenizer needs the full identifier to work.
+  const hasNonAscii = /[^\x00-\x7F]/.test(query);
+  if (hasNonAscii) {
+    // Add raw query tokens (split by whitespace) directly
+    for (const raw of query.split(/[\s]+/)) {
+      const trimmed = raw.trim();
+      if (trimmed.length >= 2) {
+        tokens.add(trimmed.toLowerCase());
+      }
+    }
+
+    // Add jieba-segmented tokens for Chinese text.
+    // "设置界面系统" → adds "设置", "界面", "系统", "设置界面", "界面系统"
+    // Only trigger for CJK text (not all non-ASCII) to avoid useless
+    // segmentation of Greek, Cyrillic, accented Latin, etc.
+    const hasCJK = /\p{Script=Han}/u.test(query);
+    if (hasCJK) {
+      const jiebaTokens = segmentChinese(query);
+      if (jiebaTokens && jiebaTokens.length > 0) {
+        for (const token of jiebaTokens) {
+          if (token.length >= 2 && !STOP_WORDS.has(token.toLowerCase())) {
+            tokens.add(token.toLowerCase());
+          }
+        }
+        // Bigrams for compound symbol names
+        for (let i = 0; i <= jiebaTokens.length - 2; i++) {
+          const bigram = jiebaTokens.slice(i, i + 2).join('');
+          if (bigram.length >= 3) {
+            tokens.add(bigram.toLowerCase());
+          }
+        }
+      }
+    }
   }
 
   // Generate stem variants for broader FTS matching.
@@ -197,6 +263,12 @@ export function scorePathRelevance(filePath: string, query: string): number {
   const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
   if (!isTestQuery && isTestFile(filePath)) {
     score -= 15;
+  }
+
+  // Deprioritize dependency/patch/vendor files — they are rarely what the
+  // user wants when searching a project's own codebase.
+  if (isDependencyFile(filePath)) {
+    score -= 25;
   }
 
   return score;
@@ -264,6 +336,41 @@ function matchesNonProductionDir(lowerPath: string): boolean {
 }
 
 /**
+ * Check if a file is in a dependency/third-party directory that should be
+ * deprioritized in search results (patch, vendor, node_modules, etc.).
+ *
+ * Directory matching is split into two tiers:
+ * - Always-dep dirs: matched anywhere in the path (these are never real source)
+ * - Root-only dirs: only matched when the path starts with them, to avoid
+ *   false-positives like src/target/target.rs or src/build/build.js.
+ */
+export function isDependencyFile(filePath: string): boolean {
+  // Normalize to forward slashes for cross-platform matching
+  const lower = filePath.replace(/\\/g, '/').toLowerCase();
+
+  // Always-dependency directories — matched anywhere in the path
+  const alwaysDepDirs = ['patch/', 'vendor/', 'node_modules/', 'third_party/',
+    'thirdparty/', 'bower_components/', '.git/'];
+  for (const dir of alwaysDepDirs) {
+    if (lower.includes('/' + dir) || lower.startsWith(dir)) {
+      return true;
+    }
+  }
+
+  // Ambiguous directories — only matched at the project root (path starts with)
+  // to avoid false-positives on real source files named after these dirs.
+  // Also check includes('/dir/') to handle absolute paths (e.g. C:/project/target/).
+  const rootOnlyDirs = ['target/', 'build/', 'dist/', 'out/'];
+  for (const dir of rootOnlyDirs) {
+    if (lower.startsWith(dir) || lower.startsWith('./' + dir)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Bonus when a node's name matches the search query.
  * Exact matches get the largest boost; prefix matches get smaller boosts.
  * Multi-word queries also check individual term matches against the name.
@@ -272,9 +379,12 @@ export function nameMatchBonus(nodeName: string, query: string): number {
   const nameLower = nodeName.toLowerCase();
 
   // Split query into word-level terms (handles "CacheBuilder build" → ["cache","builder","build"])
+  // Splits on underscores first (snake_case), then on non-identifier characters.
+  // Unicode-aware: preserves CJK, Cyrillic and other non-ASCII identifier characters.
   const rawTerms = query
     .replace(/([a-z])([A-Z])/g, '$1 $2')
-    .split(/[\s_.\-]+/)
+    .split(/_+/)
+    .flatMap(part => part.split(/[^\p{L}\p{N}]+/u))
     .map(t => t.toLowerCase())
     .filter(t => t.length >= 2);
 
@@ -297,7 +407,7 @@ export function nameMatchBonus(nodeName: string, query: string): number {
     return Math.round(10 + 30 * ratio);
   }
 
-  // All camelCase-split terms appear in the name
+  // All split terms appear in the name
   if (rawTerms.length > 1) {
     const allMatch = rawTerms.every(t => nameLower.includes(t));
     if (allMatch) return 15;

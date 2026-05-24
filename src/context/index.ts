@@ -25,7 +25,8 @@ import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
 import { validatePathWithinRoot } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants } from '../search/query-utils';
+import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDependencyFile } from '../search/query-utils';
+import { segmentChinese } from '../search/jieba-helper';
 
 /**
  * Extract likely symbol names from a natural language query
@@ -65,6 +66,48 @@ function extractSymbolsFromQuery(query: string): string[] {
   while ((match = screamingPattern.exec(query)) !== null) {
     if (match[1]) {
       symbols.add(match[1]);
+    }
+  }
+
+  // Extract Unicode identifiers (Chinese, Japanese, etc.).
+  // Unicode letter/ideograph sequences of 2+ chars, optionally separated by _.
+  // Catches: 设置界面, 游戏设置_插件组, 输入动作 etc.
+  // Uses Unicode-aware lookbehind/lookahead instead of \b because \b only
+  // matches at \w (=[a-zA-Z0-9_]) boundaries — CJK characters are \W,
+  // so \b never fires between them.
+  const unicodeIdentPattern = /(?<![\p{L}\p{N}_])([\p{L}\p{N}_]{2,}(?:_[\p{L}\p{N}_]+)*)(?![\p{L}\p{N}_])/gu;
+  while ((match = unicodeIdentPattern.exec(query)) !== null) {
+    if (match[1] && match[1].length >= 2) {
+      symbols.add(match[1]);
+    }
+  }
+
+  // Segment Chinese natural language queries with jieba.
+  // For queries like "设置界面系统如何工作", jieba produces
+  // ["设置","界面","系统","如何","工作"] — each token becomes a
+  // candidate symbol name for exact-match lookup. Multi-char tokens
+  // are also combined into consecutive N-grams (e.g. "设置界面",
+  // "界面系统") to match compound symbol names.
+  const hasCJK = /\p{Script=Han}/u.test(query);
+  if (hasCJK) {
+    const jiebaTokens = segmentChinese(query);
+    if (jiebaTokens && jiebaTokens.length > 0) {
+      // Add individual tokens (2+ chars)
+      for (const token of jiebaTokens) {
+        if (token.length >= 2) {
+          symbols.add(token);
+        }
+      }
+      // Build consecutive bigrams/trigrams from adjacent tokens for
+      // compound symbol names: "设置" + "界面" → "设置界面"
+      for (let len = 2; len <= 3; len++) {
+        for (let i = 0; i <= jiebaTokens.length - len; i++) {
+          const ngram = jiebaTokens.slice(i, i + len).join('');
+          if (ngram.length >= 3) {
+            symbols.add(ngram);
+          }
+        }
+      }
     }
   }
 
@@ -477,6 +520,14 @@ export class ContextBuilder {
       }
     }
 
+    // Similarly deprioritize dependency/patch/vendor files — they flood results
+    // with symbols from patched dependencies that aren't the user's code.
+    for (const result of searchResults) {
+      if (isDependencyFile(result.node.filePath)) {
+        result.score *= 0.2;
+      }
+    }
+
     // Step 5a: Multi-term co-occurrence re-ranking (applied BEFORE truncation).
     // For multi-word queries like "search execution from request to shard",
     // nodes matching 2+ query terms in their name or path are far more relevant
@@ -582,6 +633,7 @@ export class ContextBuilder {
           if (!/[a-zA-Z]/.test(name.charAt(idx - 1))) continue;
           if (searchIdSet.has(r.node.id)) continue;
           if (isTestFile(r.node.filePath) && !isTestQuery) continue;
+          if (isDependencyFile(r.node.filePath)) continue;
 
           const pathScore = scorePathRelevance(r.node.filePath, query);
           const brevityBonus = Math.max(0, 6 - (name.length - titleCased.length) / 4);
@@ -649,6 +701,7 @@ export class ContextBuilder {
           for (const r of likeResults) {
             if (searchIdSet.has(r.node.id)) continue;
             if (isTestFile(r.node.filePath) && !isTestQuery) continue;
+          if (isDependencyFile(r.node.filePath)) continue;
             const entry = compoundTermMap.get(r.node.id);
             if (entry) {
               entry.terms.add(titleCased);
@@ -870,7 +923,7 @@ export class ContextBuilder {
       const maxNonProd = Math.max(3, Math.ceil(opts.maxNodes * 0.15));
       const nonProdIds: string[] = [];
       for (const [id, node] of finalNodes) {
-        if (isTestFile(node.filePath)) {
+        if (isTestFile(node.filePath) || isDependencyFile(node.filePath)) {
           nonProdIds.push(id);
         }
       }

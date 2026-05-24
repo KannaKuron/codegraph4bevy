@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 /**
  * Migration definition
@@ -62,6 +62,44 @@ const migrations: Migration[] = [
       db.exec(`
         DROP INDEX IF EXISTS idx_edges_source;
         DROP INDEX IF EXISTS idx_edges_target;
+      `);
+    },
+  },
+  {
+    version: 5,
+    description:
+      'Add fts_tokens column and rebuild nodes_fts with unicode61 tokenizer for CJK support',
+    up: (db) => {
+      db.exec(`
+        -- Add FTS token enrichment column
+        ALTER TABLE nodes ADD COLUMN fts_tokens TEXT DEFAULT '';
+
+        -- Rebuild FTS with unicode61 tokenizer, including fts_tokens column
+        DROP TRIGGER IF EXISTS nodes_ai;
+        DROP TRIGGER IF EXISTS nodes_ad;
+        DROP TRIGGER IF EXISTS nodes_au;
+        DROP TABLE IF EXISTS nodes_fts;
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+          id, name, qualified_name, docstring, signature, fts_tokens,
+          content='nodes', content_rowid='rowid',
+          tokenize='unicode61'
+        );
+        INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature, fts_tokens)
+        SELECT rowid, id, name, qualified_name, docstring, signature, fts_tokens FROM nodes;
+        CREATE TRIGGER nodes_ai AFTER INSERT ON nodes BEGIN
+          INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature, fts_tokens)
+          VALUES (NEW.rowid, NEW.id, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.fts_tokens);
+        END;
+        CREATE TRIGGER nodes_ad AFTER DELETE ON nodes BEGIN
+          INSERT INTO nodes_fts(nodes_fts, rowid, id, name, qualified_name, docstring, signature, fts_tokens)
+          VALUES ('delete', OLD.rowid, OLD.id, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.fts_tokens);
+        END;
+        CREATE TRIGGER nodes_au AFTER UPDATE ON nodes BEGIN
+          INSERT INTO nodes_fts(nodes_fts, rowid, id, name, qualified_name, docstring, signature, fts_tokens)
+          VALUES ('delete', OLD.rowid, OLD.id, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.fts_tokens);
+          INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature, fts_tokens)
+          VALUES (NEW.rowid, NEW.id, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.fts_tokens);
+        END;
       `);
     },
   },

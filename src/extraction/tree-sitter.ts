@@ -137,6 +137,8 @@ export class TreeSitterExtractor {
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
   private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
+  private _callEnrich: Map<string, Set<string>> | undefined; // callerId → callee names for FTS enrichment
+  private isExtractingPattern = false; // true while inside extractPatternReferences via match/if-let/matches!
 
   constructor(filePath: string, source: string, language?: Language) {
     this.filePath = filePath;
@@ -213,6 +215,26 @@ export class TreeSitterExtractor {
       this.nodeStack.push(fileNode.id);
       this.visitNode(this.tree.rootNode);
       this.nodeStack.pop();
+
+      // Bevy framework fallback: regex-scan chained add_systems patterns
+      // that the AST walker may miss (deeply nested field_expression chains).
+      if (this.language === 'rust') {
+        this.scanBevyPatternsFallback();
+      }
+
+      // Flush call enrichment: append tracked external method calls to
+      // caller node signatures so they are FTS-searchable.
+      if (this._callEnrich && this._callEnrich.size > 0) {
+        for (const [callerId, callees] of this._callEnrich) {
+          const node = this.nodes.find(n => n.id === callerId);
+          if (node && callees.size > 0) {
+            const calls = [...callees].sort().join(', ');
+            const entry = `calls: ${calls}`;
+            node.signature = node.signature ? `${node.signature}; ${entry}` : entry;
+          }
+        }
+        this._callEnrich.clear();
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
 
@@ -382,6 +404,57 @@ export class TreeSitterExtractor {
     // Rust: `impl Trait for Type { ... }` — creates implements edge from Type to Trait
     else if (nodeType === 'impl_item') {
       this.extractRustImplItem(node);
+    }
+    // match expressions: extract enum variant references from match arms.
+    // Flag is saved/restored so child recursion sees isExtractingPattern=true
+    // and skips scoped_identifier duplicate extraction.
+    else if (nodeType === 'match_expression') {
+      const saved = this.isExtractingPattern;
+      this.isExtractingPattern = true;
+      this.extractMatchReferences(node);
+      // Visit children with flag still true so scoped_identifiers in patterns are skipped
+      if (!skipChildren) {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) this.visitNode(child);
+        }
+      }
+      this.isExtractingPattern = saved;
+      return;
+    }
+    // if let expressions: extract enum variant references from the pattern
+    else if (nodeType === 'if_let_expression') {
+      const saved = this.isExtractingPattern;
+      this.isExtractingPattern = true;
+      this.extractIfLetReferences(node);
+      if (!skipChildren) {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) this.visitNode(child);
+        }
+      }
+      this.isExtractingPattern = saved;
+      return;
+    }
+    // matches! macro: extract enum variant references from the second argument
+    else if (nodeType === 'macro_invocation') {
+      const saved = this.isExtractingPattern;
+      this.isExtractingPattern = true;
+      this.extractMatchesMacroReferences(node);
+      if (!skipChildren) {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) this.visitNode(child);
+        }
+      }
+      this.isExtractingPattern = saved;
+      return;
+    }
+    // scoped_identifier in expression context (e.g. Enum::Variant as a value,
+    // function argument, or method receiver). Pattern contexts set
+    // isExtractingPattern and are skipped — they emit pattern_match edges separately.
+    else if (nodeType === 'scoped_identifier' && !this.isExtractingPattern && this.nodeStack.length > 0) {
+      this.extractScopedValueReference(node);
     }
 
     // Visit children (unless the extract method already visited them)
@@ -762,10 +835,6 @@ export class TreeSitterExtractor {
   private extractStruct(node: SyntaxNode): void {
     if (!this.extractor) return;
 
-    // Skip forward declarations and type references (no body = not a definition)
-    const body = getChildByField(node, this.extractor.bodyField);
-    if (!body) return;
-
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
@@ -781,15 +850,21 @@ export class TreeSitterExtractor {
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
     this.extractInheritance(node, structNode.id);
 
-    // Push to stack for field extraction
-    this.nodeStack.push(structNode.id);
-    for (let i = 0; i < body.namedChildCount; i++) {
-      const child = body.namedChild(i);
-      if (child) {
-        this.visitNode(child);
+    // Visit body children for field extraction.
+    // If there is no body, this is a unit struct (Rust: `pub struct Foo;`)
+    // or a forward declaration (C: `struct Foo;`). Both are valid symbols,
+    // so we create the node but skip field visiting.
+    const body = getChildByField(node, this.extractor.bodyField);
+    if (body) {
+      this.nodeStack.push(structNode.id);
+      for (let i = 0; i < body.namedChildCount; i++) {
+        const child = body.namedChild(i);
+        if (child) {
+          this.visitNode(child);
+        }
       }
+      this.nodeStack.pop();
     }
-    this.nodeStack.pop();
   }
 
   /**
@@ -797,11 +872,6 @@ export class TreeSitterExtractor {
    */
   private extractEnum(node: SyntaxNode): void {
     if (!this.extractor) return;
-
-    // Skip forward declarations and type references (no body = not a definition)
-    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
-    if (!body) return;
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
@@ -818,21 +888,25 @@ export class TreeSitterExtractor {
     // Extract inheritance (e.g. Swift: enum AFError: Error)
     this.extractInheritance(node, enumNode.id);
 
-    // Push to stack and visit body children (enum members, nested types, methods)
-    this.nodeStack.push(enumNode.id);
-
-    const memberTypes = this.extractor.enumMemberTypes;
-    for (let i = 0; i < body.namedChildCount; i++) {
-      const child = body.namedChild(i);
-      if (!child) continue;
-
-      if (memberTypes?.includes(child.type)) {
-        this.extractEnumMembers(child);
-      } else {
-        this.visitNode(child);
+    // Visit body children for enum member extraction.
+    // If there is no body, this is a forward declaration (C: `enum Foo;`).
+    // Still create the node but skip member visiting.
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (body) {
+      this.nodeStack.push(enumNode.id);
+      const memberTypes = this.extractor.enumMemberTypes;
+      for (let i = 0; i < body.namedChildCount; i++) {
+        const child = body.namedChild(i);
+        if (!child) continue;
+        if (memberTypes?.includes(child.type)) {
+          this.extractEnumMembers(child);
+        } else {
+          this.visitNode(child);
+        }
       }
+      this.nodeStack.pop();
     }
-    this.nodeStack.pop();
   }
 
   /**
@@ -843,7 +917,24 @@ export class TreeSitterExtractor {
     // Try field-based name first (e.g. Rust enum_variant has a 'name' field)
     const nameNode = getChildByField(node, 'name');
     if (nameNode) {
-      this.createNode('enum_member', getNodeText(nameNode, this.source), node);
+      const memberNode = this.createNode('enum_member', getNodeText(nameNode, this.source), node);
+      // Extract type references from variant associated data fields
+      // (e.g. Rust: `Variant(StructName)` or `Variant { field: Type }`)
+      if (memberNode) {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (!child) continue;
+          if (child.type === 'field_declaration') {
+            const fieldTypeNode = getChildByField(child, 'type');
+            if (fieldTypeNode) {
+              this.extractTypeRefsFromSubtree(fieldTypeNode, memberNode.id);
+            }
+          } else if (child.type === 'type_identifier' || child.type === 'scoped_type_identifier' || child.type === 'generic_type') {
+            // Tuple variant: `Variant(TypeName)`
+            this.extractTypeRefsFromSubtree(child, memberNode.id);
+          }
+        }
+      }
       return;
     }
 
@@ -860,6 +951,169 @@ export class TreeSitterExtractor {
     // If the node itself IS the identifier (e.g. TS property_identifier directly in enum body)
     if (!found && node.namedChildCount === 0) {
       this.createNode('enum_member', getNodeText(node, this.source), node);
+    }
+  }
+
+  /**
+   * Extract enum variant references from match expression arms.
+   * Creates `references` edges from the enclosing function/method to each
+   * enum variant referenced in match patterns.
+   */
+  private extractMatchReferences(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+
+    const arms: SyntaxNode[] = [];
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (!child) continue;
+      if (child.type === 'match_arm') {
+        arms.push(child);
+      } else if (child.type === 'match_block') {
+        for (let j = 0; j < child.namedChildCount; j++) {
+          const arm = child.namedChild(j);
+          if (arm && arm.type === 'match_arm') {
+            arms.push(arm);
+          }
+        }
+      }
+    }
+    for (const arm of arms) {
+      this.extractPatternReferences(arm, callerId);
+    }
+  }
+
+  /**
+   * Extract enum variant references from if-let expressions.
+   * The pattern lives in the let_condition child.
+   */
+  private extractIfLetReferences(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (!child) continue;
+      if (child.type === 'let_condition' || child.type === 'match_pattern') {
+        this.extractPatternReferences(child, callerId);
+      } else if (child.type === 'scoped_identifier' || child.type === 'identifier') {
+        this.extractPatternReferences(child, callerId);
+      }
+    }
+  }
+
+  /**
+   * Extract enum variant references from the matches! macro invocation.
+   * matches!(expr, Pattern::Variant) — the second argument is the pattern.
+   */
+  private extractMatchesMacroReferences(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+
+    // Check if this is a `matches!` macro
+    let isMatches = false;
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child && (child.type === 'identifier' || child.type === 'macro_name')) {
+        const text = getNodeText(child, this.source);
+        if (text === 'matches') {
+          isMatches = true;
+          break;
+        }
+      }
+    }
+    if (!isMatches) return;
+
+    // Find the single token_tree and extract pattern references from the
+    // second argument (after the first comma separator). For `matches!(expr, Pattern)`
+    // there is only one token_tree child containing both arguments.
+    // Use .children (not .namedChildren) because the comma is an anonymous node.
+    const tokenTree = node.namedChildren.find(c => c.type === 'token_tree');
+    if (!tokenTree || !tokenTree.children) return;
+    let seenComma = false;
+    for (let i = 0; i < tokenTree.children.length; i++) {
+      const child = tokenTree.children[i];
+      if (!child) continue;
+      if (!seenComma && child.type === ',') { seenComma = true; continue; }
+      if (seenComma) {
+        this.extractPatternReferences(child, callerId);
+      }
+    }
+  }
+
+  /**
+   * Extract a reference from a scoped identifier used in expression/value position
+   * (e.g. `Enum::Variant` as a function argument, method receiver, or range bound).
+   * Pattern contexts (match arms, if-let, matches! macro) are guarded by
+   * isExtractingPattern and handled separately as pattern_match edges.
+   */
+  private extractScopedValueReference(node: SyntaxNode): void {
+    const name = getNodeText(node, this.source);
+    if (!name || !name.includes('::')) return;
+
+    const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+    if (!fromNodeId) return;
+
+    // Skip module-level references — the stack top is the file node,
+    // and a file--references-->symbol edge is semantically meaningless.
+    if (fromNodeId.startsWith('file:')) return;
+
+    console.error(`[P0-DIAG] ref: fromNodeId=${fromNodeId} name=${name} line=${node.startPosition.row + 1}`);
+
+    this.unresolvedReferences.push({
+      fromNodeId,
+      referenceName: name,
+      referenceKind: 'references',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
+  /**
+   * Recursively extract enum variant references from a pattern subtree.
+   * Handles scoped_identifier (Enum::Variant), identifier (bare variant
+   * after `use` import), and nested patterns (Some(Foo::Bar) tuples/structs).
+   */
+  private extractPatternReferences(node: SyntaxNode, fromNodeId: string, edgeKind: 'references' | 'pattern_match' = 'pattern_match'): void {
+    if (node.type === 'scoped_identifier') {
+      const name = getNodeText(node, this.source);
+      if (name && name.includes('::')) {
+        this.unresolvedReferences.push({
+          fromNodeId,
+          referenceName: name,
+          referenceKind: edgeKind,
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+    if (node.type === 'identifier') {
+      const name = getNodeText(node, this.source);
+      // Only emit bare identifiers as pattern references when they start
+      // with an uppercase letter (PascalCase). Lowercase identifiers in
+      // match patterns are binding variables (e.g. `Some(v) =>`), not
+      // enum variant references. This heuristic works across Rust, Swift,
+      // and OCaml where enum variants are conventionally PascalCase.
+      const firstChar = name ? name[0] : undefined;
+      if (firstChar && firstChar === firstChar.toUpperCase() && firstChar !== '_' && !this.BUILTIN_TYPES.has(name!)) {
+        this.unresolvedReferences.push({
+          fromNodeId,
+          referenceName: name!,
+          referenceKind: edgeKind,
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+    // Recurse into nested patterns (tuple_pattern, struct_pattern, or_pattern, etc.)
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) this.extractPatternReferences(child, fromNodeId, edgeKind);
     }
   }
 
@@ -946,12 +1200,15 @@ export class TreeSitterExtractor {
           if (!nameNode) continue;
           const name = getNodeText(nameNode, this.source);
           const signature = typeText ? `${typeText} $${name}` : `$${name}`;
-          this.createNode('field', name, elem, {
+          const fieldNode = this.createNode('field', name, elem, {
             docstring,
             signature,
             visibility,
             isStatic,
           });
+          if (fieldNode && typeNode) {
+            this.extractTypeRefsFromSubtree(typeNode, fieldNode.id);
+          }
         }
         return;
       }
@@ -983,19 +1240,33 @@ export class TreeSitterExtractor {
         });
         // Java/Kotlin annotations / TS field decorators sit on the
         // outer field_declaration, not on the individual declarator.
-        if (fieldNode) this.extractDecoratorsFor(node, fieldNode.id);
+        if (fieldNode) {
+          this.extractDecoratorsFor(node, fieldNode.id);
+          if (typeNode) {
+            this.extractTypeRefsFromSubtree(typeNode, fieldNode.id);
+          }
+        }
       }
     } else {
-      // Fallback: try to find an identifier child directly
+      // Fallback: try to find an identifier child directly.
+      // Covers Rust field_declaration, C/C++ field_declaration, etc.
       const nameNode = getChildByField(node, 'name')
         || node.namedChildren.find(c => c.type === 'identifier');
       if (nameNode) {
         const name = getNodeText(nameNode, this.source);
-        this.createNode('field', name, node, {
+        // Extract type annotation if present (e.g. Rust: `field: Type`)
+        const typeNode = getChildByField(node, 'type');
+        const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
+        const signature = typeText ? `${name}: ${typeText}` : name;
+        const fieldNode = this.createNode('field', name, node, {
           docstring,
+          signature,
           visibility,
           isStatic,
         });
+        if (fieldNode && typeNode) {
+          this.extractTypeRefsFromSubtree(typeNode, fieldNode.id);
+        }
       }
     }
   }
@@ -1139,6 +1410,29 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
       });
+    } else if (this.language === 'rust' && (node.type === 'const_item' || node.type === 'static_item')) {
+      // Rust const/static items: extract type refs from the type annotation
+      // and enum variant references from the initializer value so that
+      // impact analysis can trace dependencies through constants.
+      const nameNode = getChildByField(node, 'name');
+      if (nameNode) {
+        const name = getNodeText(nameNode, this.source);
+        const isConstItem = node.type === 'const_item';
+        const itemKind: NodeKind = isConstItem ? 'constant' : 'variable';
+        const varNode = this.createNode(itemKind, name, nameNode, { docstring, isExported });
+        if (varNode) {
+          // Extract type annotation references (e.g. `const X: SomeType = ...`)
+          const typeNode = getChildByField(node, 'type');
+          if (typeNode) {
+            this.extractTypeRefsFromSubtree(typeNode, varNode.id);
+          }
+          // Extract references from initializer value (e.g. `= Enum::Variant`)
+          const valueNode = getChildByField(node, 'value') ?? getChildByField(node, 'body');
+          if (valueNode) {
+            this.extractPatternReferences(valueNode, varNode.id, 'references');
+          }
+        }
+      }
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
@@ -1479,6 +1773,263 @@ export class TreeSitterExtractor {
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
       });
+
+      // Track method/external calls in the caller node's signature so
+      // queries like "insert_resource" or "add_message" are searchable
+      // even when the target is an external API (Bevy, std, etc.).
+      if ((calleeName.includes('.') || calleeName.includes('::')) && this._callEnrich === undefined) {
+        this._callEnrich = new Map<string, Set<string>>();
+      }
+      if (this._callEnrich) {
+        let called = this._callEnrich.get(callerId);
+        if (!called) { called = new Set(); this._callEnrich.set(callerId, called); }
+        if (called.size < 8) called.add(calleeName);
+      }
+    }
+
+    // Bevy framework: extract system function references from API call args.
+    // Patterns like app.add_systems(Update, fn), OnEnter(State::Variant), etc.
+    if (this.language === 'rust') {
+      this.extractBevyCallRefs(node, callerId, calleeName);
+    }
+    // Also scan for Bevy patterns inside any call expression arguments
+    // (catches chained calls and nested API patterns).
+    if (this.language === 'rust') {
+      this.extractBevyNestedRefs(node, callerId);
+    }
+  }
+
+  /**
+   * Recursively scan call expression arguments for Bevy API patterns
+   * (OnEnter, OnExit, add_systems, etc.) at any nesting level.
+   * This catches patterns inside chained calls where the top-level
+   * extractCall only sees the outermost method name.
+   */
+  private extractBevyNestedRefs(node: SyntaxNode, callerId: string): void {
+    const args = getChildByField(node, 'arguments') ?? node.namedChildren.find(
+      c => c.type === 'arguments'
+    );
+    if (!args) return;
+
+    const scanForBevy = (child: SyntaxNode): void => {
+      if (child.type === 'call_expression') {
+        // Check if this is a Bevy API call: OnEnter(X), OnExit(X), etc.
+        const func = getChildByField(child, 'function') ?? child.namedChild(0);
+        if (func) {
+          const name = getNodeText(func, this.source);
+          if (this.BEVY_STATE_FUNCTIONS.has(name)) {
+            this.extractBevyCallRefs(child, callerId, name);
+          } else if (name.endsWith('.add_systems') || name.endsWith('.observe')
+            || name.endsWith('.add_plugins') || name.includes('::init_resource')
+            || name.includes('::add_event') || name.includes('::insert_resource')) {
+            this.extractBevyCallRefs(child, callerId, name);
+          }
+        }
+      }
+      // Recurse into all children for nested patterns
+      for (let i = 0; i < child.namedChildCount; i++) {
+        const c = child.namedChild(i);
+        if (c) scanForBevy(c);
+      }
+    };
+
+    for (let i = 0; i < args.namedChildCount; i++) {
+      const child = args.namedChild(i);
+      if (child) scanForBevy(child);
+    }
+  }
+
+  /**
+   * Regex-based fallback scanner for Bevy add_systems patterns.
+   * Handles chained calls where the AST walker may not correctly
+   * identify the system function arguments.
+   */
+  private static readonly ADD_SYSTEMS_RE = /\.?(add_systems|add_plugins|observe)\s*\(/;
+  private static readonly IDENT_EXCLUDE_RE = /^(?:Update|FixedUpdate|PreUpdate|PostUpdate|Last|Startup|First|OnEnter|OnExit|in_state|resource_exists|run_if|after|before|chain|pipe|and_then|or_else|map|filter|let|mut|use|fn|pub|impl|for|self|app|Res|ResMut|Commands|Query|EventWriter|EventReader|MessageWriter|MessageReader|Local|NextState|DespawnOnExit|with_child|spawn|insert|remove|entity|commands)$/;
+  // Matches standalone identifiers optionally followed by .method, comma, or closing paren
+  private static readonly SYSTEM_IDENT_RE = /(?:^|[,\s(]+)([\w一-鿿][\w一-鿿]*(?:::\w+)?)\s*(?=\.\w|[,\\)]|$)/g;
+
+  private scanBevyPatternsFallback(): void {
+    const existingKeys = new Set(
+      this.unresolvedReferences.map(r =>
+        `${r.fromNodeId}:${r.referenceName}:${r.referenceKind}:${r.line}`
+      )
+    );
+
+    // Map line → callerId from extracted function/method nodes
+    const lineToCaller = new Map<number, string>();
+    for (const node of this.nodes) {
+      if (node.kind === 'function' || node.kind === 'method') {
+        for (let l = node.startLine; l <= node.endLine; l++) {
+          lineToCaller.set(l, node.id);
+        }
+      }
+    }
+    // Fallback: also use current nodeStack for lines not covered
+    const stackCallerId = this.nodeStack.length > 0
+      ? this.nodeStack[this.nodeStack.length - 1]
+      : '';
+
+    const source = this.source;
+    const lines = source.split('\n');
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const apiMatch = TreeSitterExtractor.ADD_SYSTEMS_RE.exec(line);
+      if (!apiMatch) continue;
+
+      // Determine edge kind from the API method name
+      const apiMethod = apiMatch[1]!;
+      const edgeKind: 'calls' | 'instantiates' =
+        apiMethod === 'add_plugins' ? 'instantiates' : 'calls';
+
+      // Scan through to the matching closing paren
+      let parenDepth = 0;
+      let seenScheduleComma = false;
+      for (let j = i; j < lines.length; j++) {
+        const sl = lines[j]!;
+
+        // Track paren depth WITHIN this line for comma detection
+        let lineParenDepth = 0;
+        for (let k = 0; k < sl.length; k++) {
+          if (sl[k] === '(') { parenDepth++; lineParenDepth++; }
+          if (sl[k] === ')') { parenDepth--; lineParenDepth--; }
+        }
+
+        // Detect schedule comma: first comma at depth 1 (inside the call parens)
+        // but NOT inside a nested sub-expression (depth > 1)
+        if (!seenScheduleComma && parenDepth >= 1) {
+          const commaPos = sl.indexOf(',');
+          if (commaPos >= 0) {
+            // Count open parens before the comma to verify it's at depth 1
+            let preCommaParens = 0;
+            for (let k = 0; k < commaPos; k++) {
+              if (sl[k] === '(') preCommaParens++;
+              if (sl[k] === ')') preCommaParens--;
+            }
+            // At line start, depth should be 1 (the opening paren of add_systems)
+            // minus any closing parens before the comma
+            if (preCommaParens <= 1) {
+              seenScheduleComma = true;
+            }
+          }
+        }
+
+        if (seenScheduleComma && parenDepth >= 1) {
+          // Reset regex lastIndex and find ALL identifiers on this line
+          const identRe = TreeSitterExtractor.SYSTEM_IDENT_RE;
+          identRe.lastIndex = 0;
+          let identMatch;
+          while ((identMatch = identRe.exec(sl)) !== null) {
+            const name = identMatch[1]!;
+            if (TreeSitterExtractor.IDENT_EXCLUDE_RE.test(name)) continue;
+
+            const callerId = lineToCaller.get(j + 1) || stackCallerId;
+            if (callerId) {
+              const key = `${callerId}:${name}:${edgeKind}:${j + 1}`;
+              if (!existingKeys.has(key)) {
+                existingKeys.add(key);
+                this.unresolvedReferences.push({
+                  fromNodeId: callerId,
+                  referenceName: name,
+                  referenceKind: edgeKind,
+                  line: j + 1,
+                  column: identMatch.index + 1,
+                });
+              }
+            }
+          }
+        }
+
+        if (parenDepth <= 0) break;
+      }
+    }
+  }
+
+  /**
+   * Scan the arguments of a call expression for Bevy framework patterns.
+   * Extracts additional call/instantiates/references edges for:
+   * - app.add_systems(schedule, fn) / app.add_systems(schedule, (fn1, fn2))
+   * - app.add_plugins(PluginType)
+   * - app.init_resource::<T>() / app.add_event::<T>() / app.insert_resource(T)
+   * - OnEnter(State) / OnExit(State)
+   * - app.observe(fn)
+   */
+  private readonly BEVY_SYSTEM_METHODS = new Set([
+    'add_systems', 'observe',
+  ]);
+  private readonly BEVY_INSTANTIATE_METHODS = new Set([
+    'add_plugins', 'init_resource', 'add_event', 'insert_resource',
+  ]);
+  private readonly BEVY_STATE_FUNCTIONS = new Set([
+    'OnEnter', 'OnExit',
+  ]);
+
+  private extractBevyCallRefs(node: SyntaxNode, callerId: string, calleeName: string): void {
+    // Extract just the method/function name from the callee, stripping
+    // turbofish type params (e.g., "app.init_resource::<T>" → "init_resource")
+    const lastDot = calleeName.lastIndexOf('.');
+    let methodName = lastDot >= 0 ? calleeName.slice(lastDot + 1) : calleeName;
+    const turbofish = methodName.indexOf('::<');
+    if (turbofish >= 0) methodName = methodName.slice(0, turbofish);
+
+    const isSystemCall = this.BEVY_SYSTEM_METHODS.has(methodName);
+    const isInstantiateCall = this.BEVY_INSTANTIATE_METHODS.has(methodName);
+    const isStateCall = this.BEVY_STATE_FUNCTIONS.has(calleeName);
+
+    if (!isSystemCall && !isInstantiateCall && !isStateCall) return;
+
+    const edgeKind = isInstantiateCall ? 'instantiates'
+      : isStateCall ? 'references'
+      : 'calls';
+
+    // Find the arguments node
+    const args = getChildByField(node, 'arguments') ?? node.namedChildren.find(
+      c => c.type === 'arguments'
+    );
+    if (!args) return;
+
+    // Collect function identifiers from arguments. Only add_systems has a
+    // schedule as its first argument — skip it to get the system functions.
+    // observe(), init_resource, add_event, and add_plugins all have the
+    // relevant symbol as their first (and often only) argument.
+    const startIdx = (methodName === 'add_systems') ? 1 : 0;
+
+    const collectFuncRefs = (child: SyntaxNode, skip: number): void => {
+      if (skip > 0) { skip--; return; }
+      if (child.type === 'tuple_expression' || child.type === 'token_tree') {
+        // Tuple: (fn1, fn2, ...) — extract each
+        for (let i = 0; i < child.namedChildCount; i++) {
+          const item = child.namedChild(i);
+          if (item) collectFuncRefs(item, 0);
+        }
+        return;
+      }
+      if (child.type === 'identifier' || child.type === 'scoped_identifier') {
+        const name = getNodeText(child, this.source);
+        if (name) {
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: name,
+            referenceKind: edgeKind,
+            line: child.startPosition.row + 1,
+            column: child.startPosition.column,
+          });
+        }
+        return;
+      }
+      // Unwrap chained method calls: `fn_name.run_if(...).after(...)` →
+      // the root identifier is `fn_name` (a system function reference).
+      if (child.type === 'field_expression') {
+        const value = getChildByField(child, 'value') ?? child.namedChild(0);
+        if (value) collectFuncRefs(value, 0);
+        return;
+      }
+    };
+
+    for (let i = 0; i < args.namedChildCount; i++) {
+      const child = args.namedChild(i);
+      if (child) collectFuncRefs(child, startIdx > i ? 1 : 0);
     }
   }
 
@@ -1700,6 +2251,47 @@ export class TreeSitterExtractor {
       if (this.extractor!.interfaceTypes.includes(nodeType)) {
         this.extractInterface(node);
         return;
+      }
+
+      // Pattern / scoped-identifier extraction — mirror visitNode dispatch
+      // so enum variant references inside function bodies are tracked.
+      // Flag is saved/restored to prevent the child recursion from creating
+      // duplicate edges for scoped_identifiers already handled as patterns.
+      if (nodeType === 'match_expression') {
+        const saved = this.isExtractingPattern;
+        this.isExtractingPattern = true;
+        this.extractMatchReferences(node);
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) visitForCallsAndStructure(child);
+        }
+        this.isExtractingPattern = saved;
+        return;
+      }
+      if (nodeType === 'if_let_expression') {
+        const saved = this.isExtractingPattern;
+        this.isExtractingPattern = true;
+        this.extractIfLetReferences(node);
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) visitForCallsAndStructure(child);
+        }
+        this.isExtractingPattern = saved;
+        return;
+      }
+      if (nodeType === 'macro_invocation') {
+        const saved = this.isExtractingPattern;
+        this.isExtractingPattern = true;
+        this.extractMatchesMacroReferences(node);
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) visitForCallsAndStructure(child);
+        }
+        this.isExtractingPattern = saved;
+        return;
+      }
+      if (nodeType === 'scoped_identifier' && !this.isExtractingPattern && this.nodeStack.length > 0) {
+        this.extractScopedValueReference(node);
       }
 
       for (let i = 0; i < node.namedChildCount; i++) {
@@ -1988,6 +2580,14 @@ export class TreeSitterExtractor {
         line: traitNode.startPosition.row + 1,
         column: traitNode.startPosition.column,
       });
+      // Enrich the type node's signature so the trait name is FTS-searchable.
+      // Makes "codegraph_search Plugin" find `impl Plugin for MyPlugin`.
+      const targetNode = this.nodes.find(n => n.id === typeNodeId);
+      if (targetNode) {
+        const existing = targetNode.signature ?? '';
+        const implEntry = `implements ${traitName}`;
+        targetNode.signature = existing ? `${existing}; ${implEntry}` : implEntry;
+      }
     }
   }
 

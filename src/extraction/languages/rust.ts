@@ -14,6 +14,7 @@ export const rustExtractor: LanguageExtractor = {
   importTypes: ['use_declaration'],
   callTypes: ['call_expression'],
   variableTypes: ['let_declaration', 'const_item', 'static_item'],
+  fieldTypes: ['field_declaration'],
   interfaceKind: 'trait',
   nameField: 'name',
   bodyField: 'body',

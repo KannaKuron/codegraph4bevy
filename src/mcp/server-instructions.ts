@@ -36,14 +36,15 @@ of calls; a grep/read exploration is dozens.
 
 ## Tool selection by intent
 
-- **"What is the symbol named X?"** → \`codegraph_search\`
+- **"What is the symbol named X?"** → \`codegraph_search\` (use \`referencesType\` param to find all symbols referencing a type; use \`impl_for\` to find all implementors of a trait/interface)
 - **"What's the deal with this task / feature / area?"** → \`codegraph_context\` (PRIMARY — composes search + node + callers + callees in one call)
 - **"What calls this?"** → \`codegraph_callers\`
 - **"What does this call?"** → \`codegraph_callees\`
+- **"Where is this symbol used (any kind)?"** → \`codegraph_usages\` (broader than callers — covers calls, refs, type annotations, instantiations; use \`kind: "pattern_match"\` to find only match/if-let sites)
 - **"What would changing this break?"** → \`codegraph_impact\`
 - **"Show me this symbol's source / signature / docstring."** → \`codegraph_node\`
-- **"Show me several related symbols' source / survey an area."** → \`codegraph_explore\` (ONE capped call; prefer over many codegraph_node/Read)
-- **"What's in directory X?"** → \`codegraph_files\`
+- **"Show me several related symbols' source / survey an area."** → \`codegraph_explore\` (ONE capped call; prefer over many codegraph_node/Read; use \`path\` to filter by directory, \`strict\` to limit results to that directory, \`sourceOnly\` to skip relationship map)
+- **"What's in directory X?"** → \`codegraph_files\` (use \`symbols: true\` to include top-level symbol names)
 - **"Is the index ready / what's its size?"** → \`codegraph_status\`
 
 ## Common chains

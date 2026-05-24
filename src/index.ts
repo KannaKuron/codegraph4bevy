@@ -21,6 +21,7 @@ import {
   TaskContext,
   BuildContextOptions,
   FindRelevantContextOptions,
+  EdgeKind,
 } from './types';
 import { DatabaseConnection, getDatabasePath } from './db';
 import { QueryBuilder } from './db/queries';
@@ -618,6 +619,20 @@ export class CodeGraph {
     return this.queries.searchNodes(query, options);
   }
 
+  /**
+   * Find nodes that reference a given type (via type_of/references/returns edges).
+   */
+  findNodesByReferencedType(typeName: string, options?: SearchOptions & { edgeKinds?: EdgeKind[] }): SearchResult[] {
+    return this.queries.findNodesByReferencedType(typeName, options);
+  }
+
+  /**
+   * Find nodes that implement a given trait/interface.
+   */
+  findImplementors(traitName: string, options?: SearchOptions): SearchResult[] {
+    return this.queries.findImplementors(traitName, options);
+  }
+
   // ===========================================================================
   // Edge Operations
   // ===========================================================================
@@ -632,8 +647,15 @@ export class CodeGraph {
   /**
    * Get incoming edges to a node
    */
-  getIncomingEdges(nodeId: string): Edge[] {
-    return this.queries.getIncomingEdges(nodeId);
+  getIncomingEdges(nodeId: string, kinds?: EdgeKind[]): Edge[] {
+    return this.queries.getIncomingEdges(nodeId, kinds);
+  }
+
+  /**
+   * Count incoming edges for a node (fast COUNT query, avoids fetching all rows).
+   */
+  getIncomingEdgeCount(nodeId: string): number {
+    return this.queries.getIncomingEdgeCount(nodeId);
   }
 
   // ===========================================================================
