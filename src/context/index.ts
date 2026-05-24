@@ -1209,16 +1209,23 @@ export class ContextBuilder {
     const edgeCount = subgraph.edges.length;
     const files = this.getRelatedFiles(subgraph);
 
-    const entryPointNames = entryPoints
-      .slice(0, 3)
-      .map((n) => n.name)
-      .join(', ');
+    const entryLines: string[] = [];
+    for (const node of entryPoints.slice(0, 5)) {
+      const callerCount = this.queries.getIncomingEdgeCount(node.id, ['calls']);
+      const refCount = this.queries.getIncomingEdgeCount(node.id, ['references', 'type_of']);
+      const patternCount = this.queries.getIncomingEdgeCount(node.id, ['pattern_match']);
+      const parts: string[] = [`${node.name} (${node.kind})`];
+      if (callerCount > 0) parts.push(`${callerCount} callers`);
+      if (refCount > 0) parts.push(`${refCount} refs`);
+      if (patternCount > 0) parts.push(`${patternCount} patterns`);
+      entryLines.push(`  ${parts.join(' — ')}`);
+    }
 
-    const remaining = entryPoints.length > 3 ? ` and ${entryPoints.length - 3} more` : '';
+    const remaining = entryPoints.length > 5 ? `\n  ... and ${entryPoints.length - 5} more entry points` : '';
 
     return `Found ${nodeCount} relevant code symbols across ${files.length} files. ` +
-      `Key entry points: ${entryPointNames}${remaining}. ` +
-      `${edgeCount} relationships identified.`;
+      `${edgeCount} relationships identified.\n` +
+      `Key entry points:\n${entryLines.join('\n')}${remaining}`;
   }
 
   /**

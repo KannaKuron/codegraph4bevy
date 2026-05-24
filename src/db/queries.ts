@@ -186,6 +186,14 @@ export class QueryBuilder {
     this.db = db;
   }
 
+  /**
+   * Run a function inside a database transaction.
+   * If the function throws, the transaction is rolled back automatically.
+   */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
   // ===========================================================================
   // Node Operations
   // ===========================================================================
@@ -1238,7 +1246,12 @@ export class QueryBuilder {
    * Count incoming edges for a node (much faster than getIncomingEdges().length
    * because it uses COUNT(*) instead of fetching all rows).
    */
-  getIncomingEdgeCount(targetId: string): number {
+  getIncomingEdgeCount(targetId: string, kinds?: EdgeKind[]): number {
+    if (kinds && kinds.length > 0) {
+      const sql = `SELECT COUNT(*) as cnt FROM edges WHERE target = ? AND kind IN (${kinds.map(() => '?').join(',')})`;
+      const row = this.db.prepare(sql).get(targetId, ...kinds) as { cnt: number } | undefined;
+      return row?.cnt ?? 0;
+    }
     const row = this.db.prepare(
       'SELECT COUNT(*) as cnt FROM edges WHERE target = ?'
     ).get(targetId) as { cnt: number } | undefined;
@@ -1638,6 +1651,71 @@ export class QueryBuilder {
   }
 
   /**
+   * Delete all comments for a file (call before re-indexing).
+   */
+  deleteComments(filePath: string): void {
+    this.db.prepare('DELETE FROM comments WHERE file_path = ?').run(filePath);
+  }
+
+  /**
+   * Insert a comment entry.
+   */
+  insertComment(comment: { filePath: string; startLine: number; endLine: number; text: string; kind: string; associatedSymbol?: string }): void {
+    this.db.prepare(
+      'INSERT INTO comments (file_path, start_line, end_line, text, kind, associated_symbol) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(comment.filePath, comment.startLine, comment.endLine, comment.text, comment.kind, comment.associatedSymbol ?? null);
+  }
+
+  /**
+   * Search comments by text using FTS5.
+   */
+  searchComments(query: string, limit: number = 20): Array<{
+    filePath: string;
+    startLine: number;
+    endLine: number;
+    text: string;
+    kind: string;
+    associatedSymbol: string | null;
+  }> {
+    // Sanitize FTS5 query — same logic as searchNodesFTS
+    const ftsQuery = query
+      .replace(/::/g, ' ')
+      .replace(/['"*():^]/g, '')
+      .split(/\s+/)
+      .filter(term => term.length > 0)
+      .filter(term => !/^(AND|OR|NOT|NEAR)$/i.test(term))
+      .map(term => `"${term}"*`)
+      .join(' OR ');
+
+    if (!ftsQuery) return [];
+
+    const sql = `
+      SELECT c.file_path, c.start_line, c.end_line, c.text, c.kind, c.associated_symbol
+      FROM comments_fts f
+      JOIN comments c ON c.rowid = f.rowid
+      WHERE comments_fts MATCH ?
+      ORDER BY rank
+      LIMIT ?
+    `;
+    const rows = this.db.prepare(sql).all(ftsQuery, limit) as Array<{
+      file_path: string;
+      start_line: number;
+      end_line: number;
+      text: string;
+      kind: string;
+      associated_symbol: string | null;
+    }>;
+    return rows.map(r => ({
+      filePath: r.file_path,
+      startLine: r.start_line,
+      endLine: r.end_line,
+      text: r.text,
+      kind: r.kind,
+      associatedSymbol: r.associated_symbol,
+    }));
+  }
+
+  /**
    * Clear all data from the database
    */
   clear(): void {
@@ -1647,6 +1725,7 @@ export class QueryBuilder {
       this.db.exec('DELETE FROM edges');
       this.db.exec('DELETE FROM nodes');
       this.db.exec('DELETE FROM files');
+      this.db.exec('DELETE FROM comments');
     })();
   }
 }

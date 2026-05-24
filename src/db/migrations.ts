@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Migration definition
@@ -99,6 +99,44 @@ const migrations: Migration[] = [
           VALUES ('delete', OLD.rowid, OLD.id, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.fts_tokens);
           INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature, fts_tokens)
           VALUES (NEW.rowid, NEW.id, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.fts_tokens);
+        END;
+      `);
+    },
+  },
+  {
+    version: 6,
+    description: 'Add comments table with FTS index for searchable code comments (FIXME, TODO, etc.)',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS comments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          file_path TEXT NOT NULL,
+          start_line INTEGER NOT NULL,
+          end_line INTEGER NOT NULL,
+          text TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'line',
+          associated_symbol TEXT DEFAULT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_comments_file_path ON comments(file_path);
+        CREATE INDEX IF NOT EXISTS idx_comments_associated ON comments(associated_symbol);
+        CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
+          text, associated_symbol,
+          content='comments', content_rowid='rowid',
+          tokenize='unicode61'
+        );
+        CREATE TRIGGER IF NOT EXISTS comments_ai AFTER INSERT ON comments BEGIN
+          INSERT INTO comments_fts(rowid, text, associated_symbol)
+          VALUES (NEW.rowid, NEW.text, NEW.associated_symbol);
+        END;
+        CREATE TRIGGER IF NOT EXISTS comments_ad AFTER DELETE ON comments BEGIN
+          INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol)
+          VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol);
+        END;
+        CREATE TRIGGER IF NOT EXISTS comments_au AFTER UPDATE ON comments BEGIN
+          INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol)
+          VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol);
+          INSERT INTO comments_fts(rowid, text, associated_symbol)
+          VALUES (NEW.rowid, NEW.text, NEW.associated_symbol);
         END;
       `);
     },

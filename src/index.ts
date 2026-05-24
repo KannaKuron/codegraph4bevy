@@ -627,6 +627,20 @@ export class CodeGraph {
   }
 
   /**
+   * Search comments via FTS5 by text content.
+   */
+  searchComments(query: string, limit?: number): Array<{
+    filePath: string;
+    startLine: number;
+    endLine: number;
+    text: string;
+    kind: string;
+    associatedSymbol: string | null;
+  }> {
+    return this.queries.searchComments(query, limit);
+  }
+
+  /**
    * Find nodes that implement a given trait/interface.
    */
   findImplementors(traitName: string, options?: SearchOptions): SearchResult[] {
@@ -654,8 +668,8 @@ export class CodeGraph {
   /**
    * Count incoming edges for a node (fast COUNT query, avoids fetching all rows).
    */
-  getIncomingEdgeCount(nodeId: string): number {
-    return this.queries.getIncomingEdgeCount(nodeId);
+  getIncomingEdgeCount(nodeId: string, kinds?: EdgeKind[]): number {
+    return this.queries.getIncomingEdgeCount(nodeId, kinds);
   }
 
   // ===========================================================================

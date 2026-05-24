@@ -276,6 +276,7 @@ interface PropertySchema {
   description: string;
   enum?: string[];
   default?: unknown;
+  items?: { type: string };
 }
 
 /**
@@ -319,11 +320,16 @@ export const tools: ToolDefinition[] = [
         kind: {
           type: 'string',
           description: 'Filter by node kind',
-          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component'],
+          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component', 'comment'],
         },
         referencesType: {
           type: 'string',
           description: 'Find symbols that reference this type (via type_of/references/returns edges). When set, query is used only as a fallback if referencesType yields no results.',
+        },
+        mutability: {
+          type: 'string',
+          description: 'When referencesType is set, filter by borrowing mode: "mut" (mutable borrow, ResMut), "shared" (shared borrow, Res, &T), or "owning" (owned value, return type). Use to separate writers from readers of a resource.',
+          enum: ['mut', 'shared', 'owning'],
         },
         impl_for: {
           type: 'string',
@@ -366,7 +372,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callers',
-    description: 'Find all functions/methods that call a specific symbol. Useful for understanding usage patterns and impact of changes.',
+    description: 'Find all functions/methods that call a specific symbol. Returns call-site line numbers and single-line source snippets, not just function definition locations. Useful for understanding usage patterns and impact of changes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -386,7 +392,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callees',
-    description: 'Find all functions/methods that a specific symbol calls. Useful for understanding dependencies and code flow.',
+    description: 'Find all functions/methods that a specific symbol calls. Returns call-site line numbers and single-line source snippets. Useful for understanding dependencies and code flow.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -528,13 +534,18 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_usages',
-    description: 'Find all usages of a symbol (calls, references, pattern matches, type annotations, instantiations). Broader than callers — covers every edge kind that references the symbol.',
+    description: 'Find all usages of a symbol (calls, references, pattern matches, type annotations, instantiations). Broader than callers — covers every edge kind that references the symbol. Supports batch mode: pass `symbols` (array) to query multiple symbols at once, results grouped by symbol.',
     inputSchema: {
       type: 'object',
       properties: {
         symbol: {
           type: 'string',
           description: 'Name of the symbol to find usages for',
+        },
+        symbols: {
+          type: 'array',
+          description: 'Batch query: multiple symbol names to find usages for. Results grouped by symbol. Use instead of calling codegraph_usages N times.',
+          items: { type: 'string' },
         },
         kind: {
           type: 'string',
@@ -543,12 +554,12 @@ export const tools: ToolDefinition[] = [
         },
         limit: {
           type: 'number',
-          description: 'Maximum usages to return (default: 20)',
+          description: 'Maximum usages to return per symbol (default: 20)',
           default: 20,
         },
         projectPath: projectPathProperty,
       },
-      required: ['symbol'],
+      required: [],
     },
   },
   {
@@ -581,6 +592,8 @@ export const tools: ToolDefinition[] = [
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  // Explore gap summary accumulator (reset per handleExplore call)
+  private _exploreGaps?: Map<string, { totalTopLevelSymbols: number; fullyShown: number; symbolsInGap: Array<{ name: string; lines: string; kind: string }> }>;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -873,7 +886,24 @@ export class ToolHandler {
     const implFor = args.impl_for as string | undefined;
 
     let results: SearchResult[];
-    if (implFor) {
+    if (kind === 'comment') {
+      // Comment search via FTS5 — directly query comments table
+      const commentResults = cg.searchComments(query, limit);
+      if (commentResults.length === 0) {
+        return this.textResult(`No comments found for "${query}"`);
+      }
+      const lines: string[] = [
+        `## Comment Search: "${query}" (${commentResults.length} found)`,
+        '',
+      ];
+      for (const c of commentResults) {
+        const symbolNote = c.associatedSymbol ? ` [${c.associatedSymbol}]` : '';
+        lines.push(`**${c.filePath}:${c.startLine}** (${c.kind})${symbolNote}`);
+        lines.push(`> ${c.text.length > 200 ? c.text.slice(0, 197) + '…' : c.text}`);
+        lines.push('');
+      }
+      return this.textResult(this.truncateOutput(lines.join('\n')));
+    } else if (implFor) {
       results = cg.findImplementors(implFor, {
         limit,
         kinds: kind ? [kind as NodeKind] : undefined,
@@ -885,10 +915,18 @@ export class ToolHandler {
         });
       }
     } else if (referencesType) {
+      // When mutability filter is active, fetch more results since many
+      // may be filtered out. The final slice respects the user's limit.
+      const mutability = args.mutability as string | undefined;
+      const fetchLimit = mutability ? Math.max(limit * 3, 100) : limit;
       results = cg.findNodesByReferencedType(referencesType, {
-        limit,
+        limit: fetchLimit,
         kinds: kind ? [kind as NodeKind] : undefined,
       });
+      if (mutability && (mutability === 'mut' || mutability === 'shared' || mutability === 'owning')) {
+        results = results.filter(r => this.classifyMutability(r.node.signature, referencesType) === mutability);
+        results = results.slice(0, limit);
+      }
       if (results.length === 0) {
         results = cg.searchNodes(query, {
           limit,
@@ -999,24 +1037,49 @@ export class ToolHandler {
       return this.textResult(`Symbol "${symbol}" not found in the codebase`);
     }
 
-    // Aggregate callers across all matching symbols
+    // Collect call sites: each entry is (caller node, edge with call-site line).
+    // A single caller function may have multiple call sites for the same target.
+    const callSites: Array<{ caller: Node; edge: Edge }> = [];
     const seen = new Set<string>();
-    const allCallers: Node[] = [];
     for (const node of allMatches.nodes) {
       for (const c of cg.getCallers(node.id)) {
-        if (!seen.has(c.node.id)) {
-          seen.add(c.node.id);
-          allCallers.push(c.node);
+        const key = `${c.node.id}:${c.edge.line ?? c.node.startLine}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          callSites.push({ caller: c.node, edge: c.edge });
         }
       }
     }
 
-    if (allCallers.length === 0) {
+    if (callSites.length === 0) {
       return this.textResult(`No callers found for "${symbol}"${allMatches.note}`);
     }
 
-    const formatted = this.formatNodeList(allCallers.slice(0, limit), `Callers of ${symbol}`) + allMatches.note;
-    return this.textResult(this.truncateOutput(formatted));
+    // Read source snippets for call-site lines
+    const fileCache = new Map<string, string[]>();
+
+    const shown = callSites.slice(0, limit);
+    const lines: string[] = [
+      `## Callers of "${symbol}" (${shown.length} shown, ${callSites.length} total)`,
+      '',
+    ];
+    for (const cs of shown) {
+      const defLine = cs.caller.startLine ? `:${cs.caller.startLine}` : '';
+      const callLine = cs.edge.line ?? cs.caller.startLine;
+      const fileRef = `${cs.caller.filePath}:${callLine}`;
+      const snippet = this.sourceLineAt(cg, fileRef, fileCache);
+      lines.push(`- **${cs.caller.name}** (${cs.caller.kind})`);
+      lines.push(`  def: ${cs.caller.filePath}${defLine}`);
+      lines.push(`  call: ${cs.caller.filePath}:${callLine}${snippet ? ` — \`${snippet}\`` : ''}`);
+      lines.push('');
+    }
+
+    if (callSites.length > limit) {
+      lines.push(`... and ${callSites.length - limit} more callers`);
+    }
+
+    lines.push(allMatches.note);
+    return this.textResult(this.truncateOutput(lines.join('\n')));
   }
 
   /**
@@ -1034,24 +1097,47 @@ export class ToolHandler {
       return this.textResult(`Symbol "${symbol}" not found in the codebase`);
     }
 
-    // Aggregate callees across all matching symbols
+    // Collect call sites with edge line info
+    const callSites: Array<{ callee: Node; edge: Edge }> = [];
     const seen = new Set<string>();
-    const allCallees: Node[] = [];
     for (const node of allMatches.nodes) {
       for (const c of cg.getCallees(node.id)) {
-        if (!seen.has(c.node.id)) {
-          seen.add(c.node.id);
-          allCallees.push(c.node);
+        const key = `${c.node.id}:${c.edge.line ?? c.node.startLine}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          callSites.push({ callee: c.node, edge: c.edge });
         }
       }
     }
 
-    if (allCallees.length === 0) {
+    if (callSites.length === 0) {
       return this.textResult(`No callees found for "${symbol}"${allMatches.note}`);
     }
 
-    const formatted = this.formatNodeList(allCallees.slice(0, limit), `Callees of ${symbol}`) + allMatches.note;
-    return this.textResult(this.truncateOutput(formatted));
+    const fileCache = new Map<string, string[]>();
+
+    const shown = callSites.slice(0, limit);
+    const lines: string[] = [
+      `## Callees of "${symbol}" (${shown.length} shown, ${callSites.length} total)`,
+      '',
+    ];
+    for (const cs of shown) {
+      const defLine = cs.callee.startLine ? `:${cs.callee.startLine}` : '';
+      const callLine = cs.edge.line ?? cs.callee.startLine;
+      const fileRef = `${cs.callee.filePath}:${callLine}`;
+      const snippet = this.sourceLineAt(cg, fileRef, fileCache);
+      lines.push(`- **${cs.callee.name}** (${cs.callee.kind})`);
+      lines.push(`  def: ${cs.callee.filePath}${defLine}`);
+      lines.push(`  call: ${cs.callee.filePath}:${callLine}${snippet ? ` — \`${snippet}\`` : ''}`);
+      lines.push('');
+    }
+
+    if (callSites.length > limit) {
+      lines.push(`... and ${callSites.length - limit} more callees`);
+    }
+
+    lines.push(allMatches.note);
+    return this.textResult(this.truncateOutput(lines.join('\n')));
   }
 
   /**
@@ -1106,12 +1192,18 @@ export class ToolHandler {
    * (calls, references, type_of, instantiates, etc.), grouped by file.
    */
   private async handleUsages(args: Record<string, unknown>): Promise<ToolResult> {
-    const symbol = this.validateString(args.symbol, 'symbol');
-    if (typeof symbol !== 'string') return symbol;
-
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const kindFilter = args.kind as string | undefined;
+
+    // Batch mode: symbols array — check BEFORE validating single symbol
+    const symbolsArr = args.symbols as string[] | undefined;
+    if (symbolsArr && Array.isArray(symbolsArr) && symbolsArr.length > 0) {
+      return this.handleBatchUsages(cg, symbolsArr, limit, kindFilter);
+    }
+
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
@@ -1559,6 +1651,10 @@ export class ToolHandler {
     // P1: Strict mode — limit results to files under the path directory
     const strict = args.strict === true;
 
+    // Reset gap tracking at the start of every explore call so a
+    // mid-format exception doesn't leak stale gaps into the next call.
+    this._exploreGaps = undefined;
+
     // Resolve adaptive output budget from project size. Falls back to the
     // largest-tier defaults if stats aren't available, which preserves
     // pre-#185 behavior for callers that hit the rare stats failure.
@@ -2004,6 +2100,26 @@ export class ToolHandler {
       }
       if (chosenIndices.size < clusters.length || fileTrimmed) {
         anyFileTrimmed = true;
+        // Collect symbols in unchosen clusters for gap summary
+        const gapSymbols: Array<{ name: string; lines: string; kind: string }> = [];
+        for (let i = 0; i < clusters.length; i++) {
+          if (!chosenIndices.has(i)) {
+            for (const sym of clusters[i]!.symbols) {
+              const parenIdx = sym.lastIndexOf('(');
+              const name = parenIdx > 0 ? sym.substring(0, parenIdx) : sym;
+              const kind = parenIdx > 0 ? sym.substring(parenIdx + 1, sym.length - 1) : 'unknown';
+              gapSymbols.push({ name, lines: `${clusters[i]!.start}-${clusters[i]!.end}`, kind });
+            }
+          }
+        }
+        if (gapSymbols.length > 0) {
+          if (!this._exploreGaps) this._exploreGaps = new Map();
+          this._exploreGaps.set(filePath, {
+            totalTopLevelSymbols: group.nodes.length,
+            fullyShown: allSymbols.length,
+            symbolsInGap: gapSymbols,
+          });
+        }
       }
 
       // Dedupe + cap the symbols list shown in the per-file header. Some
@@ -2052,6 +2168,24 @@ export class ToolHandler {
 
       totalChars += fileSection.length + 200;
       filesIncluded++;
+    }
+
+    // Gap summary: tell the agent what symbols were omitted from truncated files
+    if (this._exploreGaps && this._exploreGaps.size > 0) {
+      lines.push('### Gap Summary');
+      lines.push('');
+      lines.push('The following symbols were omitted due to output budget limits. Use `codegraph_explore` with more specific query terms or increase `maxFiles` to include them.');
+      lines.push('');
+      for (const [file, gap] of this._exploreGaps) {
+        lines.push(`**${file}** — ${gap.totalTopLevelSymbols} total symbols, ${gap.fullyShown} fully shown, ${gap.symbolsInGap.length} in gap:`);
+        for (const sym of gap.symbolsInGap.slice(0, 15)) {
+          lines.push(`  - ${sym.name} (${sym.kind}) @ lines ${sym.lines}`);
+        }
+        if (gap.symbolsInGap.length > 15) {
+          lines.push(`  ... and ${gap.symbolsInGap.length - 15} more`);
+        }
+        lines.push('');
+      }
     }
 
     // Add remaining files as references (from both relevant and peripheral files).
@@ -2705,55 +2839,84 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatNodeList(nodes: Node[], title: string): string {
-    const lines: string[] = [`## ${title} (${nodes.length} found)`, ''];
-
-    for (const node of nodes) {
-      const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact: just name, kind, location
-      lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}`);
-    }
-
-    return lines.join('\n');
-  }
-
   private formatImpact(symbol: string, impact: Subgraph): string {
     const nodeCount = impact.nodes.size;
 
-    // Compact format: just list affected symbols grouped by file
+    // Compute BFS distance from root nodes to all affected nodes
+    const rootSet = new Set(impact.roots);
+    const distance = new Map<string, number>();
+    const queue: string[] = [];
+    for (const rootId of impact.roots) {
+      distance.set(rootId, 0);
+      queue.push(rootId);
+    }
+    // Build reverse adjacency: target → sources (following incoming edges)
+    const adj = new Map<string, string[]>();
+    for (const e of impact.edges) {
+      if (e.kind === 'contains') continue;
+      const targets = adj.get(e.target) || [];
+      targets.push(e.source);
+      adj.set(e.target, targets);
+    }
+    for (let h = 0; h < queue.length; h++) {
+      const cur = queue[h]!;
+      const curDist = distance.get(cur)!;
+      const sources = adj.get(cur) || [];
+      for (const src of sources) {
+        if (!distance.has(src)) {
+          distance.set(src, curDist + 1);
+          queue.push(src);
+        }
+      }
+    }
+
+    // Group by risk level
+    const ENVELOPE_KINDS = new Set(['class', 'struct', 'interface', 'enum', 'namespace', 'module', 'trait', 'protocol', 'component']);
+    const levels: Array<{ label: string; desc: string; nodes: Map<string, Node[]> }> = [
+      { label: 'Level 1 (direct)', desc: 'Directly references — must review if changing', nodes: new Map() },
+      { label: 'Level 2 (indirect)', desc: 'One hop away — likely affected', nodes: new Map() },
+      { label: 'Level 3 (transitive)', desc: 'Two or more hops — may be affected', nodes: new Map() },
+    ];
+
+    for (const node of impact.nodes.values()) {
+      if (node.kind === 'file' || rootSet.has(node.id)) continue;
+      const d = distance.get(node.id) ?? 99;
+      const levelIdx = d <= 1 ? 0 : d <= 2 ? 1 : 2;
+      const byFile = levels[levelIdx]!.nodes;
+      const existing = byFile.get(node.filePath) || [];
+      existing.push(node);
+      byFile.set(node.filePath, existing);
+    }
+
     const lines: string[] = [
       `## Impact: "${symbol}" affects ${nodeCount} symbols`,
       '',
     ];
 
-    // First pass: collect all non-file nodes
-    const ENVELOPE_KINDS = new Set(['class', 'struct', 'interface', 'enum', 'namespace', 'module', 'trait', 'protocol', 'component']);
-    const rawByFile = new Map<string, Node[]>();
-    for (const node of impact.nodes.values()) {
-      if (node.kind === 'file') continue;
-      const existing = rawByFile.get(node.filePath) || [];
-      existing.push(node);
-      rawByFile.set(node.filePath, existing);
-    }
-    // Second pass: drop whole-file envelope nodes when the file has more
-    // specific symbols (methods, fields, etc.). Keep them only when they
-    // are the sole symbol in the file.
-    const byFile = new Map<string, Node[]>();
-    for (const [filePath, fileNodes] of rawByFile) {
-      const specific = fileNodes.filter(n => !ENVELOPE_KINDS.has(n.kind));
-      if (specific.length > 0) {
-        const envelopesToKeep = fileNodes.filter(n => ENVELOPE_KINDS.has(n.kind) && impact.roots.includes(n.id));
-        byFile.set(filePath, [...specific, ...envelopesToKeep]);
-      } else {
-        byFile.set(filePath, fileNodes);
+    for (const level of levels) {
+      // Deduplicate file entries
+      const files: Array<{ filePath: string; nodes: Node[] }> = [];
+      for (const [filePath, fileNodes] of level.nodes) {
+        // Drop whole-file envelope nodes when more specific symbols exist
+        const specific = fileNodes.filter(n => !ENVELOPE_KINDS.has(n.kind));
+        if (specific.length > 0) {
+          files.push({ filePath, nodes: specific });
+        } else {
+          files.push({ filePath, nodes: fileNodes });
+        }
       }
-    }
+      if (files.length === 0) continue;
 
-    for (const [file, nodes] of byFile) {
-      lines.push(`**${file}:**`);
-      // Compact: inline list
-      const nodeList = nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
-      lines.push(nodeList);
+      let levelNodeCount = 0;
+      for (const f of files) levelNodeCount += f.nodes.length;
+
+      lines.push(`### ${level.label} — ${level.desc} (${levelNodeCount} symbols)`);
+      lines.push('');
+      for (const { filePath, nodes } of files) {
+        const nodeList = nodes.slice(0, 10).map(n => `${n.name}:${n.startLine}`).join(', ');
+        const tail = nodes.length > 10 ? `, +${nodes.length - 10} more` : '';
+        lines.push(`- **${filePath}:** ${nodeList}${tail}`);
+      }
       lines.push('');
     }
 
@@ -2812,7 +2975,84 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatTaskContext(context: TaskContext): string {
+  /**
+   * Classify how a function references a type by inspecting its signature.
+   * Returns 'mut' (mutable borrow, ResMut, &mut T), 'shared' (shared borrow,
+   * Res, &T), 'owning' (owned value, return type, plain T), or 'unknown'.
+   */
+  private classifyMutability(signature: string | undefined | null, typeName: string): 'mut' | 'shared' | 'owning' | 'unknown' {
+    if (!signature) return 'unknown';
+    const escaped = typeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Unicode-aware word boundary: JS \b only matches ASCII [a-zA-Z0-9_],
+    // so CJK type names (e.g. 导航上) never match. Use lookaround instead.
+    const WB = `(?<![\\p{L}\\p{N}_])`;
+    const WE = `(?![\\p{L}\\p{N}_])`;
+
+    // Mutable: ResMut<Type>, &mut Type
+    if (new RegExp(`ResMut\\s*<[^>]*${WB}${escaped}${WE}`, 'u').test(signature)) return 'mut';
+    if (new RegExp(`&mut\\s+${WB}${escaped}${WE}`, 'u').test(signature)) return 'mut';
+
+    // Shared: Res<Type> (but not ResMut), &Type (but not &mut)
+    if (new RegExp(`(?<!Mut)Res\\s*<[^>]*${WB}${escaped}${WE}`, 'u').test(signature)) return 'shared';
+    if (new RegExp(`(?<!&mut\\s)&${WB}${escaped}${WE}`, 'u').test(signature)) return 'shared';
+
+    // Owned: return type (-> Type or -> impl ... Type ...), or plain param without &
+    if (new RegExp(`->\\s*[^;{]*${WB}${escaped}${WE}`, 'u').test(signature)) return 'owning';
+    if (new RegExp(`${WB}${escaped}${WE}`, 'u').test(signature)) return 'owning';
+
+    return 'unknown';
+  }
+
+  private handleBatchUsages(cg: CodeGraph, symbols: string[], limit: number, kindFilter: string | undefined): ToolResult {
+    const batchLimit = Math.min(symbols.length, 20);
+    const allLines: string[] = [`## Batch Usages (${batchLimit} symbols)`, ""];
+    let totalUsages = 0;
+    for (const symbol of symbols.slice(0, batchLimit)) {
+      const allMatches = this.findAllSymbols(cg, symbol);
+      if (allMatches.nodes.length === 0) { allLines.push(`### ${symbol}: not found`); allLines.push(""); continue; }
+      const seen = new Set<string>();
+      const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
+      for (const node of allMatches.nodes) {
+        const edgeKinds = kindFilter ? [kindFilter as EdgeKind] : undefined;
+        for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
+          const key = `${edge.source}:${edge.target}:${edge.kind}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const sourceNode = cg.getNode(edge.source);
+          if (sourceNode) { usages.push({ sourceNode, targetNode: node, edgeKind: edge.kind, line: edge.line ?? sourceNode.startLine }); }
+        }
+      }
+      const perLimit = Math.max(3, Math.ceil(limit / batchLimit));
+      allLines.push(this.formatUsageResults(symbol, usages, perLimit));
+      allLines.push("");
+      totalUsages += usages.length;
+    }
+    allLines.push("---");
+    allLines.push(`Total: ${totalUsages} usages across ${batchLimit} symbols`);
+    return this.textResult(this.truncateOutput(allLines.join("\n")));
+  }
+
+  private formatUsageResults(symbol: string, usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }>, limit: number): string {
+    const byFile = new Map<string, typeof usages>();
+    for (const u of usages) { const existing = byFile.get(u.sourceNode.filePath) || []; existing.push(u); byFile.set(u.sourceNode.filePath, existing); }
+    const lines: string[] = [`### ${symbol} (${Math.min(usages.length, limit)} shown, ${usages.length} total)`, ""];
+    let count = 0;
+    for (const [file, fileUsages] of byFile) {
+      if (count >= limit) break;
+      lines.push(`**${file}:**`);
+      for (const u of fileUsages) {
+        if (count >= limit) break;
+        const lineInfo = u.line ? `:${u.line}` : "";
+        lines.push(`- ${u.sourceNode.name} (${u.sourceNode.kind}) ${u.edgeKind}→ ${u.targetNode.name}${lineInfo}`);
+        count++;
+      }
+      lines.push("");
+    }
+    if (usages.length > limit) { lines.push(`... and ${usages.length - limit} more usages`); }
+    return lines.join("\n");
+  }
+
+    private formatTaskContext(context: TaskContext): string {
     return context.summary || 'No context found';
   }
 

@@ -436,11 +436,15 @@ export class TreeSitterExtractor {
       this.isExtractingPattern = saved;
       return;
     }
-    // matches! macro: extract enum variant references from the second argument
+    // macro_invocation: for `matches!` extract pattern references from the
+    // second argument. For other macros, walk token_tree args to capture
+    // PascalCase identifiers that may be enum variants passed to the macro.
     else if (nodeType === 'macro_invocation') {
       const saved = this.isExtractingPattern;
       this.isExtractingPattern = true;
       this.extractMatchesMacroReferences(node);
+      // For non-matches! macros, also walk token_tree args for variant refs
+      this.extractMacroInvocationArgs(node);
       if (!skipChildren) {
         for (let i = 0; i < node.namedChildCount; i++) {
           const child = node.namedChild(i);
@@ -455,6 +459,30 @@ export class TreeSitterExtractor {
     // isExtractingPattern and are skipped — they emit pattern_match edges separately.
     else if (nodeType === 'scoped_identifier' && !this.isExtractingPattern && this.nodeStack.length > 0) {
       this.extractScopedValueReference(node);
+    }
+    // Extract type references from generic_type and scoped_type_identifier
+    // wherever they appear (signatures AND expression bodies). Captures type
+    // arguments like `Action<导航上>` and turbofish `Action::<导航上>::new()`.
+    else if ((nodeType === 'generic_type' || nodeType === 'scoped_type_identifier') && this.nodeStack.length > 0) {
+      const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+      if (fromNodeId && !fromNodeId.startsWith('file:')) {
+        this.extractTypeRefsFromSubtree(node, fromNodeId);
+      }
+    }
+    // macro_definition: extract pattern_match references from token_tree bodies.
+    // macro_rules! bodies often contain hardcoded match arms with Enum::Variant
+    // references (scoped_identifier) that are invisible to standard match_expression
+    // extraction because tree-sitter parses them as raw tokens, not structured AST.
+    else if (nodeType === 'macro_definition') {
+      const macroNameNode = getChildByField(node, 'name');
+      const macroName = macroNameNode ? getNodeText(macroNameNode, this.source) : '<unknown>';
+      const macroNode = this.createNode('function', macroName, node);
+      if (macroNode) {
+        this.nodeStack.push(macroNode.id);
+        this.extractMacroTokenTreePatterns(node, macroNode.id);
+        this.nodeStack.pop();
+      }
+      skipChildren = true;
     }
 
     // Visit children (unless the extract method already visited them)
@@ -1064,6 +1092,128 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Walk token_tree children of a macro_definition to extract pattern_match
+   * references. Inside macro_rules! bodies, match arms like `Enum::Variant =>`
+   * are parsed as flat token sequences (not structured match_arm nodes), so
+   * standard match extraction misses them. We find scoped_identifier nodes
+   * (Enum::Variant) and PascalCase identifier nodes that look like enum variant
+   * references, and create pattern_match refs from the macro node.
+   */
+  private extractMacroTokenTreePatterns(node: SyntaxNode, macroNodeId: string): void {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (!child) continue;
+
+      if (child.type === 'scoped_identifier') {
+        const name = getNodeText(child, this.source);
+        if (name && name.includes('::')) {
+          this.unresolvedReferences.push({
+            fromNodeId: macroNodeId,
+            referenceName: name,
+            referenceKind: 'pattern_match',
+            line: child.startPosition.row + 1,
+            column: child.startPosition.column,
+          });
+        }
+        continue;
+      }
+
+      if (child.type === 'identifier') {
+        const name = getNodeText(child, this.source);
+        const firstChar = name ? name[0] : undefined;
+        if (firstChar && firstChar === firstChar.toUpperCase() && firstChar !== '_' && !this.BUILTIN_TYPES.has(name!)) {
+          this.unresolvedReferences.push({
+            fromNodeId: macroNodeId,
+            referenceName: name!,
+            referenceKind: 'pattern_match',
+            line: child.startPosition.row + 1,
+            column: child.startPosition.column,
+          });
+        }
+        continue;
+      }
+
+      // Recurse into nested token_trees (braced blocks, paren groups, etc.)
+      if (child.type === 'token_tree' || child.type === 'token_tree_pattern' || child.type === 'token_repetition') {
+        this.extractMacroTokenTreePatterns(child, macroNodeId);
+      }
+    }
+  }
+
+  /**
+   * Walk the token_tree args of a macro_invocation (not `matches!`) to capture
+   * PascalCase identifiers that are likely enum variants passed as arguments.
+   * E.g. `生成_绑定访问方法!(导航上, 导航下)` → references from the enclosing
+   * function to `导航上` and `导航下`.
+   */
+  private extractMacroInvocationArgs(node: SyntaxNode): void {
+    // Check if this is NOT a `matches!` macro (which is already handled)
+    let isMatches = false;
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child && (child.type === 'identifier' || child.type === 'macro_name')) {
+        if (getNodeText(child, this.source) === 'matches') {
+          isMatches = true;
+          break;
+        }
+      }
+    }
+    if (isMatches) return;
+
+    const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+    if (!fromNodeId || fromNodeId.startsWith('file:')) return;
+
+    const tokenTree = node.namedChildren.find(c => c.type === 'token_tree');
+    if (!tokenTree) return;
+
+    this.extractTokenTreeIdentRefs(tokenTree, fromNodeId);
+  }
+
+  /**
+   * Recurse into a token_tree and extract PascalCase identifier + scoped_identifier
+   * references. Used for both macro definitions and macro invocations.
+   */
+  private extractTokenTreeIdentRefs(node: SyntaxNode, fromNodeId: string): void {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (!child) continue;
+
+      if (child.type === 'scoped_identifier') {
+        const name = getNodeText(child, this.source);
+        if (name && name.includes('::')) {
+          this.unresolvedReferences.push({
+            fromNodeId,
+            referenceName: name,
+            referenceKind: 'references',
+            line: child.startPosition.row + 1,
+            column: child.startPosition.column,
+          });
+        }
+        continue;
+      }
+
+      if (child.type === 'identifier') {
+        const name = getNodeText(child, this.source);
+        const firstChar = name ? name[0] : undefined;
+        if (firstChar && firstChar === firstChar.toUpperCase() && firstChar !== '_' && !this.BUILTIN_TYPES.has(name!)) {
+          this.unresolvedReferences.push({
+            fromNodeId,
+            referenceName: name!,
+            referenceKind: 'references',
+            line: child.startPosition.row + 1,
+            column: child.startPosition.column,
+          });
+        }
+        continue;
+      }
+
+      if (child.type === 'token_tree' || child.type === 'token_tree_pattern' || child.type === 'token_repetition') {
+        this.extractTokenTreeIdentRefs(child, fromNodeId);
+      }
+    }
+  }
+
+  /**
    * Extract a reference from a scoped identifier used in expression/value position
    * (e.g. `Enum::Variant` as a function argument, method receiver, or range bound).
    * Pattern contexts (match arms, if-let, matches! macro) are guarded by
@@ -1080,7 +1230,6 @@ export class TreeSitterExtractor {
     // and a file--references-->symbol edge is semantically meaningless.
     if (fromNodeId.startsWith('file:')) return;
 
-    console.error(`[P0-DIAG] ref: fromNodeId=${fromNodeId} name=${name} line=${node.startPosition.row + 1}`);
 
     this.unresolvedReferences.push({
       fromNodeId,
@@ -2761,6 +2910,28 @@ export class TreeSitterExtractor {
         });
       }
       return; // type_identifier is a leaf
+    }
+
+    // scoped_type_identifier (e.g. `bevy::prelude::Query`): extract the
+    // last segment as the type name so we link to the concrete type.
+    if (node.type === 'scoped_type_identifier') {
+      const nameChildren = node.namedChildren.filter(
+        (c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'identifier'
+      );
+      const last = nameChildren[nameChildren.length - 1];
+      if (last) {
+        const typeName = getNodeText(last, this.source);
+        if (typeName && !this.BUILTIN_TYPES.has(typeName)) {
+          this.unresolvedReferences.push({
+            fromNodeId,
+            referenceName: typeName,
+            referenceKind: 'references',
+            line: last.startPosition.row + 1,
+            column: last.startPosition.column,
+          });
+        }
+      }
+      // Also recurse in case there are nested generic_type children
     }
 
     // Recurse into children (handles union_type, intersection_type, generic_type, etc.)

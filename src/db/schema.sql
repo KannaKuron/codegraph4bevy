@@ -147,6 +147,47 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_file_path ON unresolved_refs(file_path
 CREATE INDEX IF NOT EXISTS idx_unresolved_from_name ON unresolved_refs(from_node_id, reference_name);
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
 
+-- Comments extracted from source files
+CREATE TABLE IF NOT EXISTS comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'line', -- 'line', 'block', 'doc'
+    associated_symbol TEXT DEFAULT NULL  -- qualified name of nearest enclosing symbol
+);
+
+CREATE INDEX IF NOT EXISTS idx_comments_file_path ON comments(file_path);
+CREATE INDEX IF NOT EXISTS idx_comments_associated ON comments(associated_symbol);
+
+-- FTS index on comment text and associated symbol
+CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
+    text,
+    associated_symbol,
+    content='comments',
+    content_rowid='rowid',
+    tokenize='unicode61'
+);
+
+-- Triggers to keep comments FTS in sync
+CREATE TRIGGER IF NOT EXISTS comments_ai AFTER INSERT ON comments BEGIN
+    INSERT INTO comments_fts(rowid, text, associated_symbol)
+    VALUES (NEW.rowid, NEW.text, NEW.associated_symbol);
+END;
+
+CREATE TRIGGER IF NOT EXISTS comments_ad AFTER DELETE ON comments BEGIN
+    INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol)
+    VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol);
+END;
+
+CREATE TRIGGER IF NOT EXISTS comments_au AFTER UPDATE ON comments BEGIN
+    INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol)
+    VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol);
+    INSERT INTO comments_fts(rowid, text, associated_symbol)
+    VALUES (NEW.rowid, NEW.text, NEW.associated_symbol);
+END;
+
 -- Project metadata for version/provenance tracking
 CREATE TABLE IF NOT EXISTS project_metadata (
     key TEXT PRIMARY KEY,

@@ -525,6 +525,82 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
  * React re-render + JSX children + Vue templates). Returns the count added.
  * Never throws into indexing — callers wrap in try/catch.
  */
+
+// Bevy ECS dataflow: insert_resource(T) → resource_exists<T> signals.
+// When fn A calls commands.insert_resource(X) and fn B is registered with
+// .run_if(resource_exists::<X>()), synthesize a calls edge A→B so trace
+// can follow the dataflow through the ECS command queue.
+// Group 1 = turbofish type (commands.insert_resource::<Type>(...)),
+// group 2 = constructor arg (commands.insert_resource(MyRes{...})).
+const INSERT_RESOURCE_RE = /commands\.insert_resource\s*(?:::\s*<([^>]+)>\s*)?\(\s*(\w+)\s*\)/g;
+const RESOURCE_EXISTS_RE = /run_if\s*\(\s*resource_exists\s*::\s*<\s*([\w:<>, ]+)\s*>\s*\)/g;
+
+function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const resources = new Map<string, { inserters: Set<string>; checkers: Set<string> }>();
+  const fnLines = new Map<string, number>();
+
+  function ensure(r: string) {
+    if (!resources.has(r)) resources.set(r, { inserters: new Set(), checkers: new Set() });
+    return resources.get(r)!;
+  }
+
+  for (const file of ctx.getAllFiles()) {
+    if (!file.endsWith('.rs')) continue;
+    const content = ctx.readFile(file);
+    if (!content) continue;
+
+    const fileNodes = ctx.getNodesInFile(file);
+    const fns = fileNodes.filter((n: { kind: string }) => n.kind === 'function' || n.kind === 'method');
+
+    INSERT_RESOURCE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = INSERT_RESOURCE_RE.exec(content))) {
+      // Prefer turbofish type (group 1), fall back to constructor arg (group 2)
+      const typeName = (m[1] || m[2])!;
+      const line = content.substring(0, m.index).split('\n').length;
+      for (const fn of fns) {
+        if (fn.startLine <= line && fn.endLine >= line) {
+          ensure(typeName).inserters.add(fn.id);
+          fnLines.set(fn.id, line);
+          break;
+        }
+      }
+    }
+
+    RESOURCE_EXISTS_RE.lastIndex = 0;
+    while ((m = RESOURCE_EXISTS_RE.exec(content))) {
+      const typeName = m[1]!;
+      const line = content.substring(0, m.index).split('\n').length;
+      for (const fn of fns) {
+        if (fn.startLine <= line && fn.endLine >= line) {
+          ensure(typeName).checkers.add(fn.id);
+          fnLines.set(fn.id, line);
+          break;
+        }
+      }
+    }
+  }
+
+  for (const [, data] of resources) {
+    if (data.inserters.size === 0 || data.checkers.size === 0) continue;
+    for (const inserterId of data.inserters) {
+      for (const checkerId of data.checkers) {
+        edges.push({
+          source: inserterId,
+          target: checkerId,
+          kind: 'calls',
+          line: fnLines.get(inserterId),
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'bevy-ecs-resource' },
+        });
+      }
+    }
+  }
+
+  return edges;
+}
+
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
   const fieldEdges = fieldChannelEdges(queries, ctx);
   const emitterEdges = eventEmitterEdges(ctx);
@@ -537,7 +613,8 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges]) {
+  const bevyEdges = bevyEcsEdges(ctx);
+  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges, ...bevyEdges]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);

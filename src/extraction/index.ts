@@ -1125,7 +1125,29 @@ export class ExtractionOrchestrator {
       this.storeExtractionResult(relativePath, content, language, stats, result);
     }
 
+    // Extract and store comments for FTS search
+    this.extractAndStoreComments(relativePath, content, language);
+
     return result;
+  }
+
+  /**
+   * Extract comments from source and store in comments table.
+   */
+  private extractAndStoreComments(filePath: string, content: string, language: string): void {
+    try {
+      const { extractComments } = require('./comment-extractor');
+      const comments = extractComments(content, filePath, language);
+      // Delete old comments and insert new ones in a single transaction
+      this.queries.transaction(() => {
+        this.queries.deleteComments(filePath);
+        for (const c of comments) {
+          this.queries.insertComment(c);
+        }
+      });
+    } catch {
+      // Comment extraction is best-effort; never block indexing
+    }
   }
 
   /**
