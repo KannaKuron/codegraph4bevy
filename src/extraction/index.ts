@@ -824,6 +824,9 @@ export class ExtractionOrchestrator {
           this.storeExtractionResult(filePath, content, language, stats, result);
         }
 
+        // Extract and store comments for FTS search
+        this.extractAndStoreComments(filePath, content, detectLanguage(filePath, content));
+
         if (result.errors.length > 0) {
           for (const err of result.errors) {
             if (!err.filePath) err.filePath = filePath;
@@ -896,6 +899,7 @@ export class ExtractionOrchestrator {
           const language = detectLanguage(filePath, content);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
           this.storeExtractionResult(filePath, content, language, stats, result);
+          this.extractAndStoreComments(filePath, content, language);
 
           const idx = errors.indexOf(errEntry);
           if (idx >= 0) errors.splice(idx, 1);
@@ -947,6 +951,7 @@ export class ExtractionOrchestrator {
             const language = detectLanguage(filePath, fullContent);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
             this.storeExtractionResult(filePath, fullContent, language, stats, result);
+            this.extractAndStoreComments(filePath, fullContent, language);
 
             const idx = errors.indexOf(errEntry);
             if (idx >= 0) errors.splice(idx, 1);

@@ -513,6 +513,17 @@ export interface BuildContextOptions {
 }
 
 /**
+ * Per-entry-point usage statistics for inline rendering in context output.
+ */
+export interface EntryPointUsage {
+  nodeId: string;
+  callerCount: number;
+  refCount: number;
+  patternCount: number;
+  topCallerNames: string[];
+}
+
+/**
  * Full context for a task, ready for Claude
  */
 export interface TaskContext {
@@ -533,6 +544,9 @@ export interface TaskContext {
 
   /** Brief summary of the context */
   summary: string;
+
+  /** Per-entry-point usage stats for inline rendering */
+  entryPointUsage?: EntryPointUsage[];
 
   /** Statistics about the context */
   stats: {

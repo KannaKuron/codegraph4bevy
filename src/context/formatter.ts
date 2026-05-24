@@ -4,7 +4,7 @@
  * Formats TaskContext as markdown or JSON for consumption by Claude.
  */
 
-import { Node, Edge, TaskContext, Subgraph } from '../types';
+import { Node, Edge, TaskContext, Subgraph, EntryPointUsage } from '../types';
 
 /**
  * Format context as markdown
@@ -24,9 +24,26 @@ export function formatContextAsMarkdown(context: TaskContext): string {
   // Entry points - compact format
   if (context.entryPoints.length > 0) {
     lines.push('### Entry Points\n');
+    const usageMap = new Map<string, EntryPointUsage>();
+    if (context.entryPointUsage) {
+      for (const u of context.entryPointUsage) usageMap.set(u.nodeId, u);
+    }
     for (const node of context.entryPoints) {
       const location = node.startLine ? `:${node.startLine}` : '';
-      lines.push(`- **${node.name}** (${node.kind}) - ${node.filePath}${location}`);
+      const usage = usageMap.get(node.id);
+      const parts: string[] = [];
+      if (usage) {
+        if (usage.topCallerNames.length > 0) {
+          parts.push(`called by: ${usage.topCallerNames.join(', ')}`);
+        }
+        const counts: string[] = [];
+        if (usage.callerCount > 0) counts.push(`${usage.callerCount} callers`);
+        if (usage.refCount > 0) counts.push(`${usage.refCount} refs`);
+        if (usage.patternCount > 0) counts.push(`${usage.patternCount} patterns`);
+        if (counts.length > 0) parts.push(counts.join(', '));
+      }
+      const suffix = parts.length > 0 ? ` — ${parts.join(' | ')}` : '';
+      lines.push(`- **${node.name}** (${node.kind}) - ${node.filePath}${location}${suffix}`);
       if (node.signature) {
         lines.push(`  \`${node.signature}\``);
       }
@@ -93,6 +110,7 @@ export function formatContextAsJson(context: TaskContext): string {
       nodeKind: block.node?.kind,
     })),
     relatedFiles: context.relatedFiles,
+    entryPointUsage: context.entryPointUsage,
     stats: context.stats,
   };
 

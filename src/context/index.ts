@@ -19,6 +19,7 @@ import {
   BuildContextOptions,
   FindRelevantContextOptions,
   SearchResult,
+  EntryPointUsage,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from '../graph';
@@ -281,6 +282,30 @@ export class ContextBuilder {
     // Generate summary
     const summary = this.generateSummary(query, subgraph, entryPoints);
 
+    // Compute per-entry-point usage stats for inline rendering
+    const entryPointUsage: EntryPointUsage[] = [];
+    for (const node of entryPoints) {
+      const callerCount = this.queries.getIncomingEdgeCount(node.id, ['calls']);
+      const refCount = this.queries.getIncomingEdgeCount(node.id, ['references', 'type_of']);
+      const patternCount = this.queries.getIncomingEdgeCount(node.id, ['pattern_match']);
+      const topCallerNames: string[] = [];
+      const callerEdges = this.queries.getIncomingEdges(node.id, ['calls']);
+      for (const e of callerEdges) {
+        if (topCallerNames.length >= 3) break;
+        const srcNode = this.queries.getNodeById(e.source);
+        if (srcNode && !topCallerNames.includes(srcNode.name)) {
+          topCallerNames.push(srcNode.name);
+        }
+      }
+      entryPointUsage.push({
+        nodeId: node.id,
+        callerCount,
+        refCount,
+        patternCount,
+        topCallerNames,
+      });
+    }
+
     // Calculate stats
     const stats = {
       nodeCount: subgraph.nodes.size,
@@ -297,6 +322,7 @@ export class ContextBuilder {
       codeBlocks,
       relatedFiles,
       summary,
+      entryPointUsage,
       stats,
     };
 

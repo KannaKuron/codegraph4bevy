@@ -396,6 +396,22 @@ function findBestMatch(
       }
     }
 
+    // For type argument references (inside `<...>`), prefer type symbols
+    // over value symbols — e.g. `Action<导航上>` should resolve to the
+    // struct 导航上, not the enum_member 导航上.
+    if (ref.referenceKind === 'type_of') {
+      if (
+        candidate.kind === 'struct' ||
+        candidate.kind === 'enum' ||
+        candidate.kind === 'class' ||
+        candidate.kind === 'trait' ||
+        candidate.kind === 'type_alias' ||
+        candidate.kind === 'interface'
+      ) {
+        score += 25;
+      }
+    }
+
     // Exported bonus
     if (candidate.isExported) {
       score += 10;
