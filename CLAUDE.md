@@ -229,3 +229,43 @@ publish actions on shared state. Write the files, hand the user the commands.
 - The `0.7.x` line is in active multi-agent rollout. Any change to `src/installer/` (especially `targets/`) needs corresponding test coverage and a CHANGELOG entry — installer regressions break every new install silently.
 - When changing what the MCP tools do or how agents should use them, update **all three** of `src/mcp/server-instructions.ts`, `src/installer/instructions-template.ts`, and `.cursor/rules/codegraph.mdc` — they're written to different places but say the same thing.
 - CodeGraph provides **code context**, not product requirements. For new features, ask the user about UX, edge cases, and acceptance criteria — the graph won't tell you.
+
+## Branch relationships
+
+| Branch | Description |
+|---|---|
+| `main` | Tracks `origin/main` from upstream |
+| `个人改造适配分支不pr给原项目` | **Main working branch** — personal customizations, never pushed to upstream |
+| `buk-备份-个人改造适配分支不pr给原项目` | Backup — last synced 2026-05-24 |
+
+- Upstream: `github.com/colbymchenry/codegraph` — local branches are **not** pushed upstream
+- Key conflict areas on merge: `src/mcp/tools.ts`, `src/extraction/tree-sitter.ts`
+
+### Syncing from upstream
+
+```bash
+# Update main, then merge into working branch
+git fetch origin
+git checkout main && git merge origin/main
+git checkout 个人改造适配分支不pr给原项目 && git merge main
+
+# Or one-liner: merge upstream directly into working branch
+git fetch origin && git merge origin/main
+```
+
+After merge: `npm run build && npx vitest run` to verify. Prefer keeping upstream's structural refactors; layer personal changes on top.
+
+## Global deployment
+
+The globally used `codegraph` is always built from the current working branch, not the npm-published version.
+
+```bash
+# One-time setup
+npm run build && npm link
+
+# After that, just rebuild to update
+npm run build
+```
+
+- `npm link` only needs to run once; subsequent `npm run build` updates `dist/` in place
+- MCP config points to the globally linked binary
