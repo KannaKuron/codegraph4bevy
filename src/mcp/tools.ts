@@ -942,7 +942,7 @@ export class ToolHandler {
         kinds: kind ? [kind as NodeKind] : undefined,
       });
       if (results.length === 0) {
-        results = cg.searchNodes(implFor, {
+        results = cg.searchNodes(`implements ${implFor}`, {
           limit,
           kinds: kind ? [kind as NodeKind] : undefined,
         });
@@ -1331,7 +1331,7 @@ export class ToolHandler {
     for (const node of allMatches.nodes) {
       const edgeKinds = kindFilter ? [kindFilter as EdgeKind] : undefined;
       for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
-        const key = `${edge.source}:${edge.target}:${edge.kind}`;
+        const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
         if (seen.has(key)) continue;
         seen.add(key);
 
@@ -3323,7 +3323,7 @@ export class ToolHandler {
       for (const node of allMatches.nodes) {
         const edgeKinds = kindFilter ? [kindFilter as EdgeKind] : undefined;
         for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
-          const key = `${edge.source}:${edge.target}:${edge.kind}`;
+          const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
           if (seen.has(key)) continue;
           seen.add(key);
           const sourceNode = cg.getNode(edge.source);

@@ -654,15 +654,19 @@ export class ReferenceResolver {
         );
       }
 
-      // Delete unresolvable refs from this batch to avoid re-processing them
+      // Delete unresolved refs, but preserve type_of — these are structural
+      // type relationships that should survive even if the name matcher can't resolve them
       if (result.unresolved.length > 0) {
-        this.queries.deleteSpecificResolvedReferences(
-          result.unresolved.map((r) => ({
-            fromNodeId: r.fromNodeId,
-            referenceName: r.referenceName,
-            referenceKind: r.referenceKind,
-          }))
-        );
+        const deletable = result.unresolved.filter(r => r.referenceKind !== 'type_of');
+        if (deletable.length > 0) {
+          this.queries.deleteSpecificResolvedReferences(
+            deletable.map((r) => ({
+              fromNodeId: r.fromNodeId,
+              referenceName: r.referenceName,
+              referenceKind: r.referenceKind,
+            }))
+          );
+        }
       }
 
       // Aggregate stats

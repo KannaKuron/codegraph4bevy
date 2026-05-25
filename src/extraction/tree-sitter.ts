@@ -2036,6 +2036,11 @@ export class TreeSitterExtractor {
     if (this.language === 'rust') {
       this.extractBevyNestedRefs(node, callerId);
     }
+    // Bevy state constructors: DespawnOnExit(State::Variant),
+    // NextState::Pending(State::Variant) — emit type_of to enum base name.
+    if (this.language === 'rust') {
+      this.extractBevyStateCtorRefs(node, callerId, calleeName);
+    }
   }
 
   /**
@@ -2201,7 +2206,10 @@ export class TreeSitterExtractor {
     'add_plugins', 'init_resource', 'add_event', 'insert_resource',
   ]);
   private readonly BEVY_STATE_FUNCTIONS = new Set([
-    'OnEnter', 'OnExit',
+    'OnEnter', 'OnExit', 'in_state',
+  ]);
+  private readonly BEVY_STATE_CONSTRUCTORS = new Set([
+    'DespawnOnExit', 'Pending',
   ]);
 
   private extractBevyCallRefs(node: SyntaxNode, callerId: string, calleeName: string): void {
@@ -2254,6 +2262,18 @@ export class TreeSitterExtractor {
             line: child.startPosition.row + 1,
             column: child.startPosition.column,
           });
+          // For state calls, emit type_of to the enum base name
+          // e.g. OnEnter(MenuState::Open) → type_of → MenuState
+          if (isStateCall && name.includes('::')) {
+            const baseName = name.split('::')[0]!;
+            this.unresolvedReferences.push({
+              fromNodeId: callerId,
+              referenceName: baseName,
+              referenceKind: 'type_of',
+              line: child.startPosition.row + 1,
+              column: child.startPosition.column,
+            });
+          }
         }
         return;
       }
@@ -2269,6 +2289,57 @@ export class TreeSitterExtractor {
     for (let i = 0; i < args.namedChildCount; i++) {
       const child = args.namedChild(i);
       if (child) collectFuncRefs(child, startIdx > i ? 1 : 0);
+    }
+  }
+
+  /**
+   * Bevy state constructors: DespawnOnExit(State::Variant),
+   * NextState::Pending(State::Variant) — emit type_of edge to the
+   * enum base name from scoped_identifier arguments.
+   */
+  private extractBevyStateCtorRefs(node: SyntaxNode, callerId: string, calleeName: string): void {
+    // Extract the leaf name — "NextState::Pending" → "Pending",
+    // "NextState.pending" → "pending", "DespawnOnExit" → "DespawnOnExit"
+    const leafName = calleeName.includes('::')
+      ? calleeName.split('::').pop()!
+      : calleeName.includes('.')
+        ? calleeName.split('.').pop()!
+        : calleeName;
+
+    if (!this.BEVY_STATE_CONSTRUCTORS.has(leafName)) return;
+
+    const args = getChildByField(node, 'arguments') ?? node.namedChildren.find(
+      c => c.type === 'arguments'
+    );
+    if (!args) return;
+
+    const collectScopedBase = (child: SyntaxNode): void => {
+      if (child.type === 'scoped_identifier') {
+        const name = getNodeText(child, this.source);
+        if (name && name.includes('::')) {
+          const baseName = name.split('::')[0]!;
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: baseName,
+            referenceKind: 'type_of',
+            line: child.startPosition.row + 1,
+            column: child.startPosition.column,
+          });
+        }
+        return;
+      }
+      // Recurse into tuples, token_trees, etc.
+      if (child.type === 'tuple_expression' || child.type === 'token_tree') {
+        for (let i = 0; i < child.namedChildCount; i++) {
+          const item = child.namedChild(i);
+          if (item) collectScopedBase(item);
+        }
+      }
+    };
+
+    for (let i = 0; i < args.namedChildCount; i++) {
+      const child = args.namedChild(i);
+      if (child) collectScopedBase(child);
     }
   }
 

@@ -466,6 +466,14 @@ export class ContextBuilder {
   ): Promise<Subgraph> {
     const opts = { ...DEFAULT_FIND_OPTIONS, ...options };
 
+    // CJK queries need more entry point slots — rare-token dampening preserves
+    // relevant single-term matches (e.g., "按键" → 处理_按键捕获) that would
+    // be lost at the default limit of 3.
+    const hasCJKQuery = /\p{Script=Han}/u.test(query);
+    if (hasCJKQuery && opts.searchLimit < 5) {
+      opts.searchLimit = 5;
+    }
+
     // Start with empty subgraph
     const nodes = new Map<string, Node>();
     const edges: Edge[] = [];
@@ -478,8 +486,7 @@ export class ContextBuilder {
 
     // === HYBRID SEARCH ===
 
-    // Pre-compute CJK query flag and jieba availability for scoring decisions.
-    const hasCJKQuery = /\p{Script=Han}/u.test(query);
+    // Pre-compute CJK jieba tokens for scoring decisions.
     const cjkQueryTokens = hasCJKQuery
       ? (segmentChinese(query) ?? []).filter(t => t.length >= 2).map(t => t.toLowerCase())
       : [];
@@ -579,21 +586,24 @@ export class ContextBuilder {
     // which is critical for template-heavy codebases (e.g., Liquid/Shopify themes)
     // where file names are the primary identifiers.
     let textResults: SearchResult[] = [];
+    const termResultCounts = new Map<string, number>();
     try {
       const searchTerms = extractSearchTerms(query);
       if (searchTerms.length > 0) {
-        // Search each term individually to get broader coverage,
-        // then boost results that match multiple terms
-        const termResultsMap = new Map<string, { result: SearchResult; termHits: number }>();
-        // When no explicit kind filter is set, exclude imports — they flood FTS
-        // results with qualified name matches (e.g., "REST" matches 445K import paths)
-        // but are almost never what exploration queries want.
+        // Count actual FTS matches per term (without limit) for rarity-based dampening.
         const searchKinds = opts.nodeKinds && opts.nodeKinds.length > 0
           ? opts.nodeKinds
           : ['file', 'module', 'class', 'struct', 'interface', 'trait', 'protocol',
              'function', 'method', 'property', 'field', 'variable', 'constant',
              'enum', 'enum_member', 'type_alias', 'namespace', 'export',
              'route', 'component'] as NodeKind[];
+        for (const term of searchTerms) {
+          const counted = this.queries.searchNodes(term, { limit: 50, kinds: searchKinds });
+          termResultCounts.set(term, counted.length);
+        }
+        // Search each term individually to get broader coverage,
+        // then boost results that match multiple terms
+        const termResultsMap = new Map<string, { result: SearchResult; termHits: number }>();
         for (const term of searchTerms) {
           const termResults = this.queries.searchNodes(term, {
             limit: opts.searchLimit * 2,
@@ -716,28 +726,32 @@ export class ContextBuilder {
         const nameLower = result.node.name.toLowerCase();
         const dirSegments = path.dirname(result.node.filePath).toLowerCase().split('/');
         let matchCount = 0;
+        let matchedGroupMinResults = Infinity;
         for (const group of termGroups) {
-          const groupMatches = group.some(term => {
+          let groupMatch = false;
+          for (const term of group) {
             const inName = nameLower.includes(term);
             const inDir = dirSegments.some(seg => seg === term);
-            return inName || inDir;
-          });
-          if (groupMatches) matchCount++;
+            if (inName || inDir) {
+              groupMatch = true;
+              const tc = termResultCounts.get(term) ?? Infinity;
+              if (tc < matchedGroupMinResults) matchedGroupMinResults = tc;
+              break;
+            }
+          }
+          if (groupMatch) matchCount++;
         }
         if (matchCount >= 2) {
           // Multiplicative boost — 2 terms → 2x, 3 terms → 2.5x
           result.score *= 1 + matchCount * 0.5;
         } else if (!exactMatchIds.has(result.node.id)) {
-          // Mild dampen for single-term matches — they might be generic
-          // but could also be the right result (e.g., "Protocol" class for an IPC query).
-          // Exempt exact name matches: they are specific symbols the user queried for.
-          // For CJK results, dampen more aggressively — single CJK tokens
-          // are too short to be meaningful selectors (e.g., "映射" matches
-          // both "映射_垂直同步" and "处理_映射逻辑").
-          // Use milder dampening when jieba is unavailable (the post-dampening
-          // path boost in Step 5c won't fire to compensate).
           const resultIsCJK = /\p{Script=Han}/u.test(result.node.name);
-          const cjkDampFactor = jiebaAvailable ? 0.15 : 0.3;
+          // Rare single-term CJK matches are specific selectors.
+          // "按键" (5 FTS results) is specific; "映射" (9+ results) is generic.
+          const isRareCJKTerm = resultIsCJK && matchedGroupMinResults <= 5;
+          const cjkDampFactor = jiebaAvailable
+            ? (isRareCJKTerm ? 0.6 : 0.15)
+            : 0.3;
           result.score *= resultIsCJK ? cjkDampFactor : 0.6;
           if (resultIsCJK) dampenedResultIds.add(result.node.id);
         }
@@ -987,6 +1001,50 @@ export class ContextBuilder {
               edges.push(edge);
             }
           }
+        }
+      }
+    }
+
+    // Step 5e: Call-graph expansion for low-confidence CJK seeds.
+    // When CJK FTS results are all low-scoring (abstract queries like "按键重映射完整流程"),
+    // the top seeds may miss the true entry points. Expand from both top seeds AND
+    // dampened results that matched rare tokens — these are specific but crushed by
+    // single-term dampening. Their call-graph neighbors are likely the real flow.
+    if (hasCJKQuery && filteredResults.length > 0) {
+      const seen = new Set(filteredResults.map(r => r.node.id));
+      // Collect expansion seeds: top results + dampened rare-token matches
+      const expansionSeeds = [...filteredResults];
+      for (const result of searchResults) {
+        if (seen.has(result.node.id)) continue;
+        if (!dampenedResultIds.has(result.node.id)) continue;
+        // Check if this result matched a rare term (≤ 3 FTS results)
+        const nameLower = result.node.name.toLowerCase();
+        let matchedRare = false;
+        for (const [term, count] of termResultCounts) {
+          if (count <= 3 && nameLower.includes(term)) {
+            matchedRare = true;
+            break;
+          }
+        }
+        if (matchedRare) {
+          expansionSeeds.push(result);
+          seen.add(result.node.id);
+        }
+      }
+      const expansionBudget = Math.min(8, expansionSeeds.length);
+      for (const seed of expansionSeeds.slice(0, expansionBudget)) {
+        try {
+          const callers = this.traverser.getCallers(seed.node.id, 1);
+          const callees = this.traverser.getCallees(seed.node.id, 1);
+          for (const neighbor of [...callers, ...callees]) {
+            if (!nodes.has(neighbor.node.id) && !resultById.has(neighbor.node.id)) {
+              const expanded: SearchResult = { node: neighbor.node, score: seed.score * 0.5 };
+              filteredResults.push(expanded);
+              resultById.set(neighbor.node.id, expanded);
+            }
+          }
+        } catch {
+          // Skip seeds whose call-graph neighborhood is unavailable
         }
       }
     }

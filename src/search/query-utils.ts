@@ -173,6 +173,11 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
     const lower = word.toLowerCase();
     if (lower.length < 2) continue;
     if (STOP_WORDS.has(lower)) continue;
+    // Skip long CJK segments — jieba tokens + bigrams already cover the search
+    // space.  Including the full query as a token causes all jieba tokens to
+    // be grouped into one mega-group (every token is a substring of the full
+    // query), which prevents multi-term boost from ever firing.
+    if (/\p{Script=Han}/u.test(word) && word.length > 4) continue;
     tokens.add(lower);
   }
 

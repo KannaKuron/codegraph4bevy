@@ -1126,10 +1126,15 @@ export class QueryBuilder {
       SELECT DISTINCT n.*, 0.8 as score FROM nodes n
       JOIN unresolved_refs u ON n.id = u.from_node_id
       WHERE u.reference_name = ? COLLATE NOCASE AND u.reference_kind = 'implements' ${filterSql}
+      UNION
+      SELECT DISTINCT n.*, 0.6 as score FROM nodes n
+      WHERE n.signature LIKE '%implements ' || ? || '%' COLLATE NOCASE
+        AND n.kind IN ('struct', 'enum', 'class') ${filterSql}
       ORDER BY score DESC, n.name ASC LIMIT ?
     `;
 
     const params: (string | number)[] = [
+      traitName, ...filterParams,
       traitName, ...filterParams,
       traitName, ...filterParams,
       limit,
