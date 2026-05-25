@@ -772,7 +772,7 @@ export class QueryBuilder {
     // are stripped without splitting) and find nothing. See #173.
     const ftsQuery = query
       .replace(/::/g, ' ') // Rust/C++/Ruby qualifier separator
-      .replace(/['"*():^]/g, '') // Remove FTS5 special chars
+      .replace(/['"*():^\\]/g, '') // Remove FTS5 special chars
       .split(/\s+/)
       .filter(term => term.length > 0)
       // Strip FTS5 boolean operators to prevent query manipulation
@@ -1117,6 +1117,8 @@ export class QueryBuilder {
       filterParams.push(...languages);
     }
 
+    const escapedTrait = escapeLike(traitName);
+
     const sql = `
       SELECT DISTINCT n.*, 1.0 as score FROM nodes n
       JOIN edges e ON n.id = e.source
@@ -1128,7 +1130,7 @@ export class QueryBuilder {
       WHERE u.reference_name = ? COLLATE NOCASE AND u.reference_kind = 'implements' ${filterSql}
       UNION
       SELECT DISTINCT n.*, 0.6 as score FROM nodes n
-      WHERE n.signature LIKE '%implements ' || ? || '%' COLLATE NOCASE
+      WHERE n.signature LIKE '%implements ' || ? || '%' ESCAPE '\\' COLLATE NOCASE
         AND n.kind IN ('struct', 'enum', 'class') ${filterSql}
       ORDER BY score DESC, n.name ASC LIMIT ?
     `;
@@ -1136,7 +1138,7 @@ export class QueryBuilder {
     const params: (string | number)[] = [
       traitName, ...filterParams,
       traitName, ...filterParams,
-      traitName, ...filterParams,
+      escapedTrait, ...filterParams,
       limit,
     ];
 
@@ -1687,7 +1689,7 @@ export class QueryBuilder {
     // Sanitize FTS5 query — same logic as searchNodesFTS
     const ftsQuery = query
       .replace(/::/g, ' ')
-      .replace(/['"*():^]/g, '')
+      .replace(/['"*():^\\]/g, '')
       .split(/\s+/)
       .filter(term => term.length > 0)
       .filter(term => !/^(AND|OR|NOT|NEAR)$/i.test(term))
