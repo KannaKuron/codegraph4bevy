@@ -654,10 +654,12 @@ export class ReferenceResolver {
         );
       }
 
-      // Delete unresolved refs, but preserve type_of — these are structural
-      // type relationships that should survive even if the name matcher can't resolve them
+      // Delete unresolved refs, but preserve type_of and calls — type_of
+      // are structural relationships; calls to external symbols (e.g. Bevy
+      // API, std library) are valuable for usages/search even when unresolved.
+      const PRESERVED_KINDS = new Set(['type_of', 'calls']);
       if (result.unresolved.length > 0) {
-        const deletable = result.unresolved.filter(r => r.referenceKind !== 'type_of');
+        const deletable = result.unresolved.filter(r => !PRESERVED_KINDS.has(r.referenceKind));
         if (deletable.length > 0) {
           this.queries.deleteSpecificResolvedReferences(
             deletable.map((r) => ({

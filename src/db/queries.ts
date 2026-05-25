@@ -173,6 +173,7 @@ export class QueryBuilder {
     insertUnresolved?: SqliteStatement;
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
+    getUnresolvedByNode?: SqliteStatement;
     getNodesByName?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
@@ -1430,6 +1431,28 @@ export class QueryBuilder {
       );
     }
     const rows = this.stmts.getUnresolvedByName.all(name) as UnresolvedRefRow[];
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+    }));
+  }
+
+  /**
+   * Get unresolved references by source node ID
+   */
+  getUnresolvedByNode(nodeId: string): UnresolvedReference[] {
+    if (!this.stmts.getUnresolvedByNode) {
+      this.stmts.getUnresolvedByNode = this.db.prepare(
+        'SELECT * FROM unresolved_refs WHERE from_node_id = ?'
+      );
+    }
+    const rows = this.stmts.getUnresolvedByNode.all(nodeId) as UnresolvedRefRow[];
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,

@@ -410,6 +410,11 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: 'Name of the function, method, or class to find callees for',
         },
+        include_external: {
+          type: 'boolean',
+          description: 'Include calls to external symbols (no project-internal node). Shows unresolved refs for external crate types like Bevy APIs. Default: false.',
+          default: false,
+        },
         limit: {
           type: 'number',
           description: 'Maximum number of callees to return (default: 20)',
@@ -1198,6 +1203,7 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
+    const includeExternal = args.include_external === true;
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
@@ -1217,18 +1223,55 @@ export class ToolHandler {
       }
     }
 
-    if (callSites.length === 0) {
+    // When include_external, supplement with unresolved calls refs for each
+    // matched node — external symbols (e.g. Bevy APIs) have no project node
+    // and are missing from the resolved edges above.
+    const externalCallees: Array<{ name: string; line: number; kind: string; filePath: string }> = [];
+    if (includeExternal) {
+      // Per-source-node resolved callee names for dedup (see Fix #3)
+      const resolvedBySource = new Map<string, Set<string>>();
+      for (const cs of callSites) {
+        let s = resolvedBySource.get(cs.edge.source);
+        if (!s) { s = new Set(); resolvedBySource.set(cs.edge.source, s); }
+        s.add(cs.callee.name);
+      }
+
+      for (const node of allMatches.nodes) {
+        const localResolved = resolvedBySource.get(node.id) ?? new Set<string>();
+        const unresolved = cg.getUnresolvedByNode(node.id);
+        for (const ref of unresolved) {
+          if (ref.referenceKind !== 'calls') continue;
+          if (localResolved.has(ref.referenceName)) continue;
+          const key = `ext:${ref.referenceName}:${ref.line}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          externalCallees.push({
+            name: ref.referenceName,
+            line: ref.line,
+            kind: 'external',
+            filePath: ref.filePath ?? node.filePath,
+          });
+        }
+      }
+    }
+
+    const totalCallees = callSites.length + externalCallees.length;
+    if (totalCallees === 0) {
       return this.textResult(`No callees found for "${symbol}"${allMatches.note}`);
     }
 
     const fileCache = new Map<string, string[]>();
 
-    const shown = callSites.slice(0, limit);
+    const shownResolved = callSites.slice(0, limit);
+    const EXTERNAL_SUB_LIMIT = 10;
+    const shownExternal = externalCallees.slice(0, EXTERNAL_SUB_LIMIT);
+    const shownTotal = shownResolved.length + shownExternal.length;
+
     const lines: string[] = [
-      `## Callees of "${symbol}" (${shown.length} shown, ${callSites.length} total)`,
+      `## Callees of "${symbol}" (${shownTotal} shown, ${totalCallees} total)`,
       '',
     ];
-    for (const cs of shown) {
+    for (const cs of shownResolved) {
       const defLine = cs.callee.startLine ? `:${cs.callee.startLine}` : '';
       const callLine = cs.edge.line ?? cs.callee.startLine;
       const fileRef = `${cs.callee.filePath}:${callLine}`;
@@ -1238,9 +1281,14 @@ export class ToolHandler {
       lines.push(`  call: ${cs.callee.filePath}:${callLine}${snippet ? ` — \`${snippet}\`` : ''}`);
       lines.push('');
     }
+    for (const ext of shownExternal) {
+      lines.push(`- **${ext.name}** (external)`);
+      lines.push(`  call: ${ext.filePath}:${ext.line}`);
+      lines.push('');
+    }
 
-    if (callSites.length > limit) {
-      lines.push(`... and ${callSites.length - limit} more callees`);
+    if (totalCallees > shownTotal) {
+      lines.push(`... and ${totalCallees - shownTotal} more callees`);
     }
 
     lines.push(allMatches.note);
@@ -1320,8 +1368,16 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
 
     const allMatches = this.findAllSymbols(cg, symbol);
-    if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+    // Check if any returned node is an exact name match. When FTS finds nodes
+    // whose signature text contains the symbol (e.g. a function that calls
+    // DespawnOnExit), findAllSymbols returns them even though the node name
+    // doesn't match — those should not drive the main usage path.
+    const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, symbol));
+    if (!exactMatch) {
+      const unresolvedResult = this.handleUsagesFromUnresolved(cg, symbol, limit, kindFilter);
+      if (unresolvedResult !== null) {
+        return unresolvedResult;
+      }
     }
 
     // Collect all incoming edges across all matching symbols.
@@ -1383,6 +1439,73 @@ export class ToolHandler {
     }
 
     lines.push(allMatches.note);
+
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  /**
+   * Fallback for codegraph_usages when no project-internal node exists.
+   * Searches unresolved_refs for external symbols (e.g. external crate types
+   * like Bevy's DespawnOnExit) and returns the referencing nodes.
+   */
+  private handleUsagesFromUnresolved(
+    cg: CodeGraph, symbol: string, limit: number, kindFilter?: string,
+  ): ToolResult | null {
+    const unresolved = cg.getUnresolvedByName(symbol);
+    if (unresolved.length === 0) {
+      return null;
+    }
+
+    // Deduplicate by source node + kind + line
+    const seen = new Set<string>();
+    const usages: Array<{ sourceNode: Node; edgeKind: string; line: number }> = [];
+    for (const ref of unresolved) {
+      if (kindFilter && ref.referenceKind !== kindFilter) continue;
+      const key = `${ref.fromNodeId}:${ref.referenceKind}:${ref.line}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const sourceNode = cg.getNode(ref.fromNodeId);
+      if (sourceNode) {
+        usages.push({ sourceNode, edgeKind: ref.referenceKind, line: ref.line });
+      }
+    }
+
+    if (usages.length === 0) {
+      return null;
+    }
+
+    // Group by file
+    const byFile = new Map<string, typeof usages>();
+    for (const u of usages) {
+      const existing = byFile.get(u.sourceNode.filePath) || [];
+      existing.push(u);
+      byFile.set(u.sourceNode.filePath, existing);
+    }
+
+    const lines: string[] = [
+      `## Usages of "${symbol}" (${Math.min(usages.length, limit)} shown, ${usages.length} total)`,
+      '',
+      '> External symbol — no project-internal node found. Results from unresolved references.',
+      '',
+    ];
+
+    let count = 0;
+    for (const [file, fileUsages] of byFile) {
+      if (count >= limit) break;
+      lines.push(`**${file}:**`);
+      for (const u of fileUsages) {
+        if (count >= limit) break;
+        const lineInfo = u.line ? `:${u.line}` : '';
+        lines.push(`- ${u.sourceNode.name} (${u.sourceNode.kind}) ${u.edgeKind}→ ${symbol}${lineInfo}`);
+        count++;
+      }
+      lines.push('');
+    }
+
+    if (usages.length > limit) {
+      lines.push(`... and ${usages.length - limit} more usages`);
+    }
 
     return this.textResult(this.truncateOutput(lines.join('\n')));
   }

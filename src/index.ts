@@ -22,6 +22,7 @@ import {
   BuildContextOptions,
   FindRelevantContextOptions,
   EdgeKind,
+  UnresolvedReference,
 } from './types';
 import { DatabaseConnection, getDatabasePath } from './db';
 import { QueryBuilder } from './db/queries';
@@ -645,6 +646,22 @@ export class CodeGraph {
    */
   findImplementors(traitName: string, options?: SearchOptions): SearchResult[] {
     return this.queries.findImplementors(traitName, options);
+  }
+
+  /**
+   * Get unresolved references by reference name.
+   * Used for finding usages of external symbols (no project-internal node).
+   */
+  getUnresolvedByName(name: string): UnresolvedReference[] {
+    return this.queries.getUnresolvedByName(name);
+  }
+
+  /**
+   * Get unresolved references originating from a specific node.
+   * Used for callees of external symbols.
+   */
+  getUnresolvedByNode(nodeId: string): UnresolvedReference[] {
+    return this.queries.getUnresolvedByNode(nodeId);
   }
 
   // ===========================================================================

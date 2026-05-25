@@ -2022,7 +2022,7 @@ export class TreeSitterExtractor {
       if (this._callEnrich) {
         let called = this._callEnrich.get(callerId);
         if (!called) { called = new Set(); this._callEnrich.set(callerId, called); }
-        if (called.size < 8) called.add(calleeName);
+        if (called.size < 30) called.add(calleeName);
       }
     }
 
