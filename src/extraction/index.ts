@@ -1165,14 +1165,7 @@ export class ExtractionOrchestrator {
       this.queries.transaction(() => {
         this.queries.deleteComments(filePath);
         for (const c of comments) {
-          // Find nearest enclosing symbol
-          let associatedSymbol: string | undefined;
-          for (const node of candidates) {
-            if (node.startLine <= c.startLine && node.endLine >= c.endLine) {
-              associatedSymbol = node.qualifiedName ?? node.name;
-              break;
-            }
-          }
+          const associatedSymbol = associateCommentWithSymbol(c, candidates);
 
           // Enrich CJK text for FTS; non-CJK comments don't need duplicate tokens
           const ftsTokens = /\p{Script=Han}/u.test(c.text) ? enrichCJKForFTS(c.text) : '';
@@ -1506,3 +1499,43 @@ export class ExtractionOrchestrator {
 // Re-export useful types and functions
 export { extractFromSource } from './tree-sitter';
 export { detectLanguage, isSourceFile, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './grammars';
+
+/**
+ * Associate a comment with the nearest enclosing or following symbol.
+ *
+ * 1. Enclosing: comment lines fall within a symbol span.
+ * 2. Forward-lookup (doc comments only): comment appears before the
+ *    symbol (gap <= 3 lines) — covers Rust ///, Go //, JS block doc.
+ *
+ * @param candidates Must be sorted by startLine **descending** (with
+ *  endLine ascending as tiebreaker) so the first enclosing match is the
+ *  tightest (innermost) symbol.
+ */
+export function associateCommentWithSymbol(
+  comment: { startLine: number; endLine: number; kind: string },
+  candidates: Array<{ startLine: number; endLine: number; name: string; qualifiedName?: string }>,
+): string | undefined {
+  // Find nearest enclosing symbol
+  for (const node of candidates) {
+    if (node.startLine <= comment.startLine && node.endLine >= comment.endLine) {
+      return node.qualifiedName ?? node.name;
+    }
+  }
+
+  // Doc comments appear BEFORE the documented item.  Fall back to the
+  // nearest candidate whose startLine follows the comment's endLine.
+  if (comment.kind === 'doc') {
+    let bestGap = Infinity;
+    let bestSymbol: string | undefined;
+    for (const node of candidates) {
+      const gap = node.startLine - comment.endLine;
+      if (gap >= 1 && gap <= 3 && gap < bestGap) {
+        bestGap = gap;
+        bestSymbol = node.qualifiedName ?? node.name;
+      }
+    }
+    if (bestSymbol) return bestSymbol;
+  }
+
+  return undefined;
+}

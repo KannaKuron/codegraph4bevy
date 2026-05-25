@@ -478,6 +478,13 @@ export class ContextBuilder {
 
     // === HYBRID SEARCH ===
 
+    // Pre-compute CJK query flag and jieba availability for scoring decisions.
+    const hasCJKQuery = /\p{Script=Han}/u.test(query);
+    const cjkQueryTokens = hasCJKQuery
+      ? (segmentChinese(query) ?? []).filter(t => t.length >= 2).map(t => t.toLowerCase())
+      : [];
+    const jiebaAvailable = hasCJKQuery && cjkQueryTokens.length >= 1;
+
     // Step 1: Extract potential symbol names from query
     const symbolsFromQuery = extractSymbolsFromQuery(query);
     logDebug('Extracted symbols from query', { query, symbols: symbolsFromQuery });
@@ -671,6 +678,8 @@ export class ContextBuilder {
     // (matches only "execution") fills budget slots meant for "ShardSearchRequest"
     // (matches "shard" + "search" + "request").
     const queryTermsForBoost = extractSearchTerms(query);
+    // Track dampened results across Step 5a → 5c for targeted path boost.
+    const dampenedResultIds = new Set<string>();
     if (queryTermsForBoost.length >= 2) {
       // Group terms that are substrings of each other (stem variants of the same
       // root word). "indexed", "indexe", "index" should count as ONE concept match,
@@ -725,11 +734,37 @@ export class ContextBuilder {
           // For CJK results, dampen more aggressively — single CJK tokens
           // are too short to be meaningful selectors (e.g., "映射" matches
           // both "映射_垂直同步" and "处理_映射逻辑").
+          // Use milder dampening when jieba is unavailable (the post-dampening
+          // path boost in Step 5c won't fire to compensate).
           const resultIsCJK = /\p{Script=Han}/u.test(result.node.name);
-          result.score *= resultIsCJK ? 0.3 : 0.6;
+          const cjkDampFactor = jiebaAvailable ? 0.15 : 0.3;
+          result.score *= resultIsCJK ? cjkDampFactor : 0.6;
+          if (resultIsCJK) dampenedResultIds.add(result.node.id);
         }
       }
       searchResults.sort((a, b) => b.score - a.score);
+    }
+
+    // Step 5c: CJK post-dampening path relevance boost.
+    // Dampening is multiplicative and crushes path-relevance bonuses along
+    // with noise.  For CJK codebases the filename is a strong semantic signal
+    // (e.g., 输入映射_插件.rs contains query token "映射"), so re-evaluate
+    // path relevance *after* dampening with an additive bonus.
+    // Only boosts results that were actually dampened in Step 5a (single-term,
+    // non-exact-match, CJK name) — multi-term-boosted results don't need it.
+    if (jiebaAvailable && cjkQueryTokens.length >= 1) {
+        for (const result of searchResults) {
+          if (!dampenedResultIds.has(result.node.id)) continue;
+          const fileName = path.basename(result.node.filePath, path.extname(result.node.filePath)).toLowerCase();
+          let pathHits = 0;
+          for (const token of cjkQueryTokens) {
+            if (fileName.includes(token)) pathHits++;
+          }
+          if (pathHits >= 1) {
+            result.score += pathHits * 15;
+          }
+        }
+        searchResults.sort((a, b) => b.score - a.score);
     }
 
     // Step 5b: CamelCase-boundary matching via LIKE query.
@@ -818,7 +853,7 @@ export class ContextBuilder {
         searchIdSet.add(r.node.id);
       }
 
-      // Step 5c: Compound term matching — find classes whose name contains 2+
+      // Step 5d: Compound term matching — find classes whose name contains 2+
       // query terms at ANY position (not just CamelCase boundaries).
       // The CamelCase step above requires idx > 0, which misses classes that
       // START with a query term (e.g., "SearchShardsRequest" starts with "Search").

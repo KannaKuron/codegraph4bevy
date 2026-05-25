@@ -184,7 +184,12 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
     // Add raw query tokens (split by whitespace) directly
     for (const raw of query.split(/[\s]+/)) {
       const trimmed = raw.trim();
-      if (trimmed.length >= 2) {
+      // Skip > 4-char raw CJK segments — jieba tokens + bigrams already
+      // cover the search space.  Long CJK strings in term grouping contain
+      // every jieba token as a substring, collapsing all groups into one
+      // mega-group and preventing multi-term boost from ever firing.
+      const isCJKLong = /\p{Script=Han}/u.test(trimmed) && trimmed.length > 4;
+      if (trimmed.length >= 2 && !isCJKLong) {
         tokens.add(trimmed.toLowerCase());
       }
     }
