@@ -1697,6 +1697,21 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'flutter-build') {
+      return {
+        label: `Flutter setState → build — setState re-runs build() (dynamic dispatch)`,
+        compact: `dynamic: Flutter build via setState${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'cpp-override') {
+      const via = m.via ? `::${String(m.via)}` : '';
+      return {
+        label: `C++ virtual override — base dispatches to subclass${via} (dynamic dispatch)`,
+        compact: `dynamic: C++ virtual override${via}${at}`,
+        registeredAt,
+      };
+    }
     if (m?.synthesizedBy === 'interface-impl') {
       return {
         label: `interface/abstract dispatch — runs the implementation override (dynamic dispatch)`,
@@ -1705,9 +1720,12 @@ export class ToolHandler {
       };
     }
     if (m?.synthesizedBy === 'bevy-ecs-state') {
+      const via = m.transitiveVia
+        ? ` (derived via ComputedStates from \`${String(m.transitiveVia)}\`)`
+        : '';
       return {
-        label: `Bevy state transition — producer triggers consumer via state change (dynamic dispatch)`,
-        compact: `dynamic: Bevy state transition${at}`,
+        label: `Bevy state transition — producer triggers consumer via state change${via} (dynamic dispatch)`,
+        compact: `dynamic: Bevy state transition${via ? ` [computed]` : ''}${at}`,
         registeredAt,
       };
     }

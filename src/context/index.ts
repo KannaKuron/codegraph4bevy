@@ -419,7 +419,19 @@ export class ContextBuilder {
         ? `renders <${String(m.via || 'child')}>`
         : m.synthesizedBy === 'vue-handler'
         ? `Vue @${String(m.event || 'event')} handler`
-        : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
+        : m.synthesizedBy === 'event-emitter'
+        ? `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`
+        : m.synthesizedBy === 'flutter-build'
+        ? `Flutter build via setState${at}`
+        : m.synthesizedBy === 'cpp-override'
+        ? `C++ virtual override${at}`
+        : m.synthesizedBy === 'interface-impl'
+        ? `interface dispatch${at}`
+        : m.synthesizedBy === 'bevy-ecs-state'
+        ? `Bevy state${m.transitiveVia ? ` via ${m.transitiveVia}` : ''}${at}`
+        : m.synthesizedBy === 'bevy-ecs-resource'
+        ? `Bevy ECS resource${at}`
+        : String(m.synthesizedBy);
       synthByPair.set(`${e.source}>${e.target}`, label);
     }
     const renderChain = (c: string[]): string => {

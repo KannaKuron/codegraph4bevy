@@ -539,6 +539,170 @@ const RESOURCE_EXISTS_RE = /run_if\s*\(\s*resource_exists\s*::\s*<\s*([\p{L}\p{N
 const NEXT_STATE_PENDING_RE = /NextState\s*::\s*Pending\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
 const NEXT_STATE_SET_RE = /next_state\s*\.\s*set\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
 const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
+// ComputedStates: extract impl blocks via brace-depth (regex [^}]*? breaks on
+// nested fn bodies). Keyed by short name (last ::-segment) so that
+// crate::IntroState matches IntroState::Done via startsWith('IntroState::').
+const IMPL_HEADER_RE = /impl\s+ComputedStates\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)(?:\s+where\s+[^{]+)?\s*\{/gu;
+
+/** Angle-bracket-aware comma splitter for tuple SourceTypes. */
+function splitTypeList(spec: string): string[] {
+  const results: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < spec.length; i++) {
+    const ch = spec[i]!;
+    if (ch === '<') depth++;
+    else if (ch === '>') depth = Math.max(0, depth - 1);
+    else if (ch === ',' && depth === 0) {
+      const part = spec.slice(start, i).trim();
+      if (part) results.push(part);
+      start = i + 1;
+    }
+  }
+  const last = spec.slice(start).trim();
+  if (last) results.push(last);
+  return results;
+}
+
+/** Extract ComputedStates impl→SourceStates mapping from stripped Rust source. */
+function extractComputedStatesSources(content: string): Map<string, string[]> {
+  const result = new Map<string, string[]>();
+  IMPL_HEADER_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = IMPL_HEADER_RE.exec(content))) {
+    const computedNameRaw = m[1]!.replace(/\s+/g, '');
+    const computedParts = computedNameRaw.split('::').filter(p => p.length > 0);
+    const computedName = computedParts[computedParts.length - 1] ?? computedNameRaw;
+    // Extract body by counting brace depth (content is already stripped of strings/comments)
+    const bodyStart = m.index + m[0].length;
+    let depth = 1;
+    let i = bodyStart;
+    while (i < content.length && depth > 0) {
+      if (content[i] === '{') depth++;
+      else if (content[i] === '}') depth--;
+      i++;
+    }
+    IMPL_HEADER_RE.lastIndex = i;
+    const body = content.slice(bodyStart, i - 1);
+    const sourceMatch = body.match(/type\s+SourceStates\s*=\s*([^;]+);/);
+    if (!sourceMatch) continue;
+    const sourceSpec = sourceMatch[1]!.trim();
+    const sourceTypes = sourceSpec.startsWith('(')
+      ? splitTypeList(sourceSpec.slice(1, -1))
+      : [sourceSpec];
+    for (const src of sourceTypes) {
+      const srcRaw = src.replace(/\s+/g, '');
+      const srcParts = srcRaw.split('::').filter(p => p.length > 0);
+      const srcShort = srcParts[srcParts.length - 1] ?? srcRaw;
+      let arr = result.get(srcShort);
+      if (!arr) { arr = []; result.set(srcShort, arr); }
+      if (!arr.includes(computedName)) arr.push(computedName);
+    }
+  }
+  return result;
+}
+
+// Strip Rust line (//) and block (/* */) comments, strings, char literals,
+// and raw/byte strings to avoid false matches in dead text.
+function stripRustComments(src: string): string {
+  let result = '';
+  let i = 0;
+  while (i < src.length) {
+    if (src[i] === '/' && src[i + 1] === '/') {
+      // Line comment — skip to end of line
+      const nl = src.indexOf('\n', i);
+      if (nl < 0) break;
+      result += '\n'.repeat(src.substring(i, nl).split('\n').length - 1) + '\n';
+      i = nl + 1;
+    } else if (src[i] === '/' && src[i + 1] === '*') {
+      // Nested block comment — track /* */ depth
+      let depth = 1;
+      let j = i + 2;
+      while (j < src.length - 1 && depth > 0) {
+        if (src[j] === '/' && src[j + 1] === '*') { depth++; j += 2; }
+        else if (src[j] === '*' && src[j + 1] === '/') { depth--; j += 2; }
+        else { result += src[j] === '\n' ? '\n' : ' '; j++; }
+      }
+      // Unclosed block comment: preserve rest as spaces (keep newlines for line numbers)
+      if (depth > 0) {
+        while (j < src.length) { result += src[j] === '\n' ? '\n' : ' '; j++; }
+      }
+      result += '  '; // closing */
+      i = j;
+    } else if (src[i] === "'") {
+      // Char literal: 'a', '\n', '\u{7b}' — replace with spaces to prevent
+      // '{'/'}' inside char literals from corrupting brace-depth counting.
+      result += ' ';
+      i++;
+      if (i < src.length && src[i] === '\\') {
+        result += ' '; i++;
+        if (i < src.length && src[i] === 'x') {
+          result += ' '; i++;
+          while (i < src.length && src[i] !== "'") { result += ' '; i++; }
+        } else if (i < src.length && src[i] === 'u' && i + 1 < src.length && src[i + 1] === '{') {
+          while (i < src.length && src[i] !== "'") { result += ' '; i++; }
+        } else {
+          if (i < src.length) { result += ' '; i++; }
+        }
+      } else {
+        if (i < src.length) { result += ' '; i++; }
+      }
+      if (i < src.length && src[i] === "'") { result += ' '; i++; }
+    } else if (src[i] === 'b' && i + 1 < src.length && src[i + 1] === '"') {
+      // Regular byte string b"..." — must be checked before the raw string
+      // branch, otherwise b"..." falls into the raw-string path which doesn't
+      // handle escape sequences (e.g. b"he\"llo" would stop at the wrong ").
+      let j = i + 2;
+      result += '  ';
+      while (j < src.length && src[j] !== '"') {
+        if (src[j] === '\\' && j + 1 < src.length) { result += ' '; j += 2; continue; }
+        if (src[j] === '\n') result += '\n'; else result += ' ';
+        j++;
+      }
+      if (j < src.length) { result += ' '; j++; }
+      i = j;
+    } else if ((src[i] === 'r' || src[i] === 'b') && i + 1 < src.length) {
+      // Raw / raw-byte string: r"...", r#"..."#, br"...", br#"..."#
+      let j = i + 1;
+      if (src[j] === 'r') j++;
+      let hashes = 0;
+      while (j < src.length && src[j] === '#') { hashes++; j++; }
+      if (j < src.length && src[j] === '"') {
+        j++;
+        const close = '"' + '#'.repeat(hashes);
+        const end = src.indexOf(close, j);
+        if (end < 0) {
+          // Unclosed raw string — replace remainder with spaces (preserve newlines)
+          while (i < src.length) {
+            result += src[i] === '\n' ? '\n' : ' ';
+            i++;
+          }
+          break;
+        }
+        for (let k = i; k < end + close.length; k++) {
+          result += src[k] === '\n' ? '\n' : ' ';
+        }
+        i = end + close.length;
+      } else {
+        result += src[i]; i++;
+      }
+    } else if (src[i] === '"') {
+      // Regular string literal — skip contents (preserve newlines)
+      result += ' ';
+      i++;
+      while (i < src.length && src[i] !== '"') {
+        if (src[i] === '\\' && i + 1 < src.length) { result += ' '; i += 2; continue; }
+        if (src[i] === '\n') result += '\n'; else result += ' ';
+        i++;
+      }
+      if (i < src.length) { result += ' '; i++; }
+    } else {
+      result += src[i];
+      i++;
+    }
+  }
+  return result;
+}
 
 function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
@@ -552,8 +716,9 @@ function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
 
   for (const file of ctx.getAllFiles()) {
     if (!file.endsWith('.rs')) continue;
-    const content = ctx.readFile(file);
-    if (!content) continue;
+    const raw = ctx.readFile(file);
+    if (!raw) continue;
+    const content = stripRustComments(raw);
 
     const fileNodes = ctx.getNodesInFile(file);
     const fns = fileNodes.filter((n: { kind: string }) => n.kind === 'function' || n.kind === 'method');
@@ -608,6 +773,7 @@ function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
 
 function bevyStateEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
+  const seen = new Set<string>();
   const states = new Map<string, { producers: Map<string, { line: number; full: string }>; consumers: Map<string, { line: number; full: string }> }>();
 
   function ensure(s: string) {
@@ -626,76 +792,30 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
     return { full, variant };
   }
 
-  // Strip Rust line (//) and block (/* */) comments to avoid false matches
-  // in dead text. Same approach as other synthesizers that scan raw content.
-  function stripRustComments(src: string): string {
-    let result = '';
-    let i = 0;
-    while (i < src.length) {
-      if (src[i] === '/' && src[i + 1] === '/') {
-        // Line comment — skip to end of line
-        const nl = src.indexOf('\n', i);
-        if (nl < 0) break;
-        result += '\n'.repeat(src.substring(i, nl).split('\n').length - 1) + '\n';
-        i = nl + 1;
-      } else if (src[i] === '/' && src[i + 1] === '*') {
-        // Nested block comment — track /* */ depth
-        let depth = 1;
-        let j = i + 2;
-        while (j < src.length - 1 && depth > 0) {
-          if (src[j] === '/' && src[j + 1] === '*') { depth++; j += 2; }
-          else if (src[j] === '*' && src[j + 1] === '/') { depth--; j += 2; }
-          else { result += src[j] === '\n' ? '\n' : ' '; j++; }
-        }
-        // Unclosed block comment: preserve rest as spaces (keep newlines for line numbers)
-        if (depth > 0) {
-          while (j < src.length) { result += src[j] === '\n' ? '\n' : ' '; j++; }
-        }
-        result += '  '; // closing */
-        i = j;
-      } else if ((src[i] === 'r' || src[i] === 'b') && i + 1 < src.length) {
-        // Raw / byte string: r"...", r#"..."#, br"..."
-        let j = i + 1;
-        if (src[j] === 'r') j++;
-        let hashes = 0;
-        while (j < src.length && src[j] === '#') { hashes++; j++; }
-        if (j < src.length && src[j] === '"') {
-          j++;
-          const close = '"' + '#'.repeat(hashes);
-          const end = src.indexOf(close, j);
-          if (end < 0) break; // unclosed raw string — stop
-          for (let k = i; k < end + close.length; k++) {
-            result += src[k] === '\n' ? '\n' : ' ';
-          }
-          i = end + close.length;
-        } else {
-          // Not a raw/byte string (e.g. `return`, `break`) — emit char and advance
-          result += src[i]; i++;
-        }
-      } else if (src[i] === '"') {
-        // Regular string literal — skip contents (preserve newlines)
-        result += ' ';
-        i++;
-        while (i < src.length && src[i] !== '"') {
-          if (src[i] === '\\' && i + 1 < src.length) { result += ' '; i += 2; continue; }
-          if (src[i] === '\n') result += '\n'; else result += ' ';
-          i++;
-        }
-        if (i < src.length) { result += ' '; i++; }
-      } else {
-        result += src[i];
-        i++;
-      }
-    }
-    return result;
-  }
+  // Cache stripped content to avoid re-reading/re-stripping.
+  const strippedByFile = new Map<string, string>();
 
+  // Pre-scan: build computedFromSource mapping from ComputedStates impls.
+  // Maps source state type name → computed state names that derive from it.
+  const computedFromSource = new Map<string, string[]>();
   for (const file of ctx.getAllFiles()) {
     if (!file.endsWith('.rs')) continue;
-    const rawContent = ctx.readFile(file);
-    if (!rawContent) continue;
-    const content = stripRustComments(rawContent);
+    const raw = ctx.readFile(file);
+    if (!raw) continue;
+    const content = stripRustComments(raw);
+    strippedByFile.set(file, content);
+    for (const [src, names] of extractComputedStatesSources(content)) {
+      const arr = computedFromSource.get(src);
+      if (arr) {
+        for (const n of names) { if (!arr.includes(n)) arr.push(n); }
+      } else {
+        computedFromSource.set(src, [...names]);
+      }
+    }
+  }
 
+  // Main scan: find producers and consumers using cached stripped content.
+  for (const [file, content] of strippedByFile) {
     const fileNodes = ctx.getNodesInFile(file);
     const fns = fileNodes.filter((n: { kind: string }) => n.kind === 'function' || n.kind === 'method');
 
@@ -715,7 +835,7 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
       const fnId = findEnclosingFn(line);
       if (fnId) {
         const entry = ensure(variant);
-        if (!entry.producers.has(fnId)) entry.producers.set(fnId, { line, full });
+        entry.producers.set(fnId + '\0' + full, { line, full });
       }
     }
 
@@ -727,7 +847,7 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
       const fnId = findEnclosingFn(line);
       if (fnId) {
         const entry = ensure(variant);
-        if (!entry.producers.has(fnId)) entry.producers.set(fnId, { line, full });
+        entry.producers.set(fnId + '\0' + full, { line, full });
       }
     }
 
@@ -739,19 +859,26 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
       const fnId = findEnclosingFn(line);
       if (fnId) {
         const entry = ensure(variant);
-        if (!entry.consumers.has(fnId)) entry.consumers.set(fnId, { line, full });
+        entry.consumers.set(fnId + '\0' + full, { line, full });
       }
     }
   }
 
+  // Direct (non-transitive) state edges — processed BEFORE transitive so direct
+  // edges (with exact stateName) claim dedup keys first; transitive edges fill gaps.
   for (const [stateKey, data] of states) {
     if (data.producers.size === 0 || data.consumers.size === 0) continue;
-    for (const [producerId, pInfo] of data.producers) {
-      for (const [consumerId, cInfo] of data.consumers) {
+    for (const [producerKey, pInfo] of data.producers) {
+      const producerId = producerKey.split('\0')[0]!;
+      for (const [consumerKey, cInfo] of data.consumers) {
+        const consumerId = consumerKey.split('\0')[0]!;
         if (producerId === consumerId) continue;
         // Cross-enum guard: if both sides are qualified (EnumType::Variant) and the
         // enum type differs, skip — GameState::Playing ≠ UiState::Playing.
         if (pInfo.full !== stateKey && cInfo.full !== stateKey && pInfo.full !== cInfo.full) continue;
+        const dedupKey = `${producerId}>${consumerId}`;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
         edges.push({
           source: producerId,
           target: consumerId,
@@ -761,6 +888,66 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
           metadata: { synthesizedBy: 'bevy-ecs-state', stateName: stateKey },
         });
       }
+    }
+  }
+
+  // Transitive ComputedStates propagation: producers of a source state reach
+  // consumers of a computed state derived from it.  Built as direct edges to
+  // avoid cross-enum guard and variant-name collision issues with the states map.
+  const MAX_TRANSITIVE_PER_SOURCE = 100;
+  const GLOBAL_TRANSITIVE_CAP = 300;
+  let globalTransitiveCount = 0;
+  for (const [sourceTypeName, computedNames] of computedFromSource) {
+    if (globalTransitiveCount >= GLOBAL_TRANSITIVE_CAP) break;
+    // Phase 1: collect all producers of the source state
+    const sourceProducers = new Map<string, { line: number; full: string }>();
+    for (const [, data] of states) {
+      for (const [producerKey, pInfo] of data.producers) {
+        if (pInfo.full === sourceTypeName || pInfo.full.startsWith(sourceTypeName + '::')) {
+          sourceProducers.set(producerKey, pInfo);
+        }
+      }
+    }
+    if (sourceProducers.size === 0) continue;
+    // Phase 2: find consumers that reference a computed state and emit edges directly
+    let perSourceCount = 0;
+    for (const [, data] of states) {
+      if (data.consumers.size === 0) continue;
+      for (const [consumerKey, cInfo] of data.consumers) {
+        let matchedComputed: string | undefined;
+        for (const computedName of computedNames) {
+          if (cInfo.full === computedName || cInfo.full.startsWith(computedName + '::')) {
+            matchedComputed = computedName;
+            break;
+          }
+        }
+        if (!matchedComputed) continue;
+        for (const [producerKey, pInfo] of sourceProducers) {
+          const producerId = producerKey.split('\0')[0]!;
+          const consumerId = consumerKey.split('\0')[0]!;
+          if (producerId === consumerId) continue;
+          const dedupKey = `${producerId}>${consumerId}`;
+          if (seen.has(dedupKey)) continue;
+          if (perSourceCount >= MAX_TRANSITIVE_PER_SOURCE || globalTransitiveCount >= GLOBAL_TRANSITIVE_CAP) break;
+          seen.add(dedupKey);
+          edges.push({
+            source: producerId,
+            target: consumerId,
+            kind: 'calls',
+            line: pInfo.line,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'bevy-ecs-state',
+              stateName: matchedComputed,
+              transitiveVia: sourceTypeName,
+            },
+          });
+          perSourceCount++;
+          globalTransitiveCount++;
+        }
+        if (perSourceCount >= MAX_TRANSITIVE_PER_SOURCE || globalTransitiveCount >= GLOBAL_TRANSITIVE_CAP) break;
+      }
+      if (perSourceCount >= MAX_TRANSITIVE_PER_SOURCE || globalTransitiveCount >= GLOBAL_TRANSITIVE_CAP) break;
     }
   }
 
