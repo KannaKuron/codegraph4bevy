@@ -383,7 +383,7 @@ export function nameMatchBonus(nodeName: string, query: string): number {
   // Unicode-aware: preserves CJK, Cyrillic and other non-ASCII identifier characters.
   const rawTerms = query
     .replace(/([a-z])([A-Z])/g, '$1 $2')
-    .split(/_+/)
+    .split(/[_＿]+/)
     .flatMap(part => part.split(/[^\p{L}\p{N}]+/u))
     .map(t => t.toLowerCase())
     .filter(t => t.length >= 2);
@@ -402,21 +402,65 @@ export function nameMatchBonus(nodeName: string, query: string): number {
 
   // Name starts with query — scale by length ratio so "Pod"→"Pod" (exact, handled above)
   // scores much higher than "Pod"→"PodGCControllerOptions" (ratio 0.125).
+  // Don't return immediately for CJK queries: CJK token coverage may boost further.
+  let prefixScore = 0;
   if (nameLower.startsWith(queryLower)) {
     const ratio = queryLower.length / nameLower.length;
-    return Math.round(10 + 30 * ratio);
+    prefixScore = Math.round(10 + 30 * ratio);
+    if (!/[\p{Script=Han}]/u.test(query)) return prefixScore;
   }
 
-  // All split terms appear in the name
+  // All split terms appear in the name — skip early return for CJK queries
+  // so the jieba token-coverage path can score higher than this flat 15.
+  const hasCJK = /[\p{Script=Han}]/u.test(query);
+  let allTermsMatch = false;
   if (rawTerms.length > 1) {
-    const allMatch = rawTerms.every(t => nameLower.includes(t));
-    if (allMatch) return 15;
+    allTermsMatch = rawTerms.every(t => nameLower.includes(t));
+    if (allTermsMatch && !hasCJK) return 15;
   }
 
-  // Name contains the full query as substring
-  if (nameLower.includes(queryLower)) return 10;
+  // Compute a base score from substring match, then potentially boost it
+  // with CJK token coverage (which needs more tokens matching to exceed it).
+  let baseScore = prefixScore;
+  if (baseScore === 0 && nameLower.includes(queryLower)) baseScore = 10;
 
-  return 0;
+  // CJK token coverage: segment the query into meaningful tokens and check
+  // how many appear in the name. A name matching MORE query tokens is far
+  // more relevant than one matching a single token. Without this, a name
+  // that starts with a partial token scores higher than one matching all tokens.
+  if (hasCJK) {
+    const jiebaTokens = segmentChinese(query);
+    if (jiebaTokens && jiebaTokens.length >= 1) {
+      const meaningful = jiebaTokens.filter(t => t.length >= 2);
+      if (meaningful.length >= 2) {
+        let tokenHits = 0;
+        for (const token of meaningful) {
+          if (nameLower.includes(token.toLowerCase())) tokenHits++;
+        }
+        if (tokenHits >= 2) return Math.max(baseScore, 20 + tokenHits * 15);
+        if (tokenHits === 1) {
+          const singleScore = Math.max(3, Math.round(12 / meaningful.length));
+          return Math.max(baseScore > 0 ? baseScore : 0, singleScore);
+        }
+      }
+      if (meaningful.length === 1) {
+        const hit = nameLower.includes(meaningful[0]!.toLowerCase());
+        if (hit) {
+          // Prefix match is already well-calibrated — don't cap it.
+          if (prefixScore > 0) return prefixScore;
+          return Math.max(Math.min(baseScore, 8), 3);
+        }
+        // Don't return — fall through to allTermsMatch fallback
+        // which may score higher when all raw terms match.
+      }
+    }
+  }
+
+  // CJK all-match fallback: if all raw terms match but jieba path didn't
+  // produce a higher score (e.g. single meaningful token), return floor of 15.
+  if (hasCJK && allTermsMatch) return Math.max(baseScore, 15);
+
+  return baseScore;
 }
 
 /**

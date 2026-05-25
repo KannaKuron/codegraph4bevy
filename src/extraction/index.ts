@@ -14,11 +14,13 @@ import {
   FileRecord,
   ExtractionResult,
   ExtractionError,
+  Node,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isSourceFile, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { logDebug, logWarn } from '../errors';
+import { enrichCJKForFTS } from '../search/query-utils';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
@@ -825,7 +827,7 @@ export class ExtractionOrchestrator {
         }
 
         // Extract and store comments for FTS search
-        this.extractAndStoreComments(filePath, content, detectLanguage(filePath, content));
+        this.extractAndStoreComments(filePath, content, detectLanguage(filePath, content), result.nodes);
 
         if (result.errors.length > 0) {
           for (const err of result.errors) {
@@ -1131,27 +1133,59 @@ export class ExtractionOrchestrator {
     }
 
     // Extract and store comments for FTS search
-    this.extractAndStoreComments(relativePath, content, language);
+    this.extractAndStoreComments(relativePath, content, language, result.nodes);
 
     return result;
   }
 
   /**
    * Extract comments from source and store in comments table.
+   * Associates each comment with its nearest enclosing symbol and
+   * enriches CJK text with jieba-segmented tokens for FTS search.
    */
-  private extractAndStoreComments(filePath: string, content: string, language: string): void {
+  private extractAndStoreComments(filePath: string, content: string, language: string, extractionNodes?: Node[]): void {
     try {
       const { extractComments } = require('./comment-extractor');
       const comments = extractComments(content, filePath, language);
-      // Delete old comments and insert new ones in a single transaction
+
+      // Use pre-computed nodes from the current extraction when available
+      // (avoids stale nodes when storeExtractionResult was skipped due to
+      // content-hash match or extraction failure).
+      const fileNodes = extractionNodes ?? this.queries.getNodesByFile(filePath);
+      const enclosingKinds = new Set([
+        'function', 'method', 'class', 'struct', 'interface', 'trait',
+        'enum', 'type_alias', 'component', 'namespace', 'module', 'protocol', 'constant',
+      ]);
+      // Sort by start_line descending so the FIRST node whose start_line <= comment.start_line
+      // is the tightest enclosing symbol.
+      const candidates = fileNodes
+        .filter(n => enclosingKinds.has(n.kind))
+        .sort((a, b) => b.startLine - a.startLine || a.endLine - b.endLine);
+
       this.queries.transaction(() => {
         this.queries.deleteComments(filePath);
         for (const c of comments) {
-          this.queries.insertComment(c);
+          // Find nearest enclosing symbol
+          let associatedSymbol: string | undefined;
+          for (const node of candidates) {
+            if (node.startLine <= c.startLine && node.endLine >= c.endLine) {
+              associatedSymbol = node.qualifiedName ?? node.name;
+              break;
+            }
+          }
+
+          // Enrich CJK text for FTS; non-CJK comments don't need duplicate tokens
+          const ftsTokens = /\p{Script=Han}/u.test(c.text) ? enrichCJKForFTS(c.text) : '';
+
+          this.queries.insertComment({
+            ...c,
+            associatedSymbol,
+            ftsTokens,
+          });
         }
       });
-    } catch {
-      // Comment extraction is best-effort; never block indexing
+    } catch (e) {
+      logDebug('Comment extraction failed', { filePath, error: String(e) });
     }
   }
 

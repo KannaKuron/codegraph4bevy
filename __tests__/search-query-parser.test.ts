@@ -6,6 +6,12 @@
 
 import { describe, it, expect } from 'vitest';
 import { parseQuery, boundedEditDistance } from '../src/search/query-parser';
+import { nameMatchBonus } from '../src/search/query-utils';
+import { segmentChinese } from '../src/search/jieba-helper';
+
+const jiebaAvailable = (() => {
+  try { return segmentChinese('测试') !== null; } catch { return false; }
+})();
 
 describe('parseQuery', () => {
   it('returns plain text for a query with no field prefixes', () => {
@@ -138,5 +144,43 @@ describe('boundedEditDistance', () => {
   it('early-exits when row min exceeds budget (correctness, not just perf)', () => {
     // 'aaaaa' vs 'bbbbb': distance is 5, well over budget 2
     expect(boundedEditDistance('aaaaa', 'bbbbb', 2)).toBe(3);
+  });
+});
+
+describe.skipIf(!jiebaAvailable)('nameMatchBonus — CJK token coverage', () => {
+  it('gives higher score to names matching more CJK query tokens', () => {
+    const multiToken = nameMatchBonus('按键重映射_handler', '按键重映射');
+    const singleToken = nameMatchBonus('映射_垂直同步', '按键重映射');
+    expect(multiToken).toBeGreaterThan(singleToken);
+  });
+
+  it('multi-token CJK match scores at least 35', () => {
+    const score = nameMatchBonus('按键重映射_handler', '按键重映射');
+    expect(score).toBeGreaterThanOrEqual(35);
+  });
+
+  it('single-token CJK match on a multi-token query scores above zero', () => {
+    const score = nameMatchBonus('按键处理器', '按键重映射');
+    expect(score).toBeGreaterThan(0);
+  });
+
+  it('single-token CJK match on a multi-token query scales down with query length', () => {
+    // "映射_垂直同步" → meaningful.length=2, singleScore = max(3, 12/2) = 6
+    const score = nameMatchBonus('映射_垂直同步', '按键重映射');
+    expect(score).toBeLessThanOrEqual(8);
+    expect(score).toBeGreaterThanOrEqual(3);
+  });
+
+  it('CJK queries with underscore separators reach jieba scoring (not blocked by rawTerms)', () => {
+    // "设置_界面" splits on _ into rawTerms ["设置","界面"], both appear in name.
+    // Old code returned 15 (rawTerms allMatch). New code falls through to jieba.
+    const score = nameMatchBonus('设置界面处理器', '设置_界面');
+    expect(score).toBeGreaterThanOrEqual(35);
+  });
+
+  it('non-CJK queries are unaffected by the CJK path', () => {
+    expect(nameMatchBonus('CacheBuilder', 'CacheBuilder')).toBe(80);
+    expect(nameMatchBonus('build', 'CacheBuilder build')).toBe(60);
+    expect(nameMatchBonus('PodGCControllerOptions', 'Pod')).toBeLessThanOrEqual(15);
   });
 });

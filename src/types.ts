@@ -508,7 +508,7 @@ export interface BuildContextOptions {
   /** Graph traversal depth from entry points (default: 2) */
   traversalDepth?: number;
 
-  /** Minimum semantic similarity score (default: 0.3) */
+  /** Minimum semantic similarity score (default: 5) */
   minScore?: number;
 }
 
@@ -576,7 +576,7 @@ export interface FindRelevantContextOptions {
   /** Maximum nodes in result (default: 50) */
   maxNodes?: number;
 
-  /** Minimum semantic similarity score (default: 0.3) */
+  /** Minimum semantic similarity score (default: 5) */
   minScore?: number;
 
   /** Edge types to follow in traversal */

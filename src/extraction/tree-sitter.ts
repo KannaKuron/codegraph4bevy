@@ -2547,6 +2547,30 @@ export class TreeSitterExtractor {
       if (nodeType === 'scoped_identifier' && !this.isExtractingPattern && this.nodeStack.length > 0) {
         this.extractScopedValueReference(node);
       }
+      // Mirror visitNode dispatch for generic_type / scoped_type_identifier /
+      // type_arguments so turbofish generics inside function bodies (tuple
+      // expressions, call arguments) produce type_of edges.
+      else if ((nodeType === 'generic_type' || nodeType === 'scoped_type_identifier') && this.nodeStack.length > 0) {
+        if (node.parent?.type !== 'impl_item') {
+          const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+          if (fromNodeId && !fromNodeId.startsWith('file:')) {
+            this.extractTypeRefsFromSubtree(node, fromNodeId);
+          }
+        }
+        return; // extractTypeRefsFromSubtree already walked children
+      }
+      else if (nodeType === 'type_arguments' && this.language === 'rust' && this.nodeStack.length > 0) {
+        const parent = node.parent;
+        if (parent && (parent.type === 'generic_type' || parent.type === 'scoped_type_identifier')) {
+          // Already handled by parent
+        } else {
+          const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+          if (fromNodeId && !fromNodeId.startsWith('file:')) {
+            this.extractTypeRefsFromSubtree(node, fromNodeId, true);
+          }
+          return; // extractTypeRefsFromSubtree already walked children
+        }
+      }
 
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);

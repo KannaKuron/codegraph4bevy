@@ -435,6 +435,11 @@ export const tools: ToolDefinition[] = [
           description: 'How many levels of dependencies to traverse (default: 2)',
           default: 2,
         },
+        includeCode: {
+          type: 'boolean',
+          description: 'Include source code snippets for Level 1 nodes (default: false). Each snippet capped at 8 lines/400 chars.',
+          default: false,
+        },
         projectPath: projectPathProperty,
       },
       required: ['symbol'],
@@ -598,6 +603,11 @@ export const tools: ToolDefinition[] = [
         to: {
           type: 'string',
           description: 'Symbol the flow should reach (e.g., "execute_sql", "render", "setState")',
+        },
+        includeCode: {
+          type: 'boolean',
+          description: 'Include source code for each hop (default: true). Set to false for a compact symbol-only trace.',
+          default: true,
         },
         projectPath: projectPathProperty,
       },
@@ -1246,6 +1256,7 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const depth = clamp((args.depth as number) || 2, 1, 10);
+    const includeCode = args.includeCode === true;
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
@@ -1277,7 +1288,7 @@ export class ToolHandler {
       roots: allMatches.nodes.map(n => n.id),
     };
 
-    const formatted = this.formatImpact(symbol, mergedImpact) + allMatches.note;
+    const formatted = this.formatImpact(symbol, mergedImpact, includeCode ? cg : null) + allMatches.note;
     return this.textResult(this.truncateOutput(formatted));
   }
 
@@ -1392,6 +1403,7 @@ export class ToolHandler {
     if (typeof from !== 'string') return from;
     const to = this.validateString(args.to, 'to');
     if (typeof to !== 'string') return to;
+    const includeCode = args.includeCode !== false;
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const fromMatches = this.findAllSymbols(cg, from);
@@ -1450,7 +1462,9 @@ export class ToolHandler {
     const lines: string[] = [
       `## Trace: ${from} → ${to}`,
       '',
-      `Full execution path below — ${path.length} hops, each with its body, plus what the destination calls. This is the complete flow; answer from it.`,
+      includeCode
+        ? `Full execution path below — ${path.length} hops, each with its body, plus what the destination calls. This is the complete flow; answer from it.`
+        : `Execution path — ${path.length} hops (source code omitted, set includeCode=true to include).`,
       '',
       `${path.length} hops:`,
       '',
@@ -1480,8 +1494,10 @@ export class ToolHandler {
         }
       }
       lines.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine}-${step.node.endLine})`);
-      const body = this.sourceRangeAt(cg, step.node.filePath, step.node.startLine, step.node.endLine, fileCache, 60, 1800);
-      if (body) lines.push(body);
+      if (includeCode) {
+        const body = this.sourceRangeAt(cg, step.node.filePath, step.node.startLine, step.node.endLine, fileCache, 60, 1800);
+        if (body) lines.push(body);
+      }
     }
     // The "last mile": what the destination does next. Agents otherwise explore/Read
     // for exactly this (e.g. renderStaticScene → _renderStaticScene → the canvas draw),
@@ -1495,11 +1511,15 @@ export class ToolHandler {
       lines.push('', `### \`${dest.name}\` then calls (the destination's immediate work):`);
       for (const c of destCallees) {
         lines.push('', `- ${c.node.name} (${c.node.filePath}:${c.node.startLine}-${c.node.endLine})`);
-        const body = this.sourceRangeAt(cg, c.node.filePath, c.node.startLine, c.node.endLine, fileCache, 16, 600);
-        if (body) lines.push(body);
+        if (includeCode) {
+          const body = this.sourceRangeAt(cg, c.node.filePath, c.node.startLine, c.node.endLine, fileCache, 16, 600);
+          if (body) lines.push(body);
+        }
       }
     }
-    lines.push('', '> Full path + every hop body + the destination\'s calls are inlined above — the complete flow. Answer from it; a Read is only needed to chase a specific local variable\'s data-flow.');
+    lines.push('', includeCode
+      ? '> Full path + every hop body + the destination\'s calls are inlined above — the complete flow. Answer from it; a Read is only needed to chase a specific local variable\'s data-flow.'
+      : '> Path shown above. Set includeCode=true to inline source for each hop.');
     return this.textResult(this.truncateOutput(lines.join('\n')));
   }
 
@@ -1558,6 +1578,20 @@ export class ToolHandler {
       return {
         label: `interface/abstract dispatch — runs the implementation override (dynamic dispatch)`,
         compact: `dynamic: interface → impl${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'bevy-ecs-state') {
+      return {
+        label: `Bevy state transition — producer triggers consumer via state change (dynamic dispatch)`,
+        compact: `dynamic: Bevy state transition${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'bevy-ecs-resource') {
+      return {
+        label: `Bevy ECS resource — insert triggers resource check (dynamic dispatch)`,
+        compact: `dynamic: Bevy ECS resource${at}`,
         registeredAt,
       };
     }
@@ -1653,7 +1687,7 @@ export class ToolHandler {
       const tokens = [...new Set(
         query.split(/[\s,()[\]]+/)
           .map((t) => t.replace(FILE_EXT, '').trim())
-          .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
+          .filter((t) => t.length >= 3 && /^[\p{L}\p{N}_$][\p{L}\p{N}_$]*(?:(?:::|\.)[\p{L}\p{N}_$]+)*$/u.test(t))
       )].slice(0, 16);
       if (tokens.length < 2) return '';
       // Pool of name SEGMENTS (Class + method from every token) used to
@@ -2996,7 +3030,7 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatImpact(symbol: string, impact: Subgraph): string {
+  private formatImpact(symbol: string, impact: Subgraph, codeSource: CodeGraph | null): string {
     const nodeCount = impact.nodes.size;
 
     // Compute BFS distance from root nodes to all affected nodes
@@ -3140,10 +3174,21 @@ export class ToolHandler {
 
       lines.push(`### ${level.label} — ${level.desc} (${levelNodeCount} symbols)${riskSuffix}`);
       lines.push('');
+      const isLevel1 = level.label.startsWith('Level 1');
+      const fileCache = new Map<string, string[]>();
       for (const { filePath, nodes } of files) {
         const nodeList = nodes.slice(0, 10).map(n => `${n.name}:${n.startLine}`).join(', ');
         const tail = nodes.length > 10 ? `, +${nodes.length - 10} more` : '';
         lines.push(`- **${filePath}:** ${nodeList}${tail}`);
+        // For Level 1 with includeCode, inline source snippets for each node
+        if (isLevel1 && codeSource) {
+          for (const n of nodes.slice(0, 10)) {
+            const src = this.sourceRangeAt(codeSource, n.filePath, n.startLine, n.endLine, fileCache, 8, 400);
+            if (src) {
+              lines.push(`  \`${n.name}\`: ${src.split('\n').map(l => '  ' + l.trim()).join('\n')}`);
+            }
+          }
+        }
       }
       lines.push('');
     }

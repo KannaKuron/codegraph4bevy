@@ -721,6 +721,28 @@ impl Counter {
     );
     expect(implRefs).toHaveLength(0);
   });
+
+  it('should extract type_of edges for turbofish generics inside tuple expressions', () => {
+    const code = `
+pub struct MyState;
+pub struct Action<S> { _marker: std::marker::PhantomData<S> }
+
+pub fn setup() {
+    let tuple = (Action::<MyState>::new(), other_thing());
+    let _query: Query<&Action<MyState>> = build_query();
+}
+`;
+    const result = extractFromSource('lib.rs', code);
+    const typeOfRefs = result.unresolvedReferences.filter(
+      (r) => r.referenceKind === 'type_of' && r.referenceName === 'MyState'
+    );
+    // At least one type_of edge to MyState from the setup function body
+    expect(typeOfRefs.length).toBeGreaterThanOrEqual(1);
+    // The reference should come from the setup function
+    const setupNode = result.nodes.find((n) => n.name === 'setup' && n.kind === 'function');
+    expect(setupNode).toBeDefined();
+    expect(typeOfRefs.some((r) => r.fromNodeId === setupNode?.id)).toBe(true);
+  });
 });
 
 describe('Java Extraction', () => {

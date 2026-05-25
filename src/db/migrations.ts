@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 /**
  * Migration definition
@@ -137,6 +137,44 @@ const migrations: Migration[] = [
           VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol);
           INSERT INTO comments_fts(rowid, text, associated_symbol)
           VALUES (NEW.rowid, NEW.text, NEW.associated_symbol);
+        END;
+      `);
+    },
+  },
+  {
+    version: 7,
+    description: 'Add fts_tokens column to comments for CJK FTS search (requires re-index to populate)',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE comments ADD COLUMN fts_tokens TEXT DEFAULT '';
+
+        DROP TRIGGER IF EXISTS comments_ai;
+        DROP TRIGGER IF EXISTS comments_ad;
+        DROP TRIGGER IF EXISTS comments_au;
+        DROP TABLE IF EXISTS comments_fts;
+
+        CREATE VIRTUAL TABLE comments_fts USING fts5(
+          text, associated_symbol, fts_tokens,
+          content='comments', content_rowid='rowid',
+          tokenize='unicode61'
+        );
+
+        INSERT INTO comments_fts(rowid, text, associated_symbol, fts_tokens)
+        SELECT rowid, text, associated_symbol, fts_tokens FROM comments;
+
+        CREATE TRIGGER comments_ai AFTER INSERT ON comments BEGIN
+          INSERT INTO comments_fts(rowid, text, associated_symbol, fts_tokens)
+          VALUES (NEW.rowid, NEW.text, NEW.associated_symbol, NEW.fts_tokens);
+        END;
+        CREATE TRIGGER comments_ad AFTER DELETE ON comments BEGIN
+          INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol, fts_tokens)
+          VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol, OLD.fts_tokens);
+        END;
+        CREATE TRIGGER comments_au AFTER UPDATE ON comments BEGIN
+          INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol, fts_tokens)
+          VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol, OLD.fts_tokens);
+          INSERT INTO comments_fts(rowid, text, associated_symbol, fts_tokens)
+          VALUES (NEW.rowid, NEW.text, NEW.associated_symbol, NEW.fts_tokens);
         END;
       `);
     },

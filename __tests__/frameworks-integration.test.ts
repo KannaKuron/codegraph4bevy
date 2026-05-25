@@ -197,3 +197,260 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     cg.close();
   });
 });
+
+describe('Bevy ECS state transition synthesis', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('synthesizes edges from NextState::Pending producers to in_state consumers', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-state-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum GameState { #[default] Menu, Playing, GameOver }\n' +
+        '\n' +
+        'fn enter_playing(mut next_state: ResMut<NextState<GameState>>) {\n' +
+        '    next_state.set(GameState::Playing);\n' +
+        '}\n' +
+        '\n' +
+        'fn on_enter_playing() {\n' +
+        '    // setup level\n' +
+        '}\n' +
+        '\n' +
+        'fn check_state() {\n' +
+        '    if in_state(GameState::Playing) {\n' +
+        '        // do something\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const enterPlaying = fns.find((n) => n.name === 'enter_playing');
+    const checkState = fns.find((n) => n.name === 'check_state');
+    expect(enterPlaying).toBeDefined();
+    expect(checkState).toBeDefined();
+
+    // The producer (enter_playing) should have a synthesized calls edge to the consumer
+    const edges = cg.getOutgoingEdges(enterPlaying!.id);
+    const toConsumer = edges.find((e) => e.target === checkState!.id && e.kind === 'calls');
+    expect(toConsumer, 'enter_playing should reach check_state via Bevy state synthesis').toBeDefined();
+
+    // Verify provenance
+    if (toConsumer) {
+      expect(toConsumer.provenance).toBe('heuristic');
+      expect((toConsumer.metadata as Record<string, unknown>)?.synthesizedBy).toBe('bevy-ecs-state');
+    }
+
+    cg.close();
+  });
+
+  it('ignores state patterns inside comments', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-comment-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'fn producer(next_state: ResMut<NextState<GameState>>) {\n' +
+        '    next_state.set(GameState::Playing);\n' +
+        '}\n' +
+        'fn consumer() {\n' +
+        '    // TODO: next_state.set(GameState::Menu)\n' +
+        '    if in_state(GameState::Playing) {}\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const producer = fns.find((n) => n.name === 'producer');
+    const consumer = fns.find((n) => n.name === 'consumer');
+
+    // producer → consumer edge via GameState::Playing exists
+    const edges = cg.getOutgoingEdges(producer!.id);
+    const toConsumer = edges.find((e) => e.target === consumer!.id && e.kind === 'calls');
+    expect(toConsumer).toBeDefined();
+
+    // consumer should NOT have an outgoing edge (commented Menu is ignored)
+    const consumerEdges = cg.getOutgoingEdges(consumer!.id).filter(e => e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(consumerEdges.length).toBe(0);
+
+    cg.close();
+  });
+
+  it('matches qualified and unqualified state names', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-unqual-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'fn producer(next_state: ResMut<NextState<GameState>>) {\n' +
+        '    next_state.set(GameState::Playing);\n' +
+        '}\n' +
+        'fn consumer() {\n' +
+        '    if in_state(Playing) {}\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const producer = fns.find((n) => n.name === 'producer');
+    const consumer = fns.find((n) => n.name === 'consumer');
+
+    // Qualified (GameState::Playing) and unqualified (Playing) should match
+    const edges = cg.getOutgoingEdges(producer!.id);
+    const toConsumer = edges.find((e) => e.target === consumer!.id && e.kind === 'calls');
+    expect(toConsumer, 'qualified→unqualified state name should still produce an edge').toBeDefined();
+
+    cg.close();
+  });
+
+  it('does not match state patterns inside raw strings', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-raw-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'fn producer(next_state: ResMut<NextState<GameState>>) {\n' +
+      '    next_state.set(GameState::Playing);\n' +
+      '}\n' +
+      'fn consumer() {\n' +
+      '    let desc = r#"next_state.set(GameState::Menu)"#;\n' +
+      '    if in_state(GameState::Playing) {}\n' +
+      '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const consumer = fns.find((n) => n.name === 'consumer');
+
+    // consumer should NOT produce edges — the Menu pattern is inside a raw string
+    const consumerEdges = cg.getOutgoingEdges(consumer!.id)
+      .filter(e => e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(consumerEdges.length).toBe(0);
+
+    cg.close();
+  });
+
+  it('does not match state patterns inside nested block comments', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-nested-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'fn producer(next_state: ResMut<NextState<GameState>>) {\n' +
+      '    next_state.set(GameState::Playing);\n' +
+      '}\n' +
+      'fn consumer() {\n' +
+      '    /* outer /* inner */ next_state.set(GameState::GameOver); */\n' +
+      '    if in_state(GameState::Playing) {}\n' +
+      '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const consumer = fns.find((n) => n.name === 'consumer');
+
+    // consumer should NOT produce edges — GameOver is inside nested comment
+    const consumerEdges = cg.getOutgoingEdges(consumer!.id)
+      .filter(e => e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(consumerEdges.length).toBe(0);
+
+    cg.close();
+  });
+
+  it('does not produce cross-enum state edges', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-cross-enum-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'fn producer(next_state: ResMut<NextState<GameState>>) {\n' +
+      '    next_state.set(GameState::Playing);\n' +
+      '}\n' +
+      'fn consumer() {\n' +
+      '    if in_state(UiState::Playing) {}\n' +
+      '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const producer = fns.find((n) => n.name === 'producer');
+    const consumer = fns.find((n) => n.name === 'consumer');
+
+    // No edge: GameState::Playing ≠ UiState::Playing (both qualified, different enum)
+    const edges = cg.getOutgoingEdges(producer!.id);
+    const toConsumer = edges.find((e) => e.target === consumer!.id && e.kind === 'calls');
+    expect(toConsumer).toBeUndefined();
+
+    cg.close();
+  });
+
+  it('produces edge when only one side is qualified (same variant)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-one-qual-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'fn producer(next_state: ResMut<NextState<GameState>>) {\n' +
+      '    next_state.set(GameState::Playing);\n' +
+      '}\n' +
+      'fn consumer() {\n' +
+      '    if in_state(Playing) {}\n' +
+      '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const producer = fns.find((n) => n.name === 'producer');
+    const consumer = fns.find((n) => n.name === 'consumer');
+
+    // Qualified→unqualified should match (only one side is qualified)
+    const edges = cg.getOutgoingEdges(producer!.id);
+    const toConsumer = edges.find((e) => e.target === consumer!.id && e.kind === 'calls');
+    expect(toConsumer).toBeDefined();
+
+    cg.close();
+  });
+});

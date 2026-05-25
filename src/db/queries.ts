@@ -784,15 +784,16 @@ export class QueryBuilder {
       return [];
     }
 
-    // BM25 column weights: id=0, name=20, qualified_name=5, docstring=1, signature=2
+    // BM25 column weights: id=0, name=20, qualified_name=5, docstring=1, signature=2, fts_tokens=15
     // Heavy name weight ensures exact/prefix name matches rank above incidental
     // mentions in long docstrings or qualified names of nested symbols.
+    // fts_tokens gets high weight so jieba-segmented CJK tokens contribute meaningfully.
     // Fetch 5x requested limit so post-hoc rescoring (kindBonus, pathRelevance,
     // nameMatchBonus) can promote results that BM25 alone undervalues.
     const ftsLimit = Math.max(limit * 5, 100);
 
     let sql = `
-      SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2, 1, 15) as score
+      SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2, 15) as score
       FROM nodes_fts
       JOIN nodes ON nodes_fts.id = nodes.id
       WHERE nodes_fts MATCH ?
@@ -1319,6 +1320,7 @@ export class QueryBuilder {
   deleteFile(filePath: string): void {
     this.db.transaction(() => {
       this.deleteNodesByFile(filePath);
+      this.deleteComments(filePath);
       if (!this.stmts.deleteFile) {
         this.stmts.deleteFile = this.db.prepare('DELETE FROM files WHERE path = ?');
       }
@@ -1660,10 +1662,10 @@ export class QueryBuilder {
   /**
    * Insert a comment entry.
    */
-  insertComment(comment: { filePath: string; startLine: number; endLine: number; text: string; kind: string; associatedSymbol?: string }): void {
+  insertComment(comment: { filePath: string; startLine: number; endLine: number; text: string; kind: string; associatedSymbol?: string; ftsTokens?: string }): void {
     this.db.prepare(
-      'INSERT INTO comments (file_path, start_line, end_line, text, kind, associated_symbol) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(comment.filePath, comment.startLine, comment.endLine, comment.text, comment.kind, comment.associatedSymbol ?? null);
+      'INSERT INTO comments (file_path, start_line, end_line, text, kind, associated_symbol, fts_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(comment.filePath, comment.startLine, comment.endLine, comment.text, comment.kind, comment.associatedSymbol ?? null, comment.ftsTokens ?? '');
   }
 
   /**

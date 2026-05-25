@@ -29,7 +29,7 @@ const DASH_COMMENT_LANGS = new Set([
 // Languages using // for line comments
 const SLASH_COMMENT_LANGS = new Set([
   'rust', 'typescript', 'tsx', 'javascript', 'jsx', 'java', 'kotlin',
-  'swift', 'c_sharp', 'go', 'cpp', 'c', 'scala', 'dart', 'php',
+  'swift', 'c_sharp', 'csharp', 'go', 'cpp', 'c', 'scala', 'dart', 'php',
   'zig', 'ocaml',
 ]);
 
@@ -44,12 +44,12 @@ export function extractComments(
   const comments: CommentEntry[] = [];
   const lines = source.split('\n');
 
-  if (SLASH_COMMENT_LANGS.has(language) || HASH_COMMENT_LANGS.has(language) || DASH_COMMENT_LANGS.has(language)) {
-    extractSingleLineComments(source, lines, filePath, language, comments);
-    extractBlockComments(source, lines, filePath, language, comments);
-  } else if (language === 'python') {
+  if (language === 'python') {
     extractHashComments(source, lines, filePath, 'line', comments);
     extractPythonDocstrings(source, lines, filePath, comments);
+  } else if (SLASH_COMMENT_LANGS.has(language) || HASH_COMMENT_LANGS.has(language) || DASH_COMMENT_LANGS.has(language)) {
+    extractSingleLineComments(source, lines, filePath, language, comments);
+    extractBlockComments(source, lines, filePath, language, comments);
   }
 
   return comments;
@@ -110,11 +110,13 @@ function extractHashComments(
 function extractBlockComments(
   source: string, lines: string[], filePath: string, _language: string, comments: CommentEntry[]
 ): void {
-  // Match /* ... */ block comments
+  // Mask string literals so /* */ inside strings is not treated as a comment
+  const masked = source.replace(/(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g,
+    m => m.replace(/[^\n]/g, ' '));
   const blockRegex = /\/\*([\s\S]*?)\*\//g;
   let match;
-  while ((match = blockRegex.exec(source)) !== null) {
-    const body = match[1]!;
+  while ((match = blockRegex.exec(masked)) !== null) {
+    const body = source.substring(match.index + 2, match.index + match[0].length - 2);
     const startLine = getLineNumber(lines, match.index);
     const endLine = getLineNumber(lines, match.index + match[0].length - 1);
 
@@ -166,10 +168,13 @@ function getLineNumber(lines: string[], charIndex: number): number {
 function isInsideString(before: string): boolean {
   let inSingle = false;
   let inDouble = false;
+  let inBacktick = false;
   for (let i = 0; i < before.length; i++) {
     const ch = before[i]!;
-    if (ch === '"' && !inSingle) inDouble = !inDouble;
-    else if (ch === "'" && !inDouble) inSingle = !inSingle;
+    if (ch === '\\' && i + 1 < before.length) { i++; continue; }
+    if (ch === '`' && !inSingle && !inDouble) inBacktick = !inBacktick;
+    else if (ch === '"' && !inSingle && !inBacktick) inDouble = !inDouble;
+    else if (ch === "'" && !inDouble && !inBacktick) inSingle = !inSingle;
   }
-  return inSingle || inDouble;
+  return inSingle || inDouble || inBacktick;
 }

@@ -536,6 +536,10 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
 const INSERT_RESOURCE_RE = /commands\s*\.\s*insert_resource\s*(?:::\s*<([\p{L}\p{N}_<>,: >]+)>\s*)?\(\s*([\p{L}\p{N}_]+)(?:::[\p{L}\p{N}_]+(?:\([^)]*\))?)*\s*[;{)]/gu;
 const RESOURCE_EXISTS_RE = /run_if\s*\(\s*resource_exists\s*::\s*<\s*([\p{L}\p{N}_<>,: >]+)\s*>\s*\)/gu;
 
+const NEXT_STATE_PENDING_RE = /NextState\s*::\s*Pending\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
+const NEXT_STATE_SET_RE = /next_state\s*\.\s*set\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
+const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
+
 function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const resources = new Map<string, { inserters: Set<string>; checkers: Set<string> }>();
@@ -602,6 +606,167 @@ function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
   return edges;
 }
 
+function bevyStateEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const states = new Map<string, { producers: Map<string, { line: number; full: string }>; consumers: Map<string, { line: number; full: string }> }>();
+
+  function ensure(s: string) {
+    if (!states.has(s)) states.set(s, { producers: new Map(), consumers: new Map() });
+    return states.get(s)!;
+  }
+
+  // Normalize state name to last ::-segment so `GameState::Playing` and `Playing`
+  // (after `use GameState::*`) map to the same key.
+  function normalizeStateName(name: string): { full: string; variant: string } {
+    const parts = name.split('::').filter(p => p.length > 0);
+    const variant = parts[parts.length - 1] ?? name;
+    const full = parts.length >= 2
+      ? parts[parts.length - 2]! + '::' + variant
+      : variant;
+    return { full, variant };
+  }
+
+  // Strip Rust line (//) and block (/* */) comments to avoid false matches
+  // in dead text. Same approach as other synthesizers that scan raw content.
+  function stripRustComments(src: string): string {
+    let result = '';
+    let i = 0;
+    while (i < src.length) {
+      if (src[i] === '/' && src[i + 1] === '/') {
+        // Line comment — skip to end of line
+        const nl = src.indexOf('\n', i);
+        if (nl < 0) break;
+        result += '\n'.repeat(src.substring(i, nl).split('\n').length - 1) + '\n';
+        i = nl + 1;
+      } else if (src[i] === '/' && src[i + 1] === '*') {
+        // Nested block comment — track /* */ depth
+        let depth = 1;
+        let j = i + 2;
+        while (j < src.length - 1 && depth > 0) {
+          if (src[j] === '/' && src[j + 1] === '*') { depth++; j += 2; }
+          else if (src[j] === '*' && src[j + 1] === '/') { depth--; j += 2; }
+          else { result += src[j] === '\n' ? '\n' : ' '; j++; }
+        }
+        // Unclosed block comment: preserve rest as spaces (keep newlines for line numbers)
+        if (depth > 0) {
+          while (j < src.length) { result += src[j] === '\n' ? '\n' : ' '; j++; }
+        }
+        result += '  '; // closing */
+        i = j;
+      } else if ((src[i] === 'r' || src[i] === 'b') && i + 1 < src.length) {
+        // Raw / byte string: r"...", r#"..."#, br"..."
+        let j = i + 1;
+        if (src[j] === 'r') j++;
+        let hashes = 0;
+        while (j < src.length && src[j] === '#') { hashes++; j++; }
+        if (j < src.length && src[j] === '"') {
+          j++;
+          const close = '"' + '#'.repeat(hashes);
+          const end = src.indexOf(close, j);
+          if (end < 0) break; // unclosed raw string — stop
+          for (let k = i; k < end + close.length; k++) {
+            result += src[k] === '\n' ? '\n' : ' ';
+          }
+          i = end + close.length;
+        } else {
+          // Not a raw/byte string (e.g. `return`, `break`) — emit char and advance
+          result += src[i]; i++;
+        }
+      } else if (src[i] === '"') {
+        // Regular string literal — skip contents (preserve newlines)
+        result += ' ';
+        i++;
+        while (i < src.length && src[i] !== '"') {
+          if (src[i] === '\\' && i + 1 < src.length) { result += ' '; i += 2; continue; }
+          if (src[i] === '\n') result += '\n'; else result += ' ';
+          i++;
+        }
+        if (i < src.length) { result += ' '; i++; }
+      } else {
+        result += src[i];
+        i++;
+      }
+    }
+    return result;
+  }
+
+  for (const file of ctx.getAllFiles()) {
+    if (!file.endsWith('.rs')) continue;
+    const rawContent = ctx.readFile(file);
+    if (!rawContent) continue;
+    const content = stripRustComments(rawContent);
+
+    const fileNodes = ctx.getNodesInFile(file);
+    const fns = fileNodes.filter((n: { kind: string }) => n.kind === 'function' || n.kind === 'method');
+
+    function findEnclosingFn(line: number): string | null {
+      for (const fn of fns) {
+        if (fn.startLine <= line && fn.endLine >= line) return fn.id;
+      }
+      return null;
+    }
+
+    // Producers: NextState::Pending(X) — typically in OnEnter or transition systems
+    NEXT_STATE_PENDING_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = NEXT_STATE_PENDING_RE.exec(content))) {
+      const { full, variant } = normalizeStateName(m[1]!.trim());
+      const line = content.substring(0, m.index).split('\n').length;
+      const fnId = findEnclosingFn(line);
+      if (fnId) {
+        const entry = ensure(variant);
+        if (!entry.producers.has(fnId)) entry.producers.set(fnId, { line, full });
+      }
+    }
+
+    // Producers: next_state.set(X) — Bevy 0.15+ ResMut<NextState<X>>.set()
+    NEXT_STATE_SET_RE.lastIndex = 0;
+    while ((m = NEXT_STATE_SET_RE.exec(content))) {
+      const { full, variant } = normalizeStateName(m[1]!.trim());
+      const line = content.substring(0, m.index).split('\n').length;
+      const fnId = findEnclosingFn(line);
+      if (fnId) {
+        const entry = ensure(variant);
+        if (!entry.producers.has(fnId)) entry.producers.set(fnId, { line, full });
+      }
+    }
+
+    // Consumers: in_state(X) — typically in OnEnter or condition systems
+    IN_STATE_RE.lastIndex = 0;
+    while ((m = IN_STATE_RE.exec(content))) {
+      const { full, variant } = normalizeStateName(m[1]!.trim());
+      const line = content.substring(0, m.index).split('\n').length;
+      const fnId = findEnclosingFn(line);
+      if (fnId) {
+        const entry = ensure(variant);
+        if (!entry.consumers.has(fnId)) entry.consumers.set(fnId, { line, full });
+      }
+    }
+  }
+
+  for (const [stateKey, data] of states) {
+    if (data.producers.size === 0 || data.consumers.size === 0) continue;
+    for (const [producerId, pInfo] of data.producers) {
+      for (const [consumerId, cInfo] of data.consumers) {
+        if (producerId === consumerId) continue;
+        // Cross-enum guard: if both sides are qualified (EnumType::Variant) and the
+        // enum type differs, skip — GameState::Playing ≠ UiState::Playing.
+        if (pInfo.full !== stateKey && cInfo.full !== stateKey && pInfo.full !== cInfo.full) continue;
+        edges.push({
+          source: producerId,
+          target: consumerId,
+          kind: 'calls',
+          line: pInfo.line,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'bevy-ecs-state', stateName: stateKey },
+        });
+      }
+    }
+  }
+
+  return edges;
+}
+
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
   const fieldEdges = fieldChannelEdges(queries, ctx);
   const emitterEdges = eventEmitterEdges(ctx);
@@ -615,8 +780,9 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const merged: Edge[] = [];
   const seen = new Set<string>();
   const bevyEdges = bevyEcsEdges(ctx);
-  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges, ...bevyEdges]) {
-    const key = `${e.source}>${e.target}`;
+  const stateEdges = bevyStateEdges(ctx);
+  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges, ...bevyEdges, ...stateEdges]) {
+    const key = `${e.source}>${e.target}>${(e.metadata as Record<string, unknown>)?.synthesizedBy ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(e);

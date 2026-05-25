@@ -191,7 +191,7 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
   format: 'markdown',
   searchLimit: 3,         // Reduced from 5 - fewer entry points
   traversalDepth: 1,      // Reduced from 2 - shallower graph expansion
-  minScore: 0.3,
+  minScore: 5,
 };
 
 /**
@@ -211,7 +211,7 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   searchLimit: 3,        // Reduced from 5
   traversalDepth: 1,     // Reduced from 2
   maxNodes: 20,          // Reduced from 50
-  minScore: 0.3,
+  minScore: 5,
   edgeKinds: [],
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
 };
@@ -722,7 +722,11 @@ export class ContextBuilder {
           // Mild dampen for single-term matches — they might be generic
           // but could also be the right result (e.g., "Protocol" class for an IPC query).
           // Exempt exact name matches: they are specific symbols the user queried for.
-          result.score *= 0.6;
+          // For CJK results, dampen more aggressively — single CJK tokens
+          // are too short to be meaningful selectors (e.g., "映射" matches
+          // both "映射_垂直同步" and "处理_映射逻辑").
+          const resultIsCJK = /\p{Script=Han}/u.test(result.node.name);
+          result.score *= resultIsCJK ? 0.3 : 0.6;
         }
       }
       searchResults.sort((a, b) => b.score - a.score);

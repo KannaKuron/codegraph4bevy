@@ -155,16 +155,18 @@ CREATE TABLE IF NOT EXISTS comments (
     end_line INTEGER NOT NULL,
     text TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'line', -- 'line', 'block', 'doc'
-    associated_symbol TEXT DEFAULT NULL  -- qualified name of nearest enclosing symbol
+    associated_symbol TEXT DEFAULT NULL,  -- qualified name of nearest enclosing symbol
+    fts_tokens TEXT DEFAULT ''  -- jieba-segmented tokens for CJK FTS search
 );
 
 CREATE INDEX IF NOT EXISTS idx_comments_file_path ON comments(file_path);
 CREATE INDEX IF NOT EXISTS idx_comments_associated ON comments(associated_symbol);
 
--- FTS index on comment text and associated symbol
+-- FTS index on comment text, associated symbol, and CJK tokens
 CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
     text,
     associated_symbol,
+    fts_tokens,
     content='comments',
     content_rowid='rowid',
     tokenize='unicode61'
@@ -172,20 +174,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
 
 -- Triggers to keep comments FTS in sync
 CREATE TRIGGER IF NOT EXISTS comments_ai AFTER INSERT ON comments BEGIN
-    INSERT INTO comments_fts(rowid, text, associated_symbol)
-    VALUES (NEW.rowid, NEW.text, NEW.associated_symbol);
+    INSERT INTO comments_fts(rowid, text, associated_symbol, fts_tokens)
+    VALUES (NEW.rowid, NEW.text, NEW.associated_symbol, NEW.fts_tokens);
 END;
 
 CREATE TRIGGER IF NOT EXISTS comments_ad AFTER DELETE ON comments BEGIN
-    INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol)
-    VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol);
+    INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol, fts_tokens)
+    VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol, OLD.fts_tokens);
 END;
 
 CREATE TRIGGER IF NOT EXISTS comments_au AFTER UPDATE ON comments BEGIN
-    INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol)
-    VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol);
-    INSERT INTO comments_fts(rowid, text, associated_symbol)
-    VALUES (NEW.rowid, NEW.text, NEW.associated_symbol);
+    INSERT INTO comments_fts(comments_fts, rowid, text, associated_symbol, fts_tokens)
+    VALUES ('delete', OLD.rowid, OLD.text, OLD.associated_symbol, OLD.fts_tokens);
+    INSERT INTO comments_fts(rowid, text, associated_symbol, fts_tokens)
+    VALUES (NEW.rowid, NEW.text, NEW.associated_symbol, NEW.fts_tokens);
 END;
 
 -- Project metadata for version/provenance tracking
