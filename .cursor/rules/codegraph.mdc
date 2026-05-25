@@ -13,15 +13,17 @@ Use codegraph for **structural** questions — what calls what, what would break
 
 | Question | Tool |
 |---|---|
-| "Where is X defined?" / "Find symbol named X" | `codegraph_search` |
-| "What calls function Y?" | `codegraph_callers` |
+| "Where is X defined?" / "Find symbol named X" | `codegraph_search` (use `referencesType` to find symbols referencing a type; use `impl_for` to find implementors of a trait/interface) |
+| "What calls function Y?" | `codegraph_callers` (supports batch via `symbols` array) |
 | "What does Y call?" | `codegraph_callees` |
 | "How does X reach/become Y? / trace the flow from X to Y" | `codegraph_trace` (one call = the whole path, incl. callback/React/JSX dynamic hops) |
+| "Where is this symbol used (any kind)?" | `codegraph_usages` (broader than callers — covers refs, type annotations, instantiations, pattern matches; use `kind: "pattern_match"` for match/if-let sites) |
 | "What would break if I changed Z?" | `codegraph_impact` |
-| "Show me Y's signature / source / docstring" | `codegraph_node` |
+| "Show me Y's signature / source / docstring" | `codegraph_node` (supports batch via `symbols` array) |
 | "Give me focused context for a task/area" | `codegraph_context` |
-| "See several related symbols' source at once" | `codegraph_explore` |
-| "What files exist under path/" | `codegraph_files` |
+| "See several related symbols' source at once" | `codegraph_explore` (use `path` to filter by directory, `strict` to limit results to that directory) |
+| "Search comments" | `codegraph_search` with `kind: "comment"` |
+| "What files exist under path/" | `codegraph_files` (use `symbols: true` to include top-level symbol names) |
 | "Is the index healthy?" | `codegraph_status` |
 
 ### Rules of thumb
@@ -31,6 +33,7 @@ Use codegraph for **structural** questions — what calls what, what would break
 - **Don't grep first** when looking up a symbol by name. `codegraph_search` is faster and returns kind + location + signature in one call.
 - **Don't chain `codegraph_search` + `codegraph_node`** when you just want context — `codegraph_context` is one call.
 - **Don't loop `codegraph_node` over many symbols** — one `codegraph_explore` call returns several symbols' source grouped in a single capped call, while each separate node/Read call re-reads the whole context and costs far more.
+- **Explore returns verbatim source** — byte-for-byte identical to Read, line-numbered. Treat files shown by explore as already Read; don't re-open them.
 - **Index lag**: the file watcher debounces ~500ms behind writes; don't re-query immediately after editing a file in the same turn.
 
 ### If `.codegraph/` doesn't exist

@@ -36,7 +36,7 @@ of calls; a grep/read exploration is dozens.
 
 ## Tool selection by intent
 
-- **"What is the symbol named X?"** → \`codegraph_search\` (use \`referencesType\` param to find all symbols referencing a type; use \`impl_for\` to find all implementors of a trait/interface)
+- **"What is the symbol named X?"** → \`codegraph_search\` (use \`referencesType\` param to find all symbols referencing a type; use \`impl_for\` to find all implementors of a trait/interface; use \`kind: "comment"\` to search comments)
 - **"What's the deal with this task / feature / area?"** → \`codegraph_context\` (PRIMARY — composes search + node + callers + callees in one call)
 - **"How does X reach/become Y? / trace the flow / the path from X to Y"** → \`codegraph_trace\` (ONE call returns the whole call path, including dynamic-dispatch hops — callbacks, React re-render, JSX children — that grep can't follow)
 - **"What calls this?"** → \`codegraph_callers\`
