@@ -241,23 +241,39 @@ publish actions on shared state. Write the files, hand the user the commands.
 
 | Branch | Description |
 |---|---|
-| `main` | Tracks `origin/main` from upstream |
-| `个人改造适配分支不pr给原项目` | **Main working branch** — personal customizations, never pushed to upstream |
-| `buk-备份-个人改造适配分支不pr给原项目` | Backup — last synced 2026-05-24 |
+| `main` | Tracks `origin/main` from upstream — only used to fetch upstream changes, then merge into working branch |
+| `个人改造适配分支不pr给原项目` | **Main working branch** — all development happens here |
+| `buk-备份-个人改造适配分支不pr给原项目` | **Backup branch** — merge target for backups |
 
-- Upstream: `github.com/colbymchenry/codegraph` — local branches are **not** pushed upstream
+### Remotes
+
+| Remote | URL | Usage |
+|---|---|---|
+| `origin` | `github.com/colbymchenry/codegraph` | Upstream — fetch only, **never push** |
+| `fork` | `github.com/KannaKuron/codegraph4bevy` | Personal fork — **all pushes go here** |
+
+### Git workflow rules
+
+- **"合并" always means merge into `buk-备份-个人改造适配分支不pr给原项目` for backup**, NOT into `main`
+- **"推送" always means `git push fork`** to the personal fork, never `git push origin`
+- **`main` only accepts upstream changes**: `git fetch origin` → merge into working branch
 - Key conflict areas on merge: `src/mcp/tools.ts`, `src/extraction/tree-sitter.ts`
 
 ### Syncing from upstream
 
 ```bash
-# Update main, then merge into working branch
-git fetch origin
-git checkout main && git merge origin/main
-git checkout 个人改造适配分支不pr给原项目 && git merge main
-
-# Or one-liner: merge upstream directly into working branch
 git fetch origin && git merge origin/main
+```
+
+### Committing and backing up
+
+```bash
+# Commit on working branch, then backup to buk
+git checkout "个人改造适配分支不pr给原项目"
+# ... make changes, commit ...
+git checkout "buk-备份-个人改造适配分支不pr给原项目" && git merge "个人改造适配分支不pr给原项目"
+git checkout "个人改造适配分支不pr给原项目"
+git push fork "个人改造适配分支不pr给原项目" "buk-备份-个人改造适配分支不pr给原项目"
 ```
 
 After merge: `npm run build && npx vitest run` to verify. Prefer keeping upstream's structural refactors; layer personal changes on top.
