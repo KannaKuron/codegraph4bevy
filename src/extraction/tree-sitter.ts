@@ -442,6 +442,7 @@ export class TreeSitterExtractor {
     else if (nodeType === 'macro_invocation') {
       const saved = this.isExtractingPattern;
       this.isExtractingPattern = true;
+      this.extractMacroCall(node);
       this.extractMatchesMacroReferences(node);
       // For non-matches! macros, also walk token_tree args for variant refs
       this.extractMacroInvocationArgs(node);
@@ -1082,8 +1083,10 @@ export class TreeSitterExtractor {
     let isMatches = false;
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
-      if (child && (child.type === 'identifier' || child.type === 'macro_name')) {
-        const text = getNodeText(child, this.source);
+      if (child && (child.type === 'identifier' || child.type === 'macro_name'
+          || child.type === 'scoped_identifier')) {
+        const raw = getNodeText(child, this.source);
+        const text = child.type === 'scoped_identifier' ? raw.split('::').pop()! : raw;
         if (text === 'matches') {
           isMatches = true;
           break;
@@ -1107,6 +1110,41 @@ export class TreeSitterExtractor {
         this.extractPatternReferences(child, callerId);
       }
     }
+  }
+
+  /**
+   * Extract a `calls` edge from a macro_invocation node so that
+   * `warn!()`, `error!()`, `info!()`, `println!()` etc. are searchable
+   * via codegraph_callers / codegraph_usages / codegraph_callees.
+   */
+  private extractMacroCall(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+
+    // Same pattern as extractMatchesMacroReferences: iterate named children.
+    // getChildByField(node, 'name') returns null — tree-sitter-rust uses 'macro' field.
+    // node.children[0] may be anonymous; scoped_identifier preserves full name (e.g. "std::println").
+    // Strip scope prefix — macro identity is the bare name; scope is just a call-site qualifier.
+    let macroName = '';
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child && (child.type === 'identifier' || child.type === 'macro_name'
+          || child.type === 'scoped_identifier')) {
+        const raw = getNodeText(child, this.source);
+        macroName = child.type === 'scoped_identifier' ? raw.split('::').pop()! : raw;
+        break;
+      }
+    }
+    if (!macroName) return;
+
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: macroName,
+      referenceKind: 'calls',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
   }
 
   /**
@@ -2607,7 +2645,9 @@ export class TreeSitterExtractor {
       if (nodeType === 'macro_invocation') {
         const saved = this.isExtractingPattern;
         this.isExtractingPattern = true;
+        this.extractMacroCall(node);
         this.extractMatchesMacroReferences(node);
+        this.extractMacroInvocationArgs(node);
         for (let i = 0; i < node.namedChildCount; i++) {
           const child = node.namedChild(i);
           if (child) visitForCallsAndStructure(child);

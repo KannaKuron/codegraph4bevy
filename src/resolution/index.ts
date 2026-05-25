@@ -19,6 +19,7 @@ import {
 import { matchReference } from './name-matcher';
 import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
 import { detectFrameworks } from './frameworks';
+import { RUST_STD_MACROS } from './frameworks/rust';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { logDebug } from '../errors';
@@ -602,6 +603,8 @@ export class ReferenceResolver {
           fromNodeId: r.original.fromNodeId,
           referenceName: r.original.referenceName,
           referenceKind: r.original.referenceKind,
+          line: r.original.line,
+          col: r.original.column,
         }))
       );
     }
@@ -650,6 +653,8 @@ export class ReferenceResolver {
             fromNodeId: r.original.fromNodeId,
             referenceName: r.original.referenceName,
             referenceKind: r.original.referenceKind,
+            line: r.original.line,
+            col: r.original.column,
           }))
         );
       }
@@ -666,6 +671,8 @@ export class ReferenceResolver {
               fromNodeId: r.fromNodeId,
               referenceName: r.referenceName,
               referenceKind: r.referenceKind,
+              line: r.line,
+              col: r.column,
             }))
           );
         }
@@ -797,6 +804,11 @@ export class ReferenceResolver {
       if (PASCAL_BUILT_INS.has(name)) {
         return true;
       }
+    }
+
+    // Rust standard library macros — only suppress if no project symbol has this name
+    if (ref.language === 'rust' && RUST_STD_MACROS.has(name) && !this.knownNames?.has(name)) {
+      return true;
     }
 
     return false;
