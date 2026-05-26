@@ -1,41 +1,39 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+CodeGraph 的个人 fork，面向 **Rust + Bevy ECS** 代码库的深度代码理解工具。
 
-## Project Overview
+## 项目概述
 
-CodeGraph is a local-first code intelligence library + CLI + MCP server. It parses any supported codebase with tree-sitter, stores symbols/edges/files in SQLite (FTS5), and exposes a knowledge graph to AI agents (Claude Code, Cursor, Codex CLI, opencode) over MCP. Per-project data lives in `.codegraph/`. Extraction is deterministic — derived from AST, not LLM-summarized.
+CodeGraph 是一个本地优先的代码智能库 + CLI + MCP 服务器。通过 tree-sitter 解析代码，将符号/边/文件存储在 SQLite（FTS5）中，以知识图谱的形式通过 MCP 暴露给 AI agent。每个项目的数据存储在 `.codegraph/` 中。提取是确定性的——从 AST 派生，而非 LLM 总结。
 
-Distributed as `@colbymchenry/codegraph` on npm; same binary serves as installer, indexer, and MCP server.
+以 `@colbymchenry/codegraph` 发布在 npm 上；同一个二进制文件既是安装器，也是索引器和 MCP 服务器。
 
-## Build, Test, Run
+## 构建、测试、运行
 
 ```bash
-npm run build           # tsc + copy schema.sql and *.wasm into dist/; chmods dist/bin/codegraph.js
+npm run build           # tsc + 复制 schema.sql 和 *.wasm 到 dist/；给 dist/bin/codegraph.js 添加执行权限
 npm run dev             # tsc --watch
 npm run clean           # rm -rf dist
 
-npm test                # vitest run (all)
+npm test                # vitest run（全部）
 npm run test:watch
-npm run test:eval       # only __tests__/evaluation/
-npm run eval            # build then run __tests__/evaluation/runner.ts via tsx
+npm run test:eval       # 仅 __tests__/evaluation/
+npm run eval            # 构建后通过 tsx 运行 __tests__/evaluation/runner.ts
 
-npm run cli             # build then run the local dist binary
+npm run cli             # 构建后运行本地 dist 二进制文件
 
-# Single test file / pattern
+# 单个测试文件 / 匹配模式
 npx vitest run __tests__/installer-targets.test.ts
 npx vitest run __tests__/extraction.test.ts -t "TypeScript"
-npx vitest run __tests__/extraction-import.test.ts
-npx vitest run __tests__/extraction-extended.test.ts
 ```
 
-`copy-assets` (called from `build`) copies `src/db/schema.sql` and all `src/extraction/wasm/*.wasm` files into `dist/`. **Any new SQL or grammar wasm must be copied or it won't ship.**
+`copy-assets`（从 `build` 调用）将 `src/db/schema.sql` 和所有 `src/extraction/wasm/*.wasm` 文件复制到 `dist/`。**任何新的 SQL 或语法 wasm 必须被复制，否则不会随包发布。**
 
-Node engines: `>=20.0.0 <25.0.0`. Hard exit on Node <20 and Node 25.x (see `src/bin/node-version-check.ts`).
+Node 引擎要求：`>=20.0.0 <25.0.0`。Node <20 和 Node 25.x 会直接退出（见 `src/bin/node-version-check.ts`）。
 
-## Architecture
+## 架构
 
-### Layered pipeline
+### 分层流水线
 
 ```
 files → ExtractionOrchestrator (tree-sitter) → DB (nodes/edges/files)
@@ -47,225 +45,85 @@ files → ExtractionOrchestrator (tree-sitter) → DB (nodes/edges/files)
        ContextBuilder (markdown/JSON for AI consumption)
 ```
 
-The public API surface is `src/index.ts` — the `CodeGraph` class wires all the layers and re-exports types. Library users only touch this file; the MCP server and CLI also drive it.
+公共 API 入口是 `src/index.ts`——`CodeGraph` 类连接所有层并重新导出类型。库用户只接触这个文件；MCP 服务器和 CLI 也通过它驱动。
 
-### Module layout
+### 模块布局
 
-- `src/index.ts` — `CodeGraph` class: `init`/`open`/`close`, `indexAll`, `sync`, `searchNodes`, `findImplementors`, `getCallers`/`getCallees`, `getImpactRadius`, `buildContext`, `watch`/`unwatch`.
-- `src/db/` — `DatabaseConnection`, `QueryBuilder` (prepared statements), `schema.sql`. Backed by `better-sqlite3` (native) when available, transparently falls back to `node-sqlite3-wasm`. `codegraph status` surfaces which backend is live; wasm is the slow path.
-- `src/extraction/` — `ExtractionOrchestrator`, tree-sitter wrappers, per-language extractors under `languages/` (one file per language), plus standalone extractors for non-tree-sitter formats (`svelte-extractor.ts`, `vue-extractor.ts`, `liquid-extractor.ts`, `dfm-extractor.ts` for Delphi). `parse-worker.ts` runs heavy parsing off the main thread.
-- `src/resolution/` — `ReferenceResolver` orchestrates `import-resolver.ts` (with `path-aliases.ts` for tsconfig path aliases + cargo workspace member globs), `name-matcher.ts`, and `frameworks/` (Express, Laravel, Rails, FastAPI, Django, Flask, Spring, Gin, Axum, ASP.NET, Vapor, React Router, SvelteKit, Vue/Nuxt, Cargo workspaces). Frameworks emit `route` nodes and `references` edges.
-- `src/graph/` — `GraphTraverser` (BFS/DFS, impact radius, path finding) and `GraphQueryManager` (high-level queries).
-- `src/context/` — `ContextBuilder` + formatter for markdown/JSON output.
-- `src/search/` — full-text query parser and helpers for FTS5.
-- `src/sync/` — `FileWatcher` (native FSEvents/inotify/RDCW) with debounce + filter, and git-hook helpers.
-- `src/mcp/` — MCP server (`MCPServer`, `tools.ts`, `transport.ts`). `server-instructions.ts` is what the server returns in the MCP `initialize` response — keep it in sync with the user-facing tool guidance.
-- `src/installer/` — see below.
-- `src/bin/codegraph.ts` — CLI (commander). Subcommands: `install`, `init`, `uninit`, `index`, `sync`, `status`, `query`, `files`, `context`, `affected`, `serve --mcp`.
-- `src/ui/` — terminal UI (shimmer progress, worker).
+- `src/index.ts` — `CodeGraph` 类：`init`/`open`/`close`、`indexAll`、`sync`、`searchNodes`、`findImplementors`、`getCallers`/`getCallees`、`getImpactRadius`、`buildContext`、`watch`/`unwatch`
+- `src/db/` — `DatabaseConnection`、`QueryBuilder`（预编译语句）、`schema.sql`。后端优先使用 `better-sqlite3`（原生），不可用时透明回退到 `node-sqlite3-wasm`。`codegraph status` 会显示当前使用的后端；wasm 是慢路径。
+- `src/extraction/` — `ExtractionOrchestrator`、tree-sitter 封装、`languages/` 下每种语言一个提取器文件，以及非 tree-sitter 格式的独立提取器（`svelte-extractor.ts`、`vue-extractor.ts`、`liquid-extractor.ts`、`dfm-extractor.ts` 用于 Delphi）。`parse-worker.ts` 将繁重的解析工作放到 worker 线程。
+- `src/resolution/` — `ReferenceResolver` 协调 `import-resolver.ts`（含 `path-aliases.ts` 用于 tsconfig path 别名 + cargo workspace member glob）、`name-matcher.ts` 和 `frameworks/`（Express、Laravel、Rails、FastAPI、Django、Flask、Spring、Gin、Axum、ASP.NET、Vapor、React Router、SvelteKit、Vue/Nuxt、Cargo workspaces、Bevy）。框架解析器生成 `route` 节点、`references` 边和 `callback` 合成边。
+- `src/graph/` — `GraphTraverser`（BFS/DFS、影响半径、路径查找）和 `GraphQueryManager`（高级查询）。
+- `src/context/` — `ContextBuilder` + 用于 markdown/JSON 输出的格式化器。
+- `src/search/` — FTS5 的全文查询解析器和辅助工具。
+- `src/sync/` — `FileWatcher`（原生 FSEvents/inotify/RDCW），带去抖 + 过滤，以及 git hook 辅助工具。
+- `src/mcp/` — MCP 服务器（`MCPServer`、`tools.ts`、`transport.ts`）。`server-instructions.ts` 是服务器在 MCP `initialize` 响应中返回的内容——与面向用户的工具指南保持同步。
+- `src/installer/` — 多 agent 安装器入口，支持 Claude Code、Cursor、Codex CLI、OpenCode。
+- `src/bin/codegraph.ts` — CLI（commander）。子命令：`install`、`init`、`uninit`、`index`、`sync`、`status`、`query`、`files`、`context`、`affected`、`serve --mcp`
+- `src/ui/` — 终端 UI（shimmer 进度条、worker）
 
 ### NodeKind / EdgeKind
 
-Defined in `src/types.ts`. Both extractors and resolvers must use these exact strings.
+定义在 `src/types.ts` 中。提取器和解析器都必须使用这些确切的字符串。
 
-- **NodeKind**: `file`, `module`, `class`, `struct`, `interface`, `trait`, `protocol`, `function`, `method`, `property`, `field`, `variable`, `constant`, `enum`, `enum_member`, `type_alias`, `namespace`, `parameter`, `import`, `export`, `route`, `component`.
-- **EdgeKind**: `contains`, `calls`, `imports`, `exports`, `extends`, `implements`, `references`, `type_of`, `returns`, `instantiates`, `overrides`, `decorates`.
+- **NodeKind**: `file`、`module`、`class`、`struct`、`interface`、`trait`、`protocol`、`function`、`method`、`property`、`field`、`variable`、`constant`、`enum`、`enum_member`、`type_alias`、`namespace`、`parameter`、`import`、`export`、`route`、`component`
+- **EdgeKind**: `contains`、`calls`、`imports`、`exports`、`extends`、`implements`、`references`、`type_of`、`returns`、`instantiates`、`overrides`、`decorates`、`pattern_match`
 
-### Multi-agent installer
+---
 
-`src/installer/` is the entry point for `codegraph install` (and the bare `codegraph`/`npx @colbymchenry/codegraph` invocation). Architecture:
+## Fork 定位：Rust/Bevy 特化 CodeGraph
 
-- `targets/registry.ts` lists every supported agent.
-- `targets/types.ts` defines the `AgentTarget` interface — adding a 5th agent (Continue, Zed, Windsurf…) is **one new file in `targets/` + one entry in `registry.ts`**. Each target owns its config-file location, MCP-server JSON/TOML/JSONC writing, and instructions-file path.
-- Current targets: `claude.ts`, `cursor.ts`, `codex.ts`, `opencode.ts`.
-- `targets/toml.ts` is a hand-rolled TOML serializer scoped to `[mcp_servers.codegraph]` (used by Codex). Sibling tables and `[[array_of_tables]]` are preserved verbatim. No new dependency.
-- opencode reads `opencode.jsonc` by default; the installer prefers existing `.jsonc`, falls back to `.json`, and creates `.jsonc` for greenfield installs. Edits are surgical via `jsonc-parser` so user comments and formatting survive install/re-install/uninstall round-trips.
-- `instructions-template.ts` is the agent-agnostic instructions file written to each target (e.g. `CLAUDE.md`, `.cursor/rules/codegraph.mdc`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`). It explicitly says "trust codegraph results, don't re-verify with grep" — earlier versions prescribed Claude-specific "spawn an Explore agent" and confused other agents.
-- `claude-md-template.ts` is the legacy Claude-only template, retained for compatibility paths.
-- All installer changes need matching coverage in `__tests__/installer-targets.test.ts` — there are ~47 parameterized contract tests covering install idempotency, sibling preservation, uninstall reverses install, byte-equal re-runs returning `unchanged`, and partial-state recovery for Codex.
+这个 fork **不是**通用代码智能工具，而是专为 **Rust + Bevy ECS** 代码库优化。所有修改服务于以下目标：
 
-### Cursor MCP working-directory quirk
+- **Bevy DSL 语义提取** — 将 `app.add_systems()`、`app.init_resource()`、`PluginGroup::build()`、状态转换（`NextState`、`ComputedStates`、`SubStates`）识别为一等图边
+- **Rust 语义深度** — match/if-let 模式引用、宏调用提取、枚举变体类型引用、turbofish 泛型——这些都是 grep 无法恢复的结构化信息
+- **CJK 搜索质量** — jieba 分词用于 FTS，CJK 感知的名称匹配和查询解析
 
-Cursor launches MCP subprocesses with the wrong cwd and doesn't pass `rootUri` in `initialize`. The installer injects `--path` into Cursor's MCP args — absolute path for local installs, `${workspaceFolder}` for global installs. If you touch Cursor wiring, preserve this.
+上游 CodeGraph 追求广度（多语言、多 agent target、最小维护面）。本 fork 追求深度（单一语言生态、最大结构覆盖）。两者互补，非竞争。
 
-### MCP server instructions
+### 合并哲学：采纳架构，重建功能
 
-`src/mcp/server-instructions.ts` is sent back to the agent in the MCP `initialize` response. This is the *first* thing every agent sees about how to use the tools — treat it as the authoritative tool guidance and keep it in sync with `instructions-template.ts` and `.cursor/rules/codegraph.mdc`.
+上游每次变更，按变更本身的价值来评估，而非"保护我们的 diff"：
 
-## Retrieval performance & dynamic-dispatch coverage (do not regress)
+1. **架构改进无条件欢迎。** 守护进程、watcher、sync、默认忽略目录——这些在工程上都是更优解。全量采纳，在新基础上重建我们的功能。
 
-CodeGraph's core value is letting an agent answer **structural/flow** questions ("how does X reach Y", trace, impact, callers) with a few **fast** codegraph calls and **zero Read/Grep**. The optimization target is **wall-clock latency + tool-call count** — *don't optimize for token cost*. (Cost is **lower**, not "flat" as earlier framing claimed: a current-build with-vs-without A/B across the 7 README repos, median of 4, saved on average **35% cost · 57% tokens · 46% time · 71% tool calls** — reproducing the published README. The mechanism is **far fewer turns over a much smaller accumulated context** — NOT cache-ability: the without-arm's huge token volume is *mostly* cheap cache-reads, which is why token-count savings (57%) look bigger than cost savings (35%). Measure tokens by **summing per-turn assistant usage**, not `result.usage` (last-turn only in current Claude Code). See `docs/benchmarks/call-sequence-analysis.md`.) The mechanism that drives everything here: **an agent falls back to Read/Grep the instant a codegraph answer is insufficient.** So every change is judged by one question — is codegraph's answer sufficient enough to *stop* the agent from reading?
+2. **功能删除不自动拒绝。** 如果上游删了我们用的东西，先问：*在新架构上能否实现相同甚至更好的效果？* 有时上游的简化反而揭示了更干净的路径。例如：上游把 MCP 服务器拆成 daemon/engine/session 三层，我们的 Bevy 工具作为 engine 插件集成可能比之前内联在单体服务器里更好。
 
-**Target behavior:** a flow question resolves in **1 codegraph call on small repos, scaling to 3–5 on large**, with **Read/Grep = 0**. When reviewing a PR or trying something new, do not regress this.
+3. **不做兼容性修补。** 不保留旧 API、不重新导出已删除的类型、不添加 `_compat` 包装器来维持现有代码能跑。如果上游重写了 `tools.ts`，我们就按新的模式重写 Bevy 工具处理器。兼容性补丁腐烂得快，且让未来的合并更难。
 
-### Adapt the tool to the agent — don't try to change the agent
+4. **不确定时先讨论再动手。** 如果上游的变更有意思但会破坏我们的功能，先讨论权衡。"上游新的 X 更干净——我们应该在新的基础上重做 Bevy Y，还是有理由认为我们的方案对 Rust 来说根本性更好？"
 
-The lever that decides whether a retrieval change lands. **Test before building anything here: does this make a tool the agent _already calls_ do more with the input it _already gives_? If it instead needs the agent to behave differently — pick a different tool, query differently, learn from examples — it hits the low-salience wall and won't land.**
+### 评估上游变更：检查清单
 
-CodeGraph's only channels to influence the agent are low-salience: the MCP `initialize` instructions (`server-instructions.ts`) and the tool descriptions. Changing them does **not** reliably move the agent's tool _choice_ or query style — validated: trace-first steering ported into the server-instructions + tool descriptions (3 wording variants) never reproduced what a CLI `--append-system-prompt` achieved, and **regressed** wall-clock vs baseline. New tools fare worse (rarely chosen — the agent under-picks even `trace`); "better examples" is the same steering. The agent's tool-choice does improve on its own as host models get better at tool use — but that is not ours to force.
+对每个上游 commit 或变更的文件：
 
-What works is meeting the agent where it already is:
-- **Sufficiency** — `codegraph_trace` inlines each hop's body + the destination's own callees, so one trace call ends the flow investigation (no follow-up explore/node/Read).
-- **explore-flow** — `codegraph_explore`'s query is a precise bag of symbol names (incl. qualified `Class.method`) spanning the flow the agent is after; explore finds the call path _among those named symbols_ (riding synthesized edges) and leads its output with it — delivering trace-quality flow through the call the agent reliably makes. (`buildFlowFromNamedSymbols`: segment/co-naming disambiguation; ≤1 unnamed bridge so it never wanders a god-function's fan-out.)
+1. **上游为什么改这个？**（理解他们的动机）
+2. **这个问题在我们的 fork 里存在吗？**（如果有，我们需要这个修复）
+3. **这个变更与我们的 Bevy/CJK 功能有结构性冲突吗？**（没有就自由采纳）
+4. **如果有冲突，能在新基础上把我们的功能做得更好吗？**（核心问题——不要假设我们的旧方案就是最好的）
+5. **上游的方案对我们的用例来说确实更好吗？**（例如：守护进程架构意味着一个项目一个 CodeGraph 实例——我们的 Bevy 工具同样受益于跨 MCP 客户端共享状态）
 
-What fails is the inverse — folding a precise answer into a **fuzzy-input** tool. `codegraph_context` gets a description, not symbols, so it can't disambiguate a flow's endpoints and surfaces the _wrong feature_. Precise output needs precise input.
+### 已知分歧点（保持更新）
 
-The remaining lever under this axis is **coverage**: every flow made to connect statically (a new dynamic-dispatch synthesizer) is then surfaced automatically by explore-flow/`trace`, no agent change needed. Reactive/reconciler runtimes (Halo's `ReactiveExtensionClient`, MediatR, Vue Proxy) are the frontier — flows there have no static edges, so nothing surfaces (correctly — silent beats wrong). Full investigation + A/B record: `docs/benchmarks/call-sequence-analysis.md`.
+这些是本 fork 与上游有意的分歧区域。合并时重点关注这些文件：
 
-### Explore budget — keep BOTH budgets monotonic with repo size
+| 层 | 文件 | 我们的增加 | 上游方向 |
+|---|------|-----------|---------|
+| 提取 | `src/extraction/tree-sitter.ts`、`languages/rust.ts` | Bevy DSL 模式、Rust match/if-let/macro 引用提取 | 删除所有语言特定语义提取 |
+| 解析 | `src/resolution/callback-synthesizer.ts`、`frameworks/rust.ts`、`index.ts`、`name-matcher.ts` | Bevy ECS 边合成（N11/N12）、保留 `RUST_STD_MACROS`、`crate::` 前缀处理 | 删除所有框架特定合成、简化引用删除 |
+| MCP 工具 | `src/mcp/tools.ts`、`server-instructions.ts` | `codegraph_usages` 工具、批处理模式、`include_external`、`referencesType`/`impl_for` 参数、Bevy 合成边标签 | 简化 API 表面积、删除 usages 工具、删除批处理 |
+| 搜索 | `src/search/jieba-helper.ts`、`query-utils.ts` | jieba CJK 分词、`escapeLike`、`isDependencyFile`、Unicode 感知的 token 拆分 | 删除 CJK 支持、仅 ASCII token 化 |
+| 数据库 | `src/db/schema.sql`、`migrations.ts`、`queries.ts` | `comments` 表、`fts_tokens` 列、`findImplementors()`、`findNodesByReferencedType()`、`searchComments()` | 删除 comments 表、删除实现者查询、schema 版本回退 |
+| 上下文 | `src/context/index.ts`、`formatter.ts` | Bevy ECS state/resource 标签、CJK 查询分词、`EntryPointUsage` 统计 | 删除框架特定标签、CJK 处理、入口点统计 |
+| 核心 API | `src/index.ts`、`src/types.ts` | `findImplementors()`、`findNodesByReferencedType()`、`searchComments()`、`EntryPointUsage`、`pattern_match` EdgeKind | 从公共 API 中删除 |
 
-Two functions in `src/mcp/tools.ts` scale explore with indexed file count. This is the expected resolution (a regression here silently forces agents back to Read):
+---
 
-| Repo | files | explore calls | chars/call | per-file |
-|---|---|---|---|---|
-| express (small) | 147 | 1 | 18K | 3800 |
-| excalidraw/django (medium) | 643–3043 | 2 | 28K | 6500 |
-| vscode (large) | 10446 | 3 | 35K | 7000 |
-| ~20k / ~40k | — | 4 / 5 | 38K | 7000 |
-
-- `getExploreBudget(fileCount)` → **call** budget: `<500→1, <5000→2, <15000→3, <25000→4, ≥25000→5` (max 5).
-- `getExploreOutputBudget(fileCount)` → **per-call** output (chars / files / per-file). **Invariant: a larger tier must never get a smaller `maxCharsPerFile` than a smaller tier.** (Regression that motivated this doc: the `<5000` tier's 2500 was *below* the `<500` tier's 3800, so on a god-file repo — excalidraw's 415 KB `App.tsx` — one explore returned <1% of the file and forced a Read.)
-- Explore output must **never tell the agent to "use Read"** — steer to another `codegraph_explore` and "treat returned source as already Read."
-
-### Dynamic-dispatch coverage — the flow must EXIST in the graph end-to-end
-
-Static tree-sitter extraction misses computed/indirect calls, so flows break at dynamic dispatch and the agent reads to reconstruct them. Synthesizers/resolvers bridge these so `trace`/`explore` connect end-to-end (`src/resolution/callback-synthesizer.ts`, `src/resolution/frameworks/`). Channels today: callback/observer, EventEmitter, **React re-render** (`setState`→`render`), **JSX child** (`render`→child component), django ORM descriptor. All synthesized edges are `provenance:'heuristic'` with `metadata.synthesizedBy` + `registeredAt` (the wiring site), surfaced inline in `trace`, the `node` trail, and `context` call-paths.
-
-**Principle: partial coverage is WORSE than none.** Bridging one boundary but not the next reveals a hop the agent then drills + reads to finish. Measured on excalidraw: react-render alone *raised* reads to 5–7; only completing the flow (adding the jsx-child hop) dropped it to 0–1. **Always close the flow end-to-end and re-measure** — never ship a half-bridged flow.
-
-### Validation methodology (REQUIRED for every new language/framework)
-
-For each **language × framework**, validate on **small, medium, and large** real repos with **≥3 different flow prompts** each:
-
-1. **Pick the canonical flow** for the framework ("how does X reach Y": state→render, request→handler→view, query→SQL, action→reducer→store…).
-2. **Deterministic probes** (`scripts/agent-eval/probe-{trace,node,context,explore}.mjs` against the built `dist/`): `trace(from,to)` connects end-to-end with no break; **no node explosion** (`select count(*) from nodes` stable before/after re-index); synthesized-edge **precision** spot-check (`select … where provenance='heuristic'`).
-3. **Agent A/B** (`scripts/agent-eval/run-all.sh <repo> "<Q>"`): with vs without codegraph, **≥2 runs/arm** (run-to-run variance is large — never conclude from n=1). Record **duration, total tool calls, Read, Grep**. Optional forced-Read-0 sufficiency proof via the block-read hook (`scripts/agent-eval/hook-settings.json`).
-4. **Pass bar:** a normal flow question reaches **~0 Read/Grep within the repo's explore-call budget**, runs **faster** than without-codegraph, and shows **no regression on a control repo**. Record the numbers in `docs/design/dynamic-dispatch-coverage-playbook.md` (the coverage matrix).
-
-Full playbook + per-mechanism design: `docs/design/dynamic-dispatch-coverage-playbook.md` and `docs/design/callback-edge-synthesis.md`.
-
-### Worked example — Excalidraw (TS/React, medium, 643 files)
-
-The template to replicate per language/framework. Question: *"how does updating an element re-render the canvas on screen?"* (the full flow crosses three React boundaries: observer callback, `setState`→`render`, and JSX child).
-
-| Stage | duration | Read | Grep | codegraph |
-|---|---|---|---|---|
-| Without codegraph | 115–139s | 9–10 | 10–11 | 0 |
-| Broken (explore-budget regression) | 131–139s | 5–10 | 3–5 | 6–14 |
-| Fixed (budget + msgs + synthesis) | 64–112s | 0–2 | 2–4 | 3–**10** |
-| + trace-first steering | **51–74s** | **0–2** | 0–4 | **3–4** |
-
-n=4 unhooked runs/stage, same prompt. After steering flow questions to `codegraph_trace` first: **best run 0 Read / 0 Grep / 3 codegraph / 51s**; **2 of 4 fully clean** (0 Read, 0 Grep). Steering eliminated the over-drill variance — call count tightened from 3–10 to 3–4, trace adoption went 3/4 → 4/4, and the `search`+`callers` path-reconstruction floundering dropped to 0. Run-to-run variance is still real; report the range, never a single run. **Residual reads/greps are all the nonce data-flow** (`canvasNonce` — a local prop with no graph edges); that's the def-use/data-flow frontier, left deliberately uncovered (tracking every local would explode the graph). Validated: `trace(mutateElement, renderStaticScene)` connects in **6 hops** across all three boundaries (`mutateElement → triggerUpdate → [callback] triggerRender → [react-render] render → [jsx] StaticCanvas → renderStaticScene`), each hop showing inline source + the wiring site; node count stable at 9,289; 1 callback + 46 react-render + 280 jsx-render synthesized edges (no explosion, precision-checked).
-
-## Tests
-
-Tests live in `__tests__/` and mirror the module they cover. Notable ones beyond the obvious:
-
-- `extraction.test.ts` — core language extraction (TS/JS, Python, Go, Rust, Java, C#, PHP, Swift, Kotlin, Dart). 84 tests.
-- `extraction-import.test.ts` — import extraction across all languages. 71 tests. Split from the main file to avoid V8 Zone OOM (see vitest config).
-- `extraction-extended.test.ts` — Pascal/DFM, Scala, Vue, Lua, Luau, and infrastructure tests (indexing, directory exclusion, git submodules). 100 tests.
-- `installer-targets.test.ts` — parameterized contract suite across all 4 agent targets (see installer notes above).
-- `evaluation/` — `runner.ts` + `test-cases.ts` exercise codegraph against synthetic projects and score the results; run via `npm run eval` (builds first). Not part of `npm test`.
-- `sqlite-backend.test.ts` — covers native + wasm backend selection and fallback.
-- `pr19-improvements.test.ts`, `frameworks-integration.test.ts` — regression coverage for specific past PRs/incidents; don't rename these, the names anchor to git history.
-
-The extraction tests were split into three files because loading ~20 tree-sitter WASM grammars and running 250+ parse operations in a single process exhausts V8 Zone memory (JIT compiler internals, not JS heap) on some platforms (notably Node 24 / Windows). The vitest config uses `pool: 'forks'` so each file runs in its own process. **Do NOT re-merge these files** without verifying the full suite passes on Node 24 / Windows.
-
-Tests create temp dirs with `fs.mkdtempSync` and clean up in `afterEach`. They write real files and exercise real SQLite — there is no DB mocking.
-
-### Windows-gated tests
-
-Behavior that differs by platform (path resolution, drive letters, `SENSITIVE_PATHS`, `%APPDATA%` config dirs, CRLF) must be gated, not assumed. Use `it.runIf(process.platform === 'win32')(...)` for Windows-only assertions and `it.runIf(process.platform !== 'win32')(...)` for POSIX-only ones — e.g. `/etc` is sensitive on POSIX but resolves to `C:\etc` (non-existent) on Windows, so an ungated `/etc` assertion fails on Windows. Validate the Windows side for real (see below); don't merge a Windows-gated test you haven't seen run.
-
-## Windows validation (Parallels + SSH)
-
-For any Windows-specific PR, bug, or implementation, validate it on the real Windows VM rather than guessing. Connection details live in the gitignored **`.parallels`** file at the repo root (VM name, guest IP, SSH user/key). `prlctl exec` needs Parallels Pro and is unavailable, so SSH is the bridge.
-
-- Connect / run from the Mac host: `ssh <user>@<guest_ip> "..."`. For multi-line work, pipe PowerShell over stdin and **refresh PATH from the registry** first (sshd's session has a stale PATH after winget installs):
-  ```
-  ssh colby@10.211.55.3 "powershell -NoProfile -ExecutionPolicy Bypass -Command -" <<'PS'
-  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
-  Set-Location C:\dev\codegraph
-  PS
-  ```
-- Clone fresh into a **Windows-local** path (`C:\dev\codegraph`) and `npm ci` there — never run npm against the shared Mac repo, since `esbuild`/`rollup` ship platform-specific binaries.
-- Guest toolchain (winget): Node LTS, Git, and the **VC++ ARM64 redistributable** (required by `@rollup/rollup-win32-arm64-msvc`, which vitest pulls in).
-- Fetch a contributor PR head straight from their fork to dodge `pull/<n>/head` lag: `git fetch <fork-url> <branch>` then `git checkout -f FETCH_HEAD`.
-- Known pre-existing Windows failure: `security.test.ts > Session marker symlink resistance > does not follow a pre-planted symlink` (symlink creation needs privileges on Windows). Unrelated to current work; don't let it mask new regressions.
-
-## Releases
-
-Released to npm and mirrored as [GitHub Releases](https://github.com/colbymchenry/codegraph/releases). `CHANGELOG.md` is the source of truth; GitHub Release notes are extracted from it.
-
-### Writing changelog entries
-
-When asked for an entry for a new version:
-
-1. Add a new `## [X.Y.Z] - YYYY-MM-DD` block at the **top** of `CHANGELOG.md` (under the intro, above the previous version).
-2. Group under `### Added`, `### Changed`, `### Fixed`, `### Removed`, `### Deprecated`, `### Security` — omit empty sections.
-3. Write from the **user's perspective**, not the implementation's. Lead with the observable symptom or capability; mention internals only if a user needs them (e.g., to work around an existing bad install).
-4. Add the link reference at the bottom: `[X.Y.Z]: https://github.com/colbymchenry/codegraph/releases/tag/vX.Y.Z`.
-
-### Release flow (the user runs these)
-
-Releases are built and published by the **GitHub Actions "Release" workflow**
-(`.github/workflows/release.yml`). It bundles a Node runtime per platform
-(`scripts/build-bundle.sh`) and publishes both the GitHub Release and the npm
-thin-installer (`scripts/pack-npm.sh`: a shim package + per-platform packages).
-Publishing manually is **wrong** now — a plain `npm publish` ships the root
-package (non-bundled), which breaks anyone on Node < 22.5.
-
-After the changelog entry is written and `package.json` is bumped:
-
-```bash
-git add package.json package-lock.json CHANGELOG.md
-git commit -m "release: X.Y.Z (<one-line summary>)"
-git push
-```
-
-Then trigger **Actions → Release → Run workflow** (on `main`). It reads the
-version from `package.json`, builds every platform bundle on one runner, creates
-the GitHub Release with notes from the matching `CHANGELOG.md` section, and
-publishes to npm. Requires the `NPM_TOKEN` repo secret.
-
-**Do not run `npm publish`, `git push`, or `git tag` yourself** — these are
-publish actions on shared state. Write the files, hand the user the commands.
-
-## House rules
-
-- The `0.9.x` line is in active multi-agent rollout. Any change to `src/installer/` (especially `targets/`) needs corresponding test coverage and a CHANGELOG entry — installer regressions break every new install silently.
-- When changing what the MCP tools do or how agents should use them, update **all three** of `src/mcp/server-instructions.ts`, `src/installer/instructions-template.ts`, and `.cursor/rules/codegraph.mdc` — they're written to different places but say the same thing.
-- CodeGraph provides **code context**, not product requirements. For new features, ask the user about UX, edge cases, and acceptance criteria — the graph won't tell you.
-- **Regex must match by type/function/method name, never by variable name.** When writing a regex to detect API usage patterns, match the invariant part — the type path (`NextState::Pending`), function name (`in_state`), or method call (`.add_systems(` with leading dot). Never hardcode a variable name like `next_state`, `commands`, `app`, or `router` — those are developer-chosen identifiers; CJK names, abbreviations, or any other valid identifier will silently break the pattern. Use generic identifier classes (`[\p{L}\p{N}_]+`, `\w+`) for the receiver/variable slot. The Go framework resolver (`frameworks/go.ts:95`) does this correctly with `\b\w+\.(GET|POST|...)` — follow that pattern.
-
-## Branch relationships
-
-| Branch | Description |
-|---|---|
-| `main` | Tracks `origin/main` from upstream — only used to fetch upstream changes, then merge into working branch |
-| `个人改造适配分支不pr给原项目` | **Main working branch** — all development happens here |
-| `buk-备份-个人改造适配分支不pr给原项目` | **Backup branch** — merge target for backups |
-
-### Remotes
-
-| Remote | URL | Usage |
-|---|---|---|
-| `origin` | `github.com/KannaKuron/codegraph4bevy` | Personal fork — **可推送** |
-| `fork` | `github.com/KannaKuron/codegraph4bevy` | Personal fork — **可推送**（与 origin 相同） |
-| `upstream` | `github.com/colbymchenry/codegraph` | Upstream — fetch only, **never push** |
-
-### Git workflow rules
-
-- **"合并" always means merge into `buk-备份-个人改造适配分支不pr给原项目` for backup**, NOT into `main`
-- **"推送" means `git push origin` or `git push fork`**（两者相同，都推到个人 fork）
-- **`main` only accepts upstream changes**: `git fetch upstream` → merge into working branch
-- Key conflict areas on merge: `src/mcp/tools.ts`, `src/extraction/tree-sitter.ts`
-
-### Syncing from upstream — 逐个检查，禁止直接合并
+## 从上游同步 — 逐个检查，禁止直接合并
 
 **绝对不能 `git merge upstream/main` 直接合入工作分支。** 上游可能做了大重构，直接合并会导致冲突爆炸或静默覆盖个人修改。必须逐个 commit/文件检查后手动挑选。
 
-#### 第一步：同步本地 main 到上游
+### 第一步：同步本地 main 到上游
 
 ```bash
 git fetch upstream
@@ -273,7 +131,7 @@ git branch -f main upstream/main    # 不切换分支，强制对齐本地 main
 git push origin main                # 推到 fork 的 remote main
 ```
 
-#### 第二步：审查上游变更
+### 第二步：审查上游变更
 
 ```bash
 # 查看上游有哪些新 commit
@@ -283,13 +141,24 @@ git log HEAD..upstream/main --oneline
 git diff HEAD..upstream/main --stat
 ```
 
-#### 第三步：逐个文件/commit 检查后手动合并
+### 第三步：逐个文件/commit 检查后手动合并
 
-对每个上游变更的文件，**先读 diff 判断影响**，再决定：
-- **无冲突的纯新增文件**（上游新增、自己没改过的）：直接 `git checkout upstream/main -- <file>` 拿过来
-- **有重叠的文件**：必须逐段对比，理解上游重构意图，在个人修改基础上手工整合
-- **上游删掉的文件**：确认自己的功能是否还在，决定保留还是跟随删除
+对每个上游变更的文件，先判断它的性质，再决定处理方式：
 
+**纯新增文件**（上游新增、自己没改过）：
+```bash
+git checkout upstream/main -- <file>
+```
+
+**上游重写的文件**（架构重构）：不要想"怎么保留 diff"，而要想"我们的功能在新架构上怎么实现"。完全接受上游版本，然后在新结构上重新接入 Bevy 功能。
+```bash
+git checkout upstream/main -- <file>
+# 然后在新架构上重新实现我们的功能
+```
+
+**上游删掉的文件**：确认文件被删的原因。如果不影响我们的功能，跟随删除。如果是我们的功能文件（如 `jieba-helper.ts`），保留。
+
+**有重叠的文件**（两边都改了）：先读上游 diff，理解其重构意图。不自动"保留我们的版本"，而是判断上游的改法是否更好。如果是，在新代码上重做我们的功能。
 ```bash
 # 查看某个文件的上游 diff
 git diff HEAD..upstream/main -- <file>
@@ -300,36 +169,162 @@ git checkout upstream/main -- <file>
 # 有冲突的文件：Read 双方版本后手工 Edit
 ```
 
-#### 第四步：验证
+### 第四步：验证
 
 ```bash
 npm run build && npx vitest run
 ```
 
-### Committing and backing up
+---
+
+## 分支关系
+
+| 分支 | 说明 |
+|------|------|
+| `main` | 跟踪 `upstream/main`——仅用于拉取上游变更，然后合并到工作分支 |
+| `个人改造适配分支不pr给原项目` | **主工作分支**——所有开发在此进行 |
+| `buk-备份-个人改造适配分支不pr给原项目` | **备份分支**——备份的合并目标 |
+
+### 远程仓库
+
+| Remote | URL | 用途 |
+|--------|-----|------|
+| `origin` | `github.com/KannaKuron/codegraph4bevy` | 个人 fork — **可推送** |
+| `fork` | `github.com/KannaKuron/codegraph4bevy` | 个人 fork — **可推送**（与 origin 相同） |
+| `upstream` | `github.com/colbymchenry/codegraph` | 上游 — 仅 fetch，**永不推送** |
+
+### Git 工作流规则
+
+- **"合并"始终指合并到 `buk-备份-个人改造适配分支不pr给原项目` 进行备份**，而非合并到 `main`
+- **"推送"指 `git push origin` 或 `git push fork`**（两者相同，都推到个人 fork）
+- **`main` 只接受上游变更**：`git fetch upstream` → 合并到工作分支
+- 合并时的关键冲突区域：`src/mcp/tools.ts`、`src/extraction/tree-sitter.ts`、`src/resolution/callback-synthesizer.ts`
+
+## 提交与备份
 
 ```bash
-# Commit on working branch, then backup to buk
+# 在工作分支上提交，然后备份到 buk
 git checkout "个人改造适配分支不pr给原项目"
-# ... make changes, commit ...
+# ... 修改、提交 ...
 git checkout "buk-备份-个人改造适配分支不pr给原项目" && git merge "个人改造适配分支不pr给原项目"
 git checkout "个人改造适配分支不pr给原项目"
 git push origin "个人改造适配分支不pr给原项目" "buk-备份-个人改造适配分支不pr给原项目"
 ```
 
-After merge: `npm run build && npx vitest run` to verify. Prefer keeping upstream's structural refactors; layer personal changes on top.
+备份后：`npm run build && npx vitest run` 验证。
 
-## Global deployment
+## 全局部署
 
-The globally used `codegraph` is always built from the current working branch, not the npm-published version.
+全局使用的 `codegraph` 始终从当前工作分支构建，而非 npm 发布的版本。
 
 ```bash
-# One-time setup
+# 一次性设置
 npm run build && npm link
 
-# After that, just rebuild to update
+# 之后只需重新构建即可更新
 npm run build
 ```
 
-- `npm link` only needs to run once; subsequent `npm run build` updates `dist/` in place
-- MCP config points to the globally linked binary
+- `npm link` 只需运行一次；后续 `npm run build` 就地更新 `dist/`
+- MCP 配置指向全局链接的二进制文件
+
+## 开发规则
+
+- 修改 MCP 工具行为或 agent 使用方式时，需同步更新 `src/mcp/server-instructions.ts`、`src/installer/instructions-template.ts` 和 `.cursor/rules/codegraph.mdc`——它们写在不同位置但内容相同
+- CodeGraph 提供**代码上下文**，而非产品需求。新功能需要用户确认 UX、边界条件和验收标准——图谱不会告诉你这些
+- **正则表达式必须匹配类型/函数/方法名，绝不能用变量名。** 编写检测 API 使用模式的正则时，匹配不变的部分——类型路径（`NextState::Pending`）、函数名（`in_state`）或方法调用（`.add_systems(` 带前导点）。绝不要硬编码变量名如 `next_state`、`commands`、`app` 或 `router`——这些是开发者自由命名的标识符；CJK 名称、缩写或任何有效标识符都会让模式静默失效。对接收者/变量槽使用通用标识符类（`[\p{L}\p{N}_]+`、`\w+`）
+
+## 动态调度覆盖 — 流必须在图中端到端存在
+
+静态 tree-sitter 提取会遗漏计算/间接调用，因此流在动态调度处断裂，agent 被迫 Read 来重建。合成器/解析器桥接这些断裂点，使 `trace`/`explore` 端到端连接（`src/resolution/callback-synthesizer.ts`、`src/resolution/frameworks/`）。当前渠道：callback/observer、EventEmitter、React re-render（`setState`→`render`）、JSX child（`render`→子组件）、django ORM descriptor、**Bevy ECS state transitions**（`NextState::Pending` producer → `in_state` consumer、ComputedStates/SubStates 传递）。所有合成边均为 `provenance:'heuristic'`，带有 `metadata.synthesizedBy` + `registeredAt`（注册点），在 `trace`、节点追踪和上下文调用路径中内联显示。
+
+**原则：部分覆盖比无覆盖更糟。** 桥接一个边界但不桥接下一个，会揭示一个跳跃点，agent 随之钻取 + Read 来完成。验证于 excalidraw：只有 react-render 反而使 Read 上升到 5-7；只有完成整个流（添加 jsx-child 跳跃）才降到 0-1。**始终端到端关闭流并重新测量**——绝不要交付半桥接的流。
+
+### 每个新语言/框架的验证方法
+
+对每个 **语言 × 框架**，在**小型、中型和大型**真实仓库上用 **≥3 个不同的流提示**验证：
+
+1. 选择框架的标准流（"X 如何到达 Y"：state→render、request→handler→view、query→SQL、action→reducer→store…）
+2. **确定性探针**（`scripts/agent-eval/probe-{trace,node,context,explore}.mjs` 针对构建后的 `dist/`）：`trace(from,to)` 端到端连接无断裂；**无节点爆炸**（`select count(*) from nodes` 在重新索引前后稳定）；合成边**精度**抽查（`select … where provenance='heuristic'`）
+3. **Agent A/B**（`scripts/agent-eval/run-all.sh <repo> "<Q>"`）：有 vs 无 codegraph，**≥2 轮/组**（运行间方差大——绝不要从 n=1 得出结论）。记录**耗时、总工具调用、Read、Grep**
+4. **通过标准：** 正常流问题在仓库的 explore 调用预算内达到 **~0 Read/Grep**，运行**快于**无 codegraph，且**在对照仓库上无回归**。将数据记录在 `docs/design/dynamic-dispatch-coverage-playbook.md`（覆盖矩阵）中
+
+### Excalidraw 验证示例（TS/React，中型仓库，643 文件）
+
+这是每个语言/框架需要复制的模板。问题：*"更新元素如何重新渲染屏幕上的画布？"*（完整流跨越三个 React 边界：observer callback、`setState`→`render` 和 JSX child）。
+
+| 阶段 | 耗时 | Read | Grep | codegraph |
+|------|------|------|------|-----------|
+| 无 codegraph | 115–139s | 9–10 | 10–11 | 0 |
+| Broken（explore-budget 回归） | 131–139s | 5–10 | 3–5 | 6–14 |
+| 修复后（budget + msgs + synthesis） | 64–112s | 0–2 | 2–4 | 3–**10** |
+| + trace-first 引导 | **51–74s** | **0–2** | 0–4 | **3–4** |
+
+n=4 无 hook 运行/阶段，相同提示。引导流问题优先使用 `codegraph_trace` 后：**最佳运行 0 Read / 0 Grep / 3 codegraph / 51s**；**4 轮中 2 轮完全干净**。引导消除了过度钻取方差——调用次数从 3–10 收紧到 3–4，trace 采用率从 3/4 上升到 4/4。运行间方差仍然存在；始终报告范围，绝不报告单次运行。
+
+### Explore 预算 — 保持两项预算随仓库大小单调递增
+
+`src/mcp/tools.ts` 中有两个函数根据索引文件数缩放 explore。这是预期的解决方案（此处的回归会静默迫使 agent 回到 Read）：
+
+| 仓库 | 文件数 | explore 调用次数 | 字符数/调用 | 每文件字符数 |
+|------|--------|-----------------|------------|-------------|
+| express（小） | 147 | 1 | 18K | 3800 |
+| excalidraw/django（中） | 643–3043 | 2 | 28K | 6500 |
+| vscode（大） | 10446 | 3 | 35K | 7000 |
+| ~20k / ~40k | — | 4 / 5 | 38K | 7000 |
+
+- `getExploreBudget(fileCount)` → **调用**预算：`<500→1, <5000→2, <15000→3, <25000→4, ≥25000→5`（最多 5）
+- `getExploreOutputBudget(fileCount)` → **每次调用**输出（字符数 / 文件数 / 每文件字符数）
+- **不变量：较大层级绝不能比较小层级获得更小的 `maxCharsPerFile`。**（导致此文档的回归：`<5000` 层级的 2500 *低于* `<500` 层级的 3800，因此在 god-file 仓库——excalidraw 的 415 KB `App.tsx`——一次 explore 返回不到文件 1% 的内容，强制回退到 Read）
+- Explore 输出**绝不能告诉 agent "使用 Read"**——引导到另一次 `codegraph_explore`，并"将返回的源代码视为已 Read"
+
+### 适应工具而非改变 agent
+
+决定检索改进能否落地的杠杆。**在构建任何东西之前先测试这一点：这次改动是否让 agent _已经在调用_的工具，用 agent _已经给出的_输入做更多事？如果需要 agent 改变行为——选择不同工具、改变查询方式、从例子学习——就会撞上低显著性墙，无法落地。**
+
+CodeGraph 影响 agent 的唯一渠道是低显著性的：MCP `initialize` 指令（`server-instructions.ts`）和工具描述。改变它们**不能**可靠地改变 agent 的工具_选择_或查询风格——已验证：将 trace-first 引导移植到 server-instructions + 工具描述（3 个措辞变体）从未复现 CLI `--append-system-prompt` 的效果，且相比基线**退化**了 wall-clock 时间。新工具表现更差（很少被选择——agent 连 `trace` 都少选）；"更好的例子"是同样的引导问题。
+
+有效的是在 agent 已经在的地方与它相遇：
+- **充分性** — `codegraph_trace` 内联每个跳跃点的主体 + 目的地自身的被调用者，因此一次 trace 调用结束流调查（无需后续 explore/node/Read）
+- **explore-flow** — `codegraph_explore` 的查询是一个精确的符号名包（含限定名如 `Class.method`），覆盖 agent 要追踪的流；explore 在_这些命名符号中_找到调用路径（利用合成边），并在输出开头展示——通过 agent 确实会发起的调用，提供 trace 质量的流
+
+失败的是反向操作——将精确答案折叠到**模糊输入**工具中。`codegraph_context` 接收描述而非符号，因此无法消歧流的端点，并显示_错误的功能_。精确输出需要精确输入。
+
+此轴下剩余的杠杆是**覆盖率**：每个使流静态连接的改进（新的动态调度合成器）都会自动被 explore-flow/`trace` 暴露，无需 agent 改变。反应式/协调器运行时（Halo 的 `ReactiveExtensionClient`、MediatR、Vue Proxy）是前沿——这些地方的流没有静态边，因此没有东西暴露（正确——沉默比错误好）。
+
+## 开发经验
+
+以下是用 bug 和回归换来的教训，在本 fork 中也应遵守。
+
+### MCP 服务器指令同步
+
+`src/mcp/server-instructions.ts` 是每个 agent 收到的**第一样东西**，关于如何使用工具。修改 MCP 工具行为或 agent 使用方式时，需**同时更新以下三个文件**（它们写在不同位置但表达相同内容）：
+1. `src/mcp/server-instructions.ts` — MCP initialize 响应
+2. `src/installer/instructions-template.ts` — agent 无关的指令文件
+3. `.cursor/rules/codegraph.mdc` — Cursor IDE 规则文件
+
+### 测试文件拆分与 V8 Zone OOM
+
+提取测试原本分散在三个文件中，因为加载约 20 个 tree-sitter WASM 语法并在单进程中运行 250+ 次解析操作会耗尽 V8 Zone 内存（JIT 编译器内部结构，非 JS 堆），在某些平台上（特别是 Node 24 / Windows）。vitest 配置使用 `pool: 'forks'` 使每个文件在自己的进程中运行。
+
+**上游已将这些文件合并为一个 `extraction.test.ts`。** 如果在本 fork 中也跟随合并，必须在 Node 24 / Windows 上验证完整套件通过。如果合并后出现 OOM，需要重新拆分。
+
+### Windows 验证（Parallels + SSH）
+
+任何 Windows 特定的 PR、bug 或实现，在真实 Windows VM 上验证而非猜测。连接信息存储在仓库根目录的 gitignored **`.parallels`** 文件中（VM 名称、客户机 IP、SSH 用户/密钥）。`prlctl exec` 需要 Parallels Pro 且不可用，因此 SSH 是桥梁。
+
+- 从 Mac 主机连接/运行：`ssh <user>@<guest_ip> "..."`。多行工作通过 stdin 管道传输 PowerShell，并**先从注册表刷新 PATH**（sshd 的会话在 winget 安装后 PATH 过期）：
+  ```
+  ssh colby@10.211.55.3 "powershell -NoProfile -ExecutionPolicy Bypass -Command -" <<'PS'
+  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+  Set-Location C:\dev\codegraph
+  PS
+  ```
+- 在 **Windows 本地**路径（`C:\dev\codegraph`）全新 clone 并 `npm ci`——绝不在共享的 Mac 仓库上运行 npm，因为 `esbuild`/`rollup` 携带平台特定二进制
+- 客户机工具链（winget）：Node LTS、Git 和 **VC++ ARM64 可再发行组件**（`@rollup/rollup-win32-arm64-msvc` 需要，vitest 会拉取）
+- 从贡献者 fork 直接获取 PR head 以避免 `pull/<n>/head` 延迟：`git fetch <fork-url> <branch>` 然后 `git checkout -f FETCH_HEAD`
+- 已知的预先存在的 Windows 失败：`security.test.ts > Session marker symlink resistance > does not follow a pre-planted symlink`（符号链接创建在 Windows 上需要权限）；以及 `mcp-initialize.test.ts` / `mcp-roots.test.ts` 套件，在 `afterEach` 中以 `EPERM` 失败删除临时目录，因为生成的 `serve --mcp`（其 `--liftoff-only` re-exec 孙子进程）仍持有 cwd / SQLite 文件——Windows 文件锁定特性，非逻辑 bug。这些失败与当前工作无关；不要让它们掩盖新的回归
+
+### 跨平台测试门控
+
+行为因平台而异（路径解析、驱动器号、`SENSITIVE_PATHS`、`%APPDATA%` 配置目录、CRLF）必须门控，不能假设。对仅 Windows 的断言使用 `it.runIf(process.platform === 'win32')(...)`，对仅 POSIX 的使用 `it.runIf(process.platform !== 'win32')(...)`——例如 `/etc` 在 POSIX 上是敏感路径，但在 Windows 上解析为 `C:\etc`（不存在），因此未门控的 `/etc` 断言在 Windows 上会失败。在合并之前在实际 Windows 上验证 Windows 门控测试；不要合并未见过运行的 Windows 门控测试。
