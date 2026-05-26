@@ -141,7 +141,7 @@ export const expressResolver: FrameworkResolver = {
     // Match the route head up to the first arg: (app|router).METHOD('/path',
     // (NOT the whole call — handlers are often inline arrows whose `)`/`{}` the
     // old single-regex couldn't span, so inline-handler routes connected to nothing.)
-    const head = /\b(app|router)\.(get|post|put|patch|delete|all|use)\s*\(\s*['"]([^'"]+)['"]\s*,/g;
+    const head = /\b(\w+)\.(get|post|put|patch|delete|all|use)\s*\(\s*['"]([^'"]+)['"]\s*,/g;
     let match: RegExpExecArray | null;
     while ((match = head.exec(safe)) !== null) {
       const method = match[2]!;

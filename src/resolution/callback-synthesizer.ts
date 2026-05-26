@@ -533,11 +533,11 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
 // Group 1 = turbofish type (commands.insert_resource::<Type>(...)),
 // group 2 = constructor arg (base type, stops before ::Variant).
 // Uses Unicode-aware [\p{L}\p{N}_] so CJK type names (e.g. 设置界面_确认保存_触发信号_资源) match.
-const INSERT_RESOURCE_RE = /commands\s*\.\s*insert_resource\s*(?:::\s*<([\p{L}\p{N}_<>,: >]+)>\s*)?\(\s*([\p{L}\p{N}_]+)(?:::[\p{L}\p{N}_]+(?:\([^)]*\))?)*\s*[;{)]/gu;
+const INSERT_RESOURCE_RE = /[\p{L}\p{N}_]+\s*\.\s*insert_resource\s*(?:::\s*<([\p{L}\p{N}_<>,: >]+)>\s*)?\(\s*([\p{L}\p{N}_]+)(?:::[\p{L}\p{N}_]+(?:\([^)]*\))?)*\s*[;{)]/gu;
 const RESOURCE_EXISTS_RE = /run_if\s*\(\s*resource_exists\s*::\s*<\s*([\p{L}\p{N}_<>,: >]+)\s*>\s*\)/gu;
 
 const NEXT_STATE_PENDING_RE = /NextState\s*::\s*Pending\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
-const NEXT_STATE_SET_RE = /next_state\s*\.\s*set\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
+const NEXT_STATE_SET_RE = /[\p{L}\p{N}_]+\s*\.\s*set\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
 const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
 // ComputedStates: extract impl blocks via brace-depth (regex [^}]*? breaks on
 // nested fn bodies). Keyed by short name (last ::-segment) so that

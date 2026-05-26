@@ -236,6 +236,7 @@ publish actions on shared state. Write the files, hand the user the commands.
 - The `0.9.x` line is in active multi-agent rollout. Any change to `src/installer/` (especially `targets/`) needs corresponding test coverage and a CHANGELOG entry — installer regressions break every new install silently.
 - When changing what the MCP tools do or how agents should use them, update **all three** of `src/mcp/server-instructions.ts`, `src/installer/instructions-template.ts`, and `.cursor/rules/codegraph.mdc` — they're written to different places but say the same thing.
 - CodeGraph provides **code context**, not product requirements. For new features, ask the user about UX, edge cases, and acceptance criteria — the graph won't tell you.
+- **Regex must match by type/function/method name, never by variable name.** When writing a regex to detect API usage patterns, match the invariant part — the type path (`NextState::Pending`), function name (`in_state`), or method call (`.add_systems(` with leading dot). Never hardcode a variable name like `next_state`, `commands`, `app`, or `router` — those are developer-chosen identifiers; CJK names, abbreviations, or any other valid identifier will silently break the pattern. Use generic identifier classes (`[\p{L}\p{N}_]+`, `\w+`) for the receiver/variable slot. The Go framework resolver (`frameworks/go.ts:95`) does this correctly with `\b\w+\.(GET|POST|...)` — follow that pattern.
 
 ## Branch relationships
 
