@@ -60,6 +60,8 @@ export interface ExtractorContext {
   pushScope(nodeId: string): void;
   /** Pop the last node ID from the scope stack */
   popScope(): void;
+  /** Extract type references from a subtree (e.g. generic_type, scoped_type_identifier, type_arguments) */
+  extractTypeRefsFromSubtree(node: SyntaxNode, fromNodeId: string, insideTypeArgs?: boolean): void;
   /** Current file path */
   readonly filePath: string;
   /** Current source text */
@@ -68,6 +70,20 @@ export interface ExtractorContext {
   readonly nodeStack: readonly string[];
   /** All nodes extracted so far */
   readonly nodes: readonly Node[];
+}
+
+/**
+ * Context passed to the postExtract hook after the AST has been fully traversed.
+ * Provides access to the extraction state for fallback scanning (e.g. Bevy regex patterns).
+ */
+export interface PostExtractContext {
+  readonly filePath: string;
+  readonly source: string;
+  readonly nodes: readonly Node[];
+  readonly unresolvedReferences: readonly UnresolvedReference[];
+  addUnresolvedReference(ref: UnresolvedReference): void;
+  /** Get the caller node ID for a given line number (1-based) */
+  getCallerByLine(line: number): string | undefined;
 }
 
 /**
@@ -212,4 +228,33 @@ export interface LanguageExtractor {
    * Returns the callee name if this node is a bare call, or undefined if not.
    */
   extractBareCall?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
+   * If true, the extractor should NOT skip struct/enum nodes without a body field.
+   * Rust unit structs (struct Foo;) and tuple structs (struct Foo(i32);) are valid
+   * definitions without a body field, so Rust sets this to true.
+   */
+  noForwardDeclarations?: boolean;
+
+  /**
+   * Called after extractCall has emitted the base calls edge.
+   * Lets the language hook add framework-specific side effects
+   * (e.g. Bevy API scanning for add_systems/OnEnter/state constructors).
+   */
+  onExtractCall?: (node: SyntaxNode, callerId: string, calleeName: string, ctx: ExtractorContext) => void;
+
+  /**
+   * Custom dispatch within visitFunctionBody for language-specific node types.
+   * Return true if the node was fully handled (skip default body recursion).
+   * Called for every child visited inside a function body — receives the AST node
+   * and the closure that recurses into children (call it for manual child walking).
+   */
+  visitNodeInBody?: (node: SyntaxNode, visitChildren: (node: SyntaxNode) => void, ctx: ExtractorContext) => boolean;
+
+  /**
+   * Called after the full AST traversal completes (after visitNode on root).
+   * Lets the language hook do regex-based fallback scanning that needs the
+   * complete set of extracted nodes (e.g. Bevy add_systems fallback).
+   */
+  postExtract?: (ctx: PostExtractContext) => void;
 }

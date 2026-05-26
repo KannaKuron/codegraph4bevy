@@ -136,7 +136,6 @@ export class MCPEngine {
     if (this.closed) return;
     this.closed = true;
     this.toolHandler.closeAll();
-    this.toolHandler.setDefaultCodeGraph(null as any);
     if (this.cg) {
       try { this.cg.close(); } catch { /* ignore */ }
       this.cg = null;

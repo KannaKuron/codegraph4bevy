@@ -58,14 +58,14 @@ export type EdgeKind =
   | 'instantiates'    // Creates instance of class
   | 'overrides'       // Method overrides parent method
   | 'decorates'       // Decorator applied to symbol
-  | 'pattern_match'   // Match/if-let pattern references an enum variant
-  | 'runs_in'         // Bevy: system runs in a schedule
-  | 'on_enter'        // Bevy: handler registered via OnEnter(state)
-  | 'on_exit'         // Bevy: handler registered via OnExit(state)
-  | 'registers_resource'  // Bevy: plugin registers a resource
-  | 'registers_message'   // Bevy: plugin registers a message
-  | 'contains_plugin'     // Bevy: PluginGroup contains a plugin
-  | 'registers_system';   // Bevy: plugin registers a system (internal)
+  | 'pattern_match'   // Match arm pattern references (Rust/Bevy enum variants)
+  | 'registers_system'  // Bevy: Plugin registers a system
+  | 'runs_in'          // Bevy: System runs in a schedule
+  | 'registers_resource' // Bevy: Plugin registers a resource
+  | 'registers_message'  // Bevy: Plugin registers an event/message
+  | 'contains_plugin'    // Bevy: PluginGroup contains a Plugin
+  | 'on_enter'          // Bevy: State enter transition
+  | 'on_exit';          // Bevy: State exit transition
 
 /**
  * Supported programming languages. See NODE_KINDS for why this is a
@@ -516,13 +516,10 @@ export interface BuildContextOptions {
   /** Graph traversal depth from entry points (default: 2) */
   traversalDepth?: number;
 
-  /** Minimum semantic similarity score (default: 5) */
+  /** Minimum semantic similarity score (default: 0.3) */
   minScore?: number;
 }
 
-/**
- * Per-entry-point usage statistics for inline rendering in context output.
- */
 export interface EntryPointUsage {
   nodeId: string;
   callerCount: number;
@@ -553,7 +550,7 @@ export interface TaskContext {
   /** Brief summary of the context */
   summary: string;
 
-  /** Per-entry-point usage stats for inline rendering */
+  /** Entry point usage statistics */
   entryPointUsage?: EntryPointUsage[];
 
   /** Statistics about the context */
@@ -584,7 +581,7 @@ export interface FindRelevantContextOptions {
   /** Maximum nodes in result (default: 50) */
   maxNodes?: number;
 
-  /** Minimum semantic similarity score (default: 5) */
+  /** Minimum semantic similarity score (default: 0.3) */
   minScore?: number;
 
   /** Edge types to follow in traversal */
