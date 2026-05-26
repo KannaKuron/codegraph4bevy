@@ -329,6 +329,20 @@ export class CodeGraph {
       try {
         const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
 
+        // Re-detect frameworks now that the index is populated. The resolver
+        // is constructed with createResolver() before any files exist, so
+        // framework resolvers whose detect() consults the indexed file list
+        // (e.g. UIKit/SwiftUI scanning for imports, swift-objc-bridge looking
+        // for both Swift and ObjC files) all return false on that initial pass
+        // and silently drop themselves. Re-initializing here gives them a
+        // chance to see the actual project before resolution runs.
+        if (result.success && result.filesIndexed > 0) {
+          this.resolver.initialize();
+          // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
+          // before resolution so updated names show up in subsequent reads.
+          this.resolver.runPostExtract();
+        }
+
         // Resolve references to create call/import/extends edges
         if (result.success && result.filesIndexed > 0) {
           // Get count without loading all refs into memory
@@ -396,6 +410,14 @@ export class CodeGraph {
       }
       try {
         const result = await this.orchestrator.sync(options.onProgress);
+
+        // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
+        // every sync that touched files so edits to `app.module.ts` propagate
+        // to controllers in unchanged files. The pass is idempotent and cheap
+        // (regex over *.module.ts only).
+        if (result.filesAdded > 0 || result.filesModified > 0) {
+          this.resolver.runPostExtract();
+        }
 
         // Resolve references if files were updated
         if (result.filesAdded > 0 || result.filesModified > 0) {
