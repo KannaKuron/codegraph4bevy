@@ -1819,7 +1819,7 @@ export class ToolHandler {
    */
   private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): string {
     try {
-      const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
+      const CALLABLE = new Set(['method', 'function', 'component', 'constructor', 'enum', 'struct']);
       // Strip only a REAL file extension (Create.cs → Create); KEEP qualified
       // names (Class.method / Class::method) — the agent's most precise input,
       // resolved exactly by findAllSymbols. (The old strip mangled Class.method

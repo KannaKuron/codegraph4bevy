@@ -543,6 +543,12 @@ const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)
 // nested fn bodies). Keyed by short name (last ::-segment) so that
 // crate::IntroState matches IntroState::Done via startsWith('IntroState::').
 const IMPL_HEADER_RE = /impl\s+ComputedStates\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)(?:\s+where\s+[^{]+)?\s*\{/gu;
+const ADD_SYSTEMS_ONENTER_RE = /\.add_systems\s*\(\s*OnEnter\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*,\s*([\p{L}\p{N}_]+)/gu;
+const ADD_SYSTEMS_ONEXIT_RE = /\.add_systems\s*\(\s*OnExit\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*,\s*([\p{L}\p{N}_]+)/gu;
+
+// SubStates: #[source(ParentType = ParentType::Variant)] pub enum Name {
+const SUBSTATES_SOURCE_RE = /#\[\s*source\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*=\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?enum\s+([\p{L}\p{N}_]+)\s*\{/gu;
+const DEFAULT_VARIANT_RE = /#\[\s*default\s*\]\s*([\p{L}\p{N}_]+)/gu;
 
 /** Angle-bracket-aware comma splitter for tuple SourceTypes. */
 function splitTypeList(spec: string): string[] {
@@ -600,6 +606,60 @@ function extractComputedStatesSources(content: string): Map<string, string[]> {
     }
   }
   return result;
+}
+
+interface SubStatesMapping {
+  subStateName: string;
+  parentVariantFull: string;
+  defaultVariant: string;
+}
+
+/** Extract SubStates #[source(...)] + #[default] variant from stripped Rust source. */
+function extractSubStatesSources(content: string): SubStatesMapping[] {
+  const results: SubStatesMapping[] = [];
+  SUBSTATES_SOURCE_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = SUBSTATES_SOURCE_RE.exec(content))) {
+    const parentTypeRaw = m[1]!.replace(/\s+/g, '');
+    const parentVariantRaw = m[2]!.replace(/\s+/g, '');
+    const subStateName = m[3]!;
+    const parentTypeShort = parentTypeRaw.split('::').filter(p => p.length > 0).pop() ?? parentTypeRaw;
+    const parentVariantParts = parentVariantRaw.split('::').filter(p => p.length > 0);
+    // Determine the parent variant: use last segment, but if it matches the type name,
+    // use the segment before it (e.g. 游戏流程_状态::开场 → 开场, but Parent::V → V)
+    let qualifyingVariant: string;
+    if (parentVariantParts.length >= 2) {
+      qualifyingVariant = parentVariantParts[parentVariantParts.length - 1]!;
+    } else {
+      qualifyingVariant = parentVariantParts[0]!;
+    }
+    const parentVariantFull = parentTypeShort + '::' + qualifyingVariant;
+
+    // Extract enum body by brace-depth counting
+    const bodyStart = m.index + m[0].length;
+    let depth = 1;
+    let i = bodyStart;
+    while (i < content.length && depth > 0) {
+      if (content[i] === '{') depth++;
+      else if (content[i] === '}') depth--;
+      i++;
+    }
+    SUBSTATES_SOURCE_RE.lastIndex = i;
+    const body = content.slice(bodyStart, i - 1);
+
+    // Find #[default] variant in the body
+    DEFAULT_VARIANT_RE.lastIndex = 0;
+    let dm: RegExpExecArray | null;
+    while ((dm = DEFAULT_VARIANT_RE.exec(body))) {
+      results.push({
+        subStateName,
+        parentVariantFull,
+        defaultVariant: dm[1]!,
+      });
+      break; // Only need the first #[default]
+    }
+  }
+  return results;
 }
 
 // Strip Rust line (//) and block (/* */) comments, strings, char literals,
@@ -814,6 +874,12 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
     }
   }
 
+  // Pre-scan: extract SubStates #[source(...)] mappings.
+  const subStatesMappings: SubStatesMapping[] = [];
+  for (const [, content] of strippedByFile) {
+    subStatesMappings.push(...extractSubStatesSources(content));
+  }
+
   // Main scan: find producers and consumers using cached stripped content.
   for (const [file, content] of strippedByFile) {
     const fileNodes = ctx.getNodesInFile(file);
@@ -864,6 +930,54 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
     }
   }
 
+  // Phase 2b: OnEnter/OnExit consumer detection — app.add_systems(OnEnter(X), handler)
+  for (const [file, content] of strippedByFile) {
+    const fileNodes = ctx.getNodesInFile(file);
+    const fnByName = new Map<string, Node>();
+    for (const n of fileNodes) {
+      if ((n.kind === 'function' || n.kind === 'method') && n.name) {
+        if (!fnByName.has(n.name)) fnByName.set(n.name, n);
+      }
+    }
+    for (const re of [ADD_SYSTEMS_ONENTER_RE, ADD_SYSTEMS_ONEXIT_RE]) {
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(content))) {
+        const stateRaw = m[1]!.trim();
+        const handlerName = m[2]!.trim();
+        const { full, variant } = normalizeStateName(stateRaw);
+        const line = content.substring(0, m.index).split('\n').length;
+        let handlerNode = fnByName.get(handlerName);
+        if (!handlerNode) {
+          const globalNodes = ctx.getNodesByName(handlerName);
+          handlerNode = globalNodes.length > 0 ? globalNodes[0] : undefined;
+        }
+        if (!handlerNode) continue;
+        const entry = ensure(variant);
+        entry.consumers.set(handlerNode.id + '\0' + full, { line, full });
+      }
+    }
+  }
+
+  // Phase 2c: SubStates virtual producers — when a producer sets ParentState::QualifyingVariant,
+  // register it as a virtual producer of SubState::DefaultVariant so Phase 3 connects it to
+  // SubState's OnEnter/OnExit consumers.
+  for (const mapping of subStatesMappings) {
+    const { parentVariantFull, subStateName, defaultVariant } = mapping;
+    const { full: normalizedParentFull, variant: parentVar } = normalizeStateName(parentVariantFull);
+    const parentEntry = states.get(parentVar);
+    if (!parentEntry) continue;
+    for (const [producerKey, pInfo] of parentEntry.producers) {
+      if (pInfo.full !== normalizedParentFull && pInfo.full !== parentVar) continue;
+      const virtualFull = subStateName + '::' + defaultVariant;
+      const subEntry = ensure(defaultVariant);
+      const virtualKey = producerKey.split('\0')[0]! + '\0' + virtualFull;
+      if (!subEntry.producers.has(virtualKey)) {
+        subEntry.producers.set(virtualKey, { line: pInfo.line, full: virtualFull });
+      }
+    }
+  }
+
   // Direct (non-transitive) state edges — processed BEFORE transitive so direct
   // edges (with exact stateName) claim dedup keys first; transitive edges fill gaps.
   for (const [stateKey, data] of states) {
@@ -891,15 +1005,18 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
     }
   }
 
-  // Transitive ComputedStates propagation: producers of a source state reach
-  // consumers of a computed state derived from it.  Built as direct edges to
-  // avoid cross-enum guard and variant-name collision issues with the states map.
-  const MAX_TRANSITIVE_PER_SOURCE = 100;
-  const GLOBAL_TRANSITIVE_CAP = 300;
-  let globalTransitiveCount = 0;
+  // ComputedStates intermediate-node edges: source producer → computed state struct/enum
+  // node → consumer.  Edges pass through the computed state node so trace, callers,
+  // callees, and impact all show it as a meaningful intermediate hop — instead of
+  // bypassing it with a direct function→function transitive edge.
+  const MAX_COMPUTED_PER_SOURCE = 200;
+  const GLOBAL_COMPUTED_CAP = 600;
+  let globalComputedCount = 0;
+
   for (const [sourceTypeName, computedNames] of computedFromSource) {
-    if (globalTransitiveCount >= GLOBAL_TRANSITIVE_CAP) break;
-    // Phase 1: collect all producers of the source state
+    if (globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
+
+    // Collect all producers of the source state type
     const sourceProducers = new Map<string, { line: number; full: string }>();
     for (const [, data] of states) {
       for (const [producerKey, pInfo] of data.producers) {
@@ -909,45 +1026,65 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
       }
     }
     if (sourceProducers.size === 0) continue;
-    // Phase 2: find consumers that reference a computed state and emit edges directly
+
     let perSourceCount = 0;
-    for (const [, data] of states) {
-      if (data.consumers.size === 0) continue;
-      for (const [consumerKey, cInfo] of data.consumers) {
-        let matchedComputed: string | undefined;
-        for (const computedName of computedNames) {
-          if (cInfo.full === computedName || cInfo.full.startsWith(computedName + '::')) {
-            matchedComputed = computedName;
-            break;
-          }
-        }
-        if (!matchedComputed) continue;
-        for (const [producerKey, pInfo] of sourceProducers) {
-          const producerId = producerKey.split('\0')[0]!;
+    for (const computedName of computedNames) {
+      if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
+
+      // Find the computed state struct/enum node
+      const computedNodes = ctx.getNodesByName(computedName);
+      const computedNode = computedNodes.find((n) => n.kind === 'struct' || n.kind === 'enum');
+      if (!computedNode) continue;
+
+      // Edge: source producer → computed state node
+      for (const [producerKey, pInfo] of sourceProducers) {
+        if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
+        const producerId = producerKey.split('\0')[0]!;
+        const dedupKey = `${producerId}>${computedNode.id}`;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
+        edges.push({
+          source: producerId,
+          target: computedNode.id,
+          kind: 'calls',
+          line: pInfo.line,
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'bevy-ecs-state',
+            computedState: computedName,
+            transitiveVia: sourceTypeName,
+          },
+        });
+        perSourceCount++;
+        globalComputedCount++;
+      }
+
+      // Edge: computed state node → consumer
+      for (const [, data] of states) {
+        if (data.consumers.size === 0) continue;
+        for (const [consumerKey, cInfo] of data.consumers) {
+          if (cInfo.full !== computedName && !cInfo.full.startsWith(computedName + '::')) continue;
+          if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
           const consumerId = consumerKey.split('\0')[0]!;
-          if (producerId === consumerId) continue;
-          const dedupKey = `${producerId}>${consumerId}`;
+          const dedupKey = `${computedNode.id}>${consumerId}`;
           if (seen.has(dedupKey)) continue;
-          if (perSourceCount >= MAX_TRANSITIVE_PER_SOURCE || globalTransitiveCount >= GLOBAL_TRANSITIVE_CAP) break;
           seen.add(dedupKey);
           edges.push({
-            source: producerId,
+            source: computedNode.id,
             target: consumerId,
             kind: 'calls',
-            line: pInfo.line,
+            line: cInfo.line,
             provenance: 'heuristic',
             metadata: {
               synthesizedBy: 'bevy-ecs-state',
-              stateName: matchedComputed,
-              transitiveVia: sourceTypeName,
+              computedState: computedName,
             },
           });
           perSourceCount++;
-          globalTransitiveCount++;
+          globalComputedCount++;
         }
-        if (perSourceCount >= MAX_TRANSITIVE_PER_SOURCE || globalTransitiveCount >= GLOBAL_TRANSITIVE_CAP) break;
+        if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
       }
-      if (perSourceCount >= MAX_TRANSITIVE_PER_SOURCE || globalTransitiveCount >= GLOBAL_TRANSITIVE_CAP) break;
     }
   }
 

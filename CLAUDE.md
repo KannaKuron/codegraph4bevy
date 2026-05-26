@@ -249,20 +249,60 @@ publish actions on shared state. Write the files, hand the user the commands.
 
 | Remote | URL | Usage |
 |---|---|---|
-| `origin` | `github.com/colbymchenry/codegraph` | Upstream — fetch only, **never push** |
-| `fork` | `github.com/KannaKuron/codegraph4bevy` | Personal fork — **all pushes go here** |
+| `origin` | `github.com/KannaKuron/codegraph4bevy` | Personal fork — **可推送** |
+| `fork` | `github.com/KannaKuron/codegraph4bevy` | Personal fork — **可推送**（与 origin 相同） |
+| `upstream` | `github.com/colbymchenry/codegraph` | Upstream — fetch only, **never push** |
 
 ### Git workflow rules
 
 - **"合并" always means merge into `buk-备份-个人改造适配分支不pr给原项目` for backup**, NOT into `main`
-- **"推送" always means `git push fork`** to the personal fork, never `git push origin`
-- **`main` only accepts upstream changes**: `git fetch origin` → merge into working branch
+- **"推送" means `git push origin` or `git push fork`**（两者相同，都推到个人 fork）
+- **`main` only accepts upstream changes**: `git fetch upstream` → merge into working branch
 - Key conflict areas on merge: `src/mcp/tools.ts`, `src/extraction/tree-sitter.ts`
 
-### Syncing from upstream
+### Syncing from upstream — 逐个检查，禁止直接合并
+
+**绝对不能 `git merge upstream/main` 直接合入工作分支。** 上游可能做了大重构，直接合并会导致冲突爆炸或静默覆盖个人修改。必须逐个 commit/文件检查后手动挑选。
+
+#### 第一步：同步本地 main 到上游
 
 ```bash
-git fetch origin && git merge origin/main
+git fetch upstream
+git branch -f main upstream/main    # 不切换分支，强制对齐本地 main
+git push origin main                # 推到 fork 的 remote main
+```
+
+#### 第二步：审查上游变更
+
+```bash
+# 查看上游有哪些新 commit
+git log HEAD..upstream/main --oneline
+
+# 查看上游改了哪些文件，哪些与自己有重叠
+git diff HEAD..upstream/main --stat
+```
+
+#### 第三步：逐个文件/commit 检查后手动合并
+
+对每个上游变更的文件，**先读 diff 判断影响**，再决定：
+- **无冲突的纯新增文件**（上游新增、自己没改过的）：直接 `git checkout upstream/main -- <file>` 拿过来
+- **有重叠的文件**：必须逐段对比，理解上游重构意图，在个人修改基础上手工整合
+- **上游删掉的文件**：确认自己的功能是否还在，决定保留还是跟随删除
+
+```bash
+# 查看某个文件的上游 diff
+git diff HEAD..upstream/main -- <file>
+
+# 拿取无冲突的单个文件
+git checkout upstream/main -- <file>
+
+# 有冲突的文件：Read 双方版本后手工 Edit
+```
+
+#### 第四步：验证
+
+```bash
+npm run build && npx vitest run
 ```
 
 ### Committing and backing up
@@ -273,7 +313,7 @@ git checkout "个人改造适配分支不pr给原项目"
 # ... make changes, commit ...
 git checkout "buk-备份-个人改造适配分支不pr给原项目" && git merge "个人改造适配分支不pr给原项目"
 git checkout "个人改造适配分支不pr给原项目"
-git push fork "个人改造适配分支不pr给原项目" "buk-备份-个人改造适配分支不pr给原项目"
+git push origin "个人改造适配分支不pr给原项目" "buk-备份-个人改造适配分支不pr给原项目"
 ```
 
 After merge: `npm run build && npx vitest run` to verify. Prefer keeping upstream's structural refactors; layer personal changes on top.

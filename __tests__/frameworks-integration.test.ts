@@ -496,16 +496,21 @@ describe('Bevy ECS state transition synthesis', () => {
     expect(finishIntro).toBeDefined();
     expect(onLoading).toBeDefined();
 
-    const edges = cg.getOutgoingEdges(finishIntro!.id);
-    const toConsumer = edges.find((e) => e.target === onLoading!.id && e.kind === 'calls');
-    expect(toConsumer, 'finish_intro should reach on_loading_complete via ComputedStates bridge').toBeDefined();
+    // ComputedStates edges pass through the computed state node
+    const enums = cg.getNodesByKind('enum');
+    const loadingPhase = enums.find((n) => n.name === 'LoadingPhase');
+    expect(loadingPhase, 'LoadingPhase enum node should exist').toBeDefined();
 
-    if (toConsumer) {
-      expect(toConsumer.provenance).toBe('heuristic');
-      const meta = toConsumer.metadata as Record<string, unknown>;
-      expect(meta?.synthesizedBy).toBe('bevy-ecs-state');
-      expect(meta?.transitiveVia).toBe('IntroState');
-    }
+    // Step 1: finish_intro → LoadingPhase (source producer → computed state node)
+    const edgesToComputed = cg.getOutgoingEdges(finishIntro!.id);
+    const toComputed = edgesToComputed.find((e) => e.target === loadingPhase!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputed, 'finish_intro should reach LoadingPhase via ComputedStates').toBeDefined();
+    expect((toComputed!.metadata as Record<string, unknown>)?.transitiveVia).toBe('IntroState');
+
+    // Step 2: LoadingPhase → on_loading_complete (computed state node → consumer)
+    const edgesFromComputed = cg.getOutgoingEdges(loadingPhase!.id);
+    const toConsumer = edgesFromComputed.find((e) => e.target === onLoading!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toConsumer, 'LoadingPhase should reach on_loading_complete').toBeDefined();
 
     cg.close();
   });
@@ -583,14 +588,21 @@ describe('Bevy ECS state transition synthesis', () => {
     expect(producer).toBeDefined();
     expect(consumer).toBeDefined();
 
-    const edges = cg.getOutgoingEdges(producer!.id);
-    const toConsumer = edges.find((e) => e.target === consumer!.id && e.kind === 'calls');
-    expect(toConsumer, 'CJK producer should reach CJK consumer via ComputedStates').toBeDefined();
+    // ComputedStates edges pass through the computed state node
+    const enums = cg.getNodesByKind('enum');
+    const computedNode = enums.find((n) => n.name === '开场与基础素材_加载_阶段完成');
+    expect(computedNode, 'computed state enum node should exist').toBeDefined();
 
-    if (toConsumer) {
-      const meta = toConsumer.metadata as Record<string, unknown>;
-      expect(meta?.transitiveVia).toBe('片头播放_状态');
-    }
+    // Step 1: producer → computed state node
+    const edgesToComputed = cg.getOutgoingEdges(producer!.id);
+    const toComputed = edgesToComputed.find((e) => e.target === computedNode!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputed, 'CJK producer should reach computed state node').toBeDefined();
+    expect((toComputed!.metadata as Record<string, unknown>)?.transitiveVia).toBe('片头播放_状态');
+
+    // Step 2: computed state node → consumer
+    const edgesFromComputed = cg.getOutgoingEdges(computedNode!.id);
+    const toConsumer = edgesFromComputed.find((e) => e.target === consumer!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toConsumer, 'computed state node should reach CJK consumer').toBeDefined();
 
     cg.close();
   });
@@ -640,14 +652,23 @@ describe('Bevy ECS state transition synthesis', () => {
     const setBDone = fns.find((n) => n.name === 'set_b_done');
     const onReady = fns.find((n) => n.name === 'on_ready');
 
-    // Both source state producers should reach the computed state consumer
+    const enums = cg.getNodesByKind('enum');
+    const combinedState = enums.find((n) => n.name === 'CombinedState');
+    expect(combinedState, 'CombinedState enum node should exist').toBeDefined();
+
+    // Both source producers reach the computed state node
     const edgesA = cg.getOutgoingEdges(setADone!.id);
-    const toReadyFromA = edgesA.find((e) => e.target === onReady!.id && e.kind === 'calls');
-    expect(toReadyFromA, 'set_a_done should reach on_ready via tuple SourceStates').toBeDefined();
+    const toComputedFromA = edgesA.find((e) => e.target === combinedState!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputedFromA, 'set_a_done should reach CombinedState via tuple SourceStates').toBeDefined();
 
     const edgesB = cg.getOutgoingEdges(setBDone!.id);
-    const toReadyFromB = edgesB.find((e) => e.target === onReady!.id && e.kind === 'calls');
-    expect(toReadyFromB, 'set_b_done should reach on_ready via tuple SourceStates').toBeDefined();
+    const toComputedFromB = edgesB.find((e) => e.target === combinedState!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputedFromB, 'set_b_done should reach CombinedState via tuple SourceStates').toBeDefined();
+
+    // Computed state node reaches the consumer
+    const edgesFromComputed = cg.getOutgoingEdges(combinedState!.id);
+    const toReady = edgesFromComputed.find((e) => e.target === onReady!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toReady, 'CombinedState should reach on_ready').toBeDefined();
 
     cg.close();
   });
@@ -694,9 +715,17 @@ describe('Bevy ECS state transition synthesis', () => {
     expect(finishIntro).toBeDefined();
     expect(onLoading).toBeDefined();
 
-    const edges = cg.getOutgoingEdges(finishIntro!.id);
-    const toConsumer = edges.find((e) => e.target === onLoading!.id && e.kind === 'calls');
-    expect(toConsumer, 'finish_intro should reach on_loading_complete even with fn before SourceStates').toBeDefined();
+    const enums = cg.getNodesByKind('enum');
+    const loadingPhase = enums.find((n) => n.name === 'LoadingPhase');
+
+    // finish_intro → LoadingPhase → on_loading_complete (two-hop)
+    const edgesToComputed = cg.getOutgoingEdges(finishIntro!.id);
+    const toComputed = edgesToComputed.find((e) => e.target === loadingPhase!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputed, 'finish_intro should reach LoadingPhase even with fn before SourceStates').toBeDefined();
+
+    const edgesFromComputed = cg.getOutgoingEdges(loadingPhase!.id);
+    const toConsumer = edgesFromComputed.find((e) => e.target === onLoading!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toConsumer, 'LoadingPhase should reach on_loading_complete').toBeDefined();
 
     cg.close();
   });
@@ -740,9 +769,17 @@ describe('Bevy ECS state transition synthesis', () => {
     expect(finishIntro).toBeDefined();
     expect(onLoading).toBeDefined();
 
-    const edges = cg.getOutgoingEdges(finishIntro!.id);
-    const toConsumer = edges.find((e) => e.target === onLoading!.id && e.kind === 'calls');
-    expect(toConsumer, 'qualified paths should normalize and bridge').toBeDefined();
+    const enums = cg.getNodesByKind('enum');
+    const loadingPhase = enums.find((n) => n.name === 'LoadingPhase');
+
+    // Two-hop: finish_intro → LoadingPhase → on_loading_complete
+    const edgesToComputed = cg.getOutgoingEdges(finishIntro!.id);
+    const toComputed = edgesToComputed.find((e) => e.target === loadingPhase!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputed, 'qualified paths should normalize and bridge to computed state node').toBeDefined();
+
+    const edgesFromComputed = cg.getOutgoingEdges(loadingPhase!.id);
+    const toConsumer = edgesFromComputed.find((e) => e.target === onLoading!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toConsumer, 'computed state node should reach consumer').toBeDefined();
 
     cg.close();
   });
@@ -954,6 +991,645 @@ describe('Bevy ECS state transition synthesis', () => {
     const edges = cg.getOutgoingEdges(producer!.id);
     const toConsumer = edges.find((e) => e.target === consumer!.id && e.kind === 'calls');
     expect(toConsumer, 'producer should reach consumer — content before unclosed raw string preserved').toBeDefined();
+
+    cg.close();
+  });
+
+  it('OnEnter registers handler as state consumer', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-onenter-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum GameState { #[default] Menu, Playing }\n' +
+        '\n' +
+        'fn start_game(mut next_state: ResMut<NextState<GameState>>) {\n' +
+        '    next_state.set(GameState::Playing);\n' +
+        '}\n' +
+        '\n' +
+        'fn spawn_player() {\n' +
+        '    // setup\n' +
+        '}\n' +
+        '\n' +
+        'struct GamePlugin;\n' +
+        'impl Plugin for GamePlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(GameState::Playing), spawn_player);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const startGame = fns.find((n) => n.name === 'start_game');
+    const spawnPlayer = fns.find((n) => n.name === 'spawn_player');
+    expect(startGame).toBeDefined();
+    expect(spawnPlayer).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(startGame!.id);
+    const toSpawn = edges.find((e) => e.target === spawnPlayer!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toSpawn, 'OnEnter handler should be reachable from state producer').toBeDefined();
+    expect((toSpawn!.metadata as Record<string, unknown>)?.synthesizedBy).toBe('bevy-ecs-state');
+    expect((toSpawn!.metadata as Record<string, unknown>)?.stateName).toBe('Playing');
+
+    cg.close();
+  });
+
+  it('OnExit registers handler as state consumer', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-onexit-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum GameState { #[default] Menu, Playing }\n' +
+        '\n' +
+        'fn end_game(mut next_state: ResMut<NextState<GameState>>) {\n' +
+        '    next_state.set(GameState::Menu);\n' +
+        '}\n' +
+        '\n' +
+        'fn cleanup_level() {\n' +
+        '    // teardown\n' +
+        '}\n' +
+        '\n' +
+        'struct GamePlugin;\n' +
+        'impl Plugin for GamePlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnExit(GameState::Playing), cleanup_level);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const endGame = fns.find((n) => n.name === 'end_game');
+    const cleanupLevel = fns.find((n) => n.name === 'cleanup_level');
+    expect(endGame).toBeDefined();
+    expect(cleanupLevel).toBeDefined();
+
+    // end_game sets Menu; cleanup_level is OnExit(Playing). Different variants, no edge.
+    const edges = cg.getOutgoingEdges(endGame!.id);
+    const toCleanup = edges.find((e) => e.target === cleanupLevel!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toCleanup, 'different variant: Menu producer should not reach Playing OnExit').toBeUndefined();
+
+    cg.close();
+  });
+
+  it('bridges ComputedStates via OnEnter handler (N11 regression)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-cs-onenter-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum IntroState { #[default] Playing, Done }\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum LoadingPhase { #[default] NotStarted, Complete }\n' +
+        '\n' +
+        'impl ComputedStates for LoadingPhase {\n' +
+        '    type SourceStates = IntroState;\n' +
+        '}\n' +
+        '\n' +
+        'fn finish_intro(mut next_state: ResMut<NextState<IntroState>>) {\n' +
+        '    next_state.set(IntroState::Done);\n' +
+        '}\n' +
+        '\n' +
+        'fn on_loading_complete() {\n' +
+        '    // setup\n' +
+        '}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(LoadingPhase::Complete), on_loading_complete);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const finishIntro = fns.find((n) => n.name === 'finish_intro');
+    const onLoading = fns.find((n) => n.name === 'on_loading_complete');
+    expect(finishIntro).toBeDefined();
+    expect(onLoading).toBeDefined();
+
+    const enums = cg.getNodesByKind('enum');
+    const loadingPhase = enums.find((n) => n.name === 'LoadingPhase');
+
+    // Two-hop: finish_intro → LoadingPhase → on_loading_complete
+    const edgesToComputed = cg.getOutgoingEdges(finishIntro!.id);
+    const toComputed = edgesToComputed.find((e) => e.target === loadingPhase!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputed, 'finish_intro should reach LoadingPhase via ComputedStates').toBeDefined();
+    expect((toComputed!.metadata as Record<string, unknown>)?.transitiveVia).toBe('IntroState');
+
+    const edgesFromComputed = cg.getOutgoingEdges(loadingPhase!.id);
+    const toConsumer = edgesFromComputed.find((e) => e.target === onLoading!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toConsumer, 'LoadingPhase should reach OnEnter handler').toBeDefined();
+
+    cg.close();
+  });
+
+  it('handles CJK state names in OnEnter registration', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-cjk-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum 片头状态 { #[default] 播放中, 完成 }\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum 加载阶段 { #[default] 未开始, 完成 }\n' +
+        '\n' +
+        'impl ComputedStates for 加载阶段 {\n' +
+        '    type SourceStates = 片头状态;\n' +
+        '}\n' +
+        '\n' +
+        'fn 更新_片头计时(mut next_state: ResMut<NextState<片头状态>>) {\n' +
+        '    next_state.set(片头状态::完成);\n' +
+        '}\n' +
+        '\n' +
+        'fn 生成_主菜单() {\n' +
+        '    // setup\n' +
+        '}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(加载阶段::完成), 生成_主菜单);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const updateTimer = fns.find((n) => n.name === '更新_片头计时');
+    const spawnMenu = fns.find((n) => n.name === '生成_主菜单');
+    expect(updateTimer).toBeDefined();
+    expect(spawnMenu).toBeDefined();
+
+    const enums = cg.getNodesByKind('enum');
+    const loadingPhase = enums.find((n) => n.name === '加载阶段');
+
+    // Two-hop: 更新_片头计时 → 加载阶段 → 生成_主菜单
+    const edgesToComputed = cg.getOutgoingEdges(updateTimer!.id);
+    const toComputed = edgesToComputed.find((e) => e.target === loadingPhase!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputed, 'CJK state names should bridge to computed state node').toBeDefined();
+
+    const edgesFromComputed = cg.getOutgoingEdges(loadingPhase!.id);
+    const toSpawn = edgesFromComputed.find((e) => e.target === spawnMenu!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toSpawn, 'computed state node should reach CJK OnEnter handler').toBeDefined();
+
+    cg.close();
+  });
+
+  it('detects multiple OnEnter handlers in chained add_systems', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-chain-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum GameState { #[default] Menu, Playing, GameOver }\n' +
+        '\n' +
+        'fn start_game(mut next_state: ResMut<NextState<GameState>>) {\n' +
+        '    next_state.set(GameState::Playing);\n' +
+        '}\n' +
+        '\n' +
+        'fn end_game(mut next_state: ResMut<NextState<GameState>>) {\n' +
+        '    next_state.set(GameState::GameOver);\n' +
+        '}\n' +
+        '\n' +
+        'fn spawn_player() {}\n' +
+        'fn show_game_over() {}\n' +
+        '\n' +
+        'struct GamePlugin;\n' +
+        'impl Plugin for GamePlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(GameState::Playing), spawn_player)\n' +
+        '           .add_systems(OnEnter(GameState::GameOver), show_game_over);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const startGame = fns.find((n) => n.name === 'start_game');
+    const endGame = fns.find((n) => n.name === 'end_game');
+    const spawnPlayer = fns.find((n) => n.name === 'spawn_player');
+    const showGameOver = fns.find((n) => n.name === 'show_game_over');
+
+    expect(startGame).toBeDefined();
+    expect(endGame).toBeDefined();
+
+    // start_game → spawn_player (OnEnter Playing)
+    const edgesStart = cg.getOutgoingEdges(startGame!.id);
+    const toSpawn = edgesStart.find((e) => e.target === spawnPlayer!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toSpawn, 'start_game should reach spawn_player via OnEnter(Playing)').toBeDefined();
+
+    // end_game → show_game_over (OnEnter GameOver)
+    const edgesEnd = cg.getOutgoingEdges(endGame!.id);
+    const toGameOver = edgesEnd.find((e) => e.target === showGameOver!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toGameOver, 'end_game should reach show_game_over via OnEnter(GameOver)').toBeDefined();
+
+    // Cross-variant: start_game should NOT reach show_game_over
+    const cross = edgesStart.find((e) => e.target === showGameOver!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(cross, 'start_game should NOT reach show_game_over (different variant)').toBeUndefined();
+
+    cg.close();
+  });
+
+  it('traces two-step chain: ComputedStates OnEnter handler produces next state', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-e2e-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum IntroState { #[default] Playing, Done }\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum LoadingPhase { #[default] NotStarted, Complete }\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum GameState { #[default] Menu, Playing }\n' +
+        '\n' +
+        'impl ComputedStates for LoadingPhase {\n' +
+        '    type SourceStates = IntroState;\n' +
+        '}\n' +
+        '\n' +
+        'fn finish_intro(mut next_state: ResMut<NextState<IntroState>>) {\n' +
+        '    next_state.set(IntroState::Done);\n' +
+        '}\n' +
+        '\n' +
+        'fn on_loading_complete(mut next_state: ResMut<NextState<GameState>>) {\n' +
+        '    next_state.set(GameState::Playing);\n' +
+        '}\n' +
+        '\n' +
+        'fn spawn_player() {\n' +
+        '    // setup\n' +
+        '}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(LoadingPhase::Complete), on_loading_complete)\n' +
+        '           .add_systems(OnEnter(GameState::Playing), spawn_player);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const finishIntro = fns.find((n) => n.name === 'finish_intro');
+    const onLoading = fns.find((n) => n.name === 'on_loading_complete');
+    const spawnPlayer = fns.find((n) => n.name === 'spawn_player');
+    expect(finishIntro).toBeDefined();
+    expect(onLoading).toBeDefined();
+    expect(spawnPlayer).toBeDefined();
+
+    const enums = cg.getNodesByKind('enum');
+    const loadingPhase = enums.find((n) => n.name === 'LoadingPhase');
+
+    // Step 1a: finish_intro → LoadingPhase (source producer → computed state node)
+    const edgesToComputed = cg.getOutgoingEdges(finishIntro!.id);
+    const toComputed = edgesToComputed.find((e) => e.target === loadingPhase!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputed, 'finish_intro should reach LoadingPhase via ComputedStates').toBeDefined();
+
+    // Step 1b: LoadingPhase → on_loading_complete (computed state node → consumer)
+    const edgesFromComputed = cg.getOutgoingEdges(loadingPhase!.id);
+    const toLoading = edgesFromComputed.find((e) => e.target === onLoading!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toLoading, 'LoadingPhase should reach on_loading_complete').toBeDefined();
+
+    // Step 2: on_loading_complete (GameState producer) → spawn_player
+    //         (GameState consumer via OnEnter)
+    const edgesStep2 = cg.getOutgoingEdges(onLoading!.id);
+    const toSpawn = edgesStep2.find((e) => e.target === spawnPlayer!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toSpawn, 'on_loading_complete should reach spawn_player via OnEnter(GameState::Playing)').toBeDefined();
+
+    cg.close();
+  });
+
+  it('bridges SubStates virtual producer to default variant OnEnter handler', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-substates-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum ParentState { #[default] Init, Active }\n' +
+        '\n' +
+        '#[derive(SubStates, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        '#[source(ParentState = ParentState::Active)]\n' +
+        'enum ChildState { #[default] Running, Paused }\n' +
+        '\n' +
+        'fn activate(mut next_state: ResMut<NextState<ParentState>>) {\n' +
+        '    next_state.set(ParentState::Active);\n' +
+        '}\n' +
+        '\n' +
+        'fn on_child_running() {\n' +
+        '    // setup\n' +
+        '}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(ChildState::Running), on_child_running);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const activate = fns.find((n) => n.name === 'activate');
+    const onRunning = fns.find((n) => n.name === 'on_child_running');
+    expect(activate).toBeDefined();
+    expect(onRunning).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(activate!.id);
+    const toHandler = edges.find((e) => e.target === onRunning!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toHandler, 'activate should reach on_child_running via SubStates virtual producer').toBeDefined();
+    expect((toHandler!.metadata as Record<string, unknown>)?.synthesizedBy).toBe('bevy-ecs-state');
+
+    cg.close();
+  });
+
+  it('bridges SubStates with CJK state names (P-1 pattern)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-substates-cjk-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum 游戏流程_状态 { #[default] 初始化, 开场与基础素材_加载 }\n' +
+        '\n' +
+        '#[derive(SubStates, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        '#[source(游戏流程_状态 = 游戏流程_状态::开场与基础素材_加载)]\n' +
+        'enum 片头播放_状态 { #[default] 播放中, 完成 }\n' +
+        '\n' +
+        'fn 开始_初始化(mut next_state: ResMut<NextState<游戏流程_状态>>) {\n' +
+        '    next_state.set(游戏流程_状态::开场与基础素材_加载);\n' +
+        '}\n' +
+        '\n' +
+        'fn 生成_片头() {\n' +
+        '    // setup\n' +
+        '}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(片头播放_状态::播放中), 生成_片头);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const init = fns.find((n) => n.name === '开始_初始化');
+    const spawn = fns.find((n) => n.name === '生成_片头');
+    expect(init).toBeDefined();
+    expect(spawn).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(init!.id);
+    const toSpawn = edges.find((e) => e.target === spawn!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toSpawn, '开始_初始化 should reach 生成_片头 via SubStates CJK virtual producer').toBeDefined();
+
+    cg.close();
+  });
+
+  it('does not bridge SubStates for wrong parent variant', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-substates-wrong-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum ParentState { #[default] Init, Active, Inactive }\n' +
+        '\n' +
+        '#[derive(SubStates, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        '#[source(ParentState = ParentState::Active)]\n' +
+        'enum ChildState { #[default] Running, Paused }\n' +
+        '\n' +
+        'fn deactivate(mut next_state: ResMut<NextState<ParentState>>) {\n' +
+        '    next_state.set(ParentState::Inactive);\n' +
+        '}\n' +
+        '\n' +
+        'fn on_child_running() {\n' +
+        '    // setup\n' +
+        '}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(ChildState::Running), on_child_running);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const deactivate = fns.find((n) => n.name === 'deactivate');
+    const onRunning = fns.find((n) => n.name === 'on_child_running');
+    expect(deactivate).toBeDefined();
+    expect(onRunning).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(deactivate!.id);
+    const toHandler = edges.find((e) => e.target === onRunning!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toHandler, 'deactivate sets Inactive, should NOT reach ChildState Running handler').toBeUndefined();
+
+    cg.close();
+  });
+
+  it('bridges multiple SubStates sharing same parent variant', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-substates-multi-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum ParentState { #[default] Init, Active }\n' +
+        '\n' +
+        '#[derive(SubStates, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        '#[source(ParentState = ParentState::Active)]\n' +
+        'enum SubA { #[default] DefaultA, OtherA }\n' +
+        '\n' +
+        '#[derive(SubStates, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        '#[source(ParentState = ParentState::Active)]\n' +
+        'enum SubB { #[default] DefaultB, OtherB }\n' +
+        '\n' +
+        'fn activate(mut next_state: ResMut<NextState<ParentState>>) {\n' +
+        '    next_state.set(ParentState::Active);\n' +
+        '}\n' +
+        '\n' +
+        'fn on_sub_a() {}\n' +
+        'fn on_sub_b() {}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(SubA::DefaultA), on_sub_a)\n' +
+        '           .add_systems(OnEnter(SubB::DefaultB), on_sub_b);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const activate = fns.find((n) => n.name === 'activate');
+    const onSubA = fns.find((n) => n.name === 'on_sub_a');
+    const onSubB = fns.find((n) => n.name === 'on_sub_b');
+    expect(activate).toBeDefined();
+    expect(onSubA).toBeDefined();
+    expect(onSubB).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(activate!.id);
+
+    const toSubA = edges.find((e) => e.target === onSubA!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toSubA, 'activate should reach on_sub_a via SubA virtual producer').toBeDefined();
+
+    const toSubB = edges.find((e) => e.target === onSubB!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toSubB, 'activate should reach on_sub_b via SubB virtual producer').toBeDefined();
+
+    cg.close();
+  });
+
+  it('bridges SubStates + ComputedStates end-to-end chain', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-substates-e2e-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum ParentState { #[default] Init, Active }\n' +
+        '\n' +
+        '#[derive(SubStates, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        '#[source(ParentState = ParentState::Active)]\n' +
+        'enum ChildState { #[default] Running, Done }\n' +
+        '\n' +
+        '#[derive(States, Default, Clone, Eq, PartialEq, Hash, Debug)]\n' +
+        'enum ComputedResult { #[default] Waiting, Ready }\n' +
+        '\n' +
+        'impl ComputedStates for ComputedResult {\n' +
+        '    type SourceStates = ChildState;\n' +
+        '}\n' +
+        '\n' +
+        'fn activate(mut next_state: ResMut<NextState<ParentState>>) {\n' +
+        '    next_state.set(ParentState::Active);\n' +
+        '}\n' +
+        '\n' +
+        'fn on_ready() {\n' +
+        '    // setup\n' +
+        '}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(OnEnter(ComputedResult::Ready), on_ready);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const activate = fns.find((n) => n.name === 'activate');
+    const onReady = fns.find((n) => n.name === 'on_ready');
+    expect(activate).toBeDefined();
+    expect(onReady).toBeDefined();
+
+    const enums = cg.getNodesByKind('enum');
+    const computedResult = enums.find((n) => n.name === 'ComputedResult');
+
+    // SubStates virtual producer: activate is a virtual producer of ChildState::Running
+    // ComputedStates: ChildState → ComputedResult, so activate reaches ComputedResult node
+    const edgesToComputed = cg.getOutgoingEdges(activate!.id);
+    const toComputed = edgesToComputed.find((e) => e.target === computedResult!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toComputed, 'activate should reach ComputedResult via SubStates + ComputedStates chain').toBeDefined();
+    const meta = toComputed!.metadata as Record<string, unknown>;
+    expect(meta?.transitiveVia).toBe('ChildState');
+
+    // ComputedResult node → on_ready consumer
+    const edgesFromComputed = cg.getOutgoingEdges(computedResult!.id);
+    const toReady = edgesFromComputed.find((e) => e.target === onReady!.id && e.kind === 'calls' && e.provenance === 'heuristic');
+    expect(toReady, 'ComputedResult should reach on_ready').toBeDefined();
 
     cg.close();
   });
