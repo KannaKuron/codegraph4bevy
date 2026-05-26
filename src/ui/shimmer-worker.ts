@@ -81,10 +81,9 @@ function render(): void {
   let line: string;
   if (currentPercent >= 0) {
     const barWidth = 25;
-    const clamped = Math.min(currentPercent, 100);
-    const filled = Math.round(barWidth * clamped / 100);
+    const filled = Math.round(barWidth * currentPercent / 100);
     const empty = barWidth - filled;
-    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${currentMessage}  ${renderBar(frame, filled, empty)}  ${clamped}%`;
+    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${currentMessage}  ${renderBar(frame, filled, empty)}  ${currentPercent}%`;
   } else if (currentCount > 0) {
     line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${currentMessage}... ${formatNumber(currentCount)} found`;
   } else {

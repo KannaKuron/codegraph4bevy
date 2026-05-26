@@ -36,16 +36,16 @@ of calls; a grep/read exploration is dozens.
 
 ## Tool selection by intent
 
-- **"What is the symbol named X?"** → \`codegraph_search\` (use \`referencesType\` param to find all symbols referencing a type; use \`impl_for\` to find all implementors of a trait/interface; use \`kind: "comment"\` to search comments)
+- **"What is the symbol named X?"** → \`codegraph_search\` (use \`referencesType\` param to find all symbols referencing a type, with \`mutability\` to filter by borrowing mode; use \`impl_for\` to find all implementors of a trait/interface; use \`kind: "comment"\` to search comments)
 - **"What's the deal with this task / feature / area?"** → \`codegraph_context\` (PRIMARY — composes search + node + callers + callees in one call)
-- **"How does X reach/become Y? / trace the flow / the path from X to Y"** → \`codegraph_trace\` (ONE call returns the whole call path, including dynamic-dispatch hops — callbacks, React re-render, JSX children — that grep can't follow)
+- **"How does X reach/become Y? / trace the flow / the path from X to Y"** → \`codegraph_trace\` (ONE call returns the whole call path, including dynamic-dispatch hops — callbacks, React re-render, JSX children, Bevy state transitions — that grep can't follow)
 - **"What calls this?"** → \`codegraph_callers\`
-- **"What does this call?"** → \`codegraph_callees\`
-- **"Where is this symbol used (any kind)?"** → \`codegraph_usages\` (broader than callers — covers calls, refs, type annotations, instantiations; use \`kind: "pattern_match"\` to find only match/if-let sites)
+- **"What does this call?"** → \`codegraph_callees\` (use \`include_external\` to show calls to external/third-party APIs)
+- **"Where is this symbol used (any kind)?"** → \`codegraph_usages\` (broader than callers — covers calls, refs, type annotations, instantiations; supports batch via \`symbols\` array; use \`kind: "pattern_match"\` to find only match/if-let sites)
 - **"What would changing this break?"** → \`codegraph_impact\`
 - **"Show me this symbol's source / signature / docstring."** → \`codegraph_node\`
 - **"Show me several related symbols' source / survey an area."** → \`codegraph_explore\` (ONE capped call; prefer over many codegraph_node/Read; use \`path\` to filter by directory, \`strict\` to limit results to that directory, \`sourceOnly\` to skip relationship map)
-- **"What's in directory X?"** → \`codegraph_files\` (use \`symbols: true\` to include top-level symbol names)
+- **"What's in directory X?"** → \`codegraph_files\` (use \`symbols: true\` to include top-level symbol names) (use \`symbols: true\` to include top-level symbol names)
 - **"Is the index ready / what's its size?"** → \`codegraph_status\`
 
 ## Common chains

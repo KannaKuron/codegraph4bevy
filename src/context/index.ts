@@ -191,7 +191,7 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
   format: 'markdown',
   searchLimit: 3,         // Reduced from 5 - fewer entry points
   traversalDepth: 1,      // Reduced from 2 - shallower graph expansion
-  minScore: 5,
+  minScore: 0.3,
 };
 
 /**
@@ -211,7 +211,7 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   searchLimit: 3,        // Reduced from 5
   traversalDepth: 1,     // Reduced from 2
   maxNodes: 20,          // Reduced from 50
-  minScore: 5,
+  minScore: 0.3,
   edgeKinds: [],
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
 };
@@ -1055,8 +1055,13 @@ export class ContextBuilder {
               resultById.set(neighbor.node.id, expanded);
             }
           }
-        } catch {
-          // Skip seeds whose call-graph neighborhood is unavailable
+        } catch (e) {
+          // Seed may lack call-graph edges (benign), but log unexpected errors
+          // (DB failure, corrupt index) so they aren't silently swallowed.
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!msg.includes('no such') && !msg.includes('not found')) {
+            logDebug('context: seed call-graph expansion failed', { nodeId: seed.node.id, error: msg });
+          }
         }
       }
     }

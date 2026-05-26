@@ -5,6 +5,13 @@
  */
 
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
+import {
+  detectWorktreeIndexMismatch,
+  worktreeMismatchWarning,
+  worktreeMismatchNotice,
+  type WorktreeIndexMismatch,
+} from '../sync/worktree';
+import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, EdgeKind } from '../types';
 import { createHash } from 'crypto';
 import {
@@ -14,11 +21,12 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  realpathSync,
   writeSync,
 } from 'fs';
 import { clamp, validatePathWithinRoot, validateProjectPath } from '../utils';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve as resolvePath } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -622,6 +630,47 @@ export const tools: ToolDefinition[] = [
 ];
 
 /**
+ * Banner prepended when a read-tool response references files the watcher
+ * has seen change but hasn't synced yet. Only lists files actually mentioned
+ * in this response; see {@link formatStaleFooter} for the rest.
+ */
+export function formatStaleBanner(stale: PendingFile[]): string {
+  const now = Date.now();
+  const lines = stale.map((p) => {
+    const ageMs = Math.max(0, now - p.lastSeenMs);
+    const label = p.indexing ? 'indexing in progress' : 'pending sync';
+    return `  - ${p.path} (edited ${ageMs}ms ago, ${label})`;
+  });
+  return (
+    '⚠️ Some files referenced below were edited since the last index sync — ' +
+    'their codegraph entries may be stale:\n' +
+    lines.join('\n') +
+    '\nFor accurate content of those specific files, Read them directly. ' +
+    'The rest of this response is fresh.'
+  );
+}
+
+/**
+ * Compact footer listing pending files that are NOT referenced in this
+ * response. Gives the agent a complete project-wide freshness picture
+ * without bloating the main banner.
+ */
+export function formatStaleFooter(stale: PendingFile[]): string {
+  const MAX = 5;
+  const now = Date.now();
+  const shown = stale.slice(0, MAX);
+  const lines = shown.map((p) => {
+    const ageMs = Math.max(0, now - p.lastSeenMs);
+    return `  - ${p.path} (edited ${ageMs}ms ago)`;
+  });
+  const more = stale.length > MAX ? `\n  - …and ${stale.length - MAX} more` : '';
+  return (
+    `(Note: ${stale.length} file(s) elsewhere in this project are pending index ` +
+    `sync but were not referenced above:\n${lines.join('\n')}${more})`
+  );
+}
+
+/**
  * Tool handler that executes tools against a CodeGraph instance
  *
  * Supports cross-project queries via the projectPath parameter.
@@ -630,11 +679,15 @@ export const tools: ToolDefinition[] = [
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
-  // Explore gap summary accumulator (reset per handleExplore call)
-  private _exploreGaps?: Map<string, { totalTopLevelSymbols: number; fullyShown: number; symbolsInGap: Array<{ name: string; lines: string; kind: string }> }>;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
+  // Per-start-path cache of the git worktree/index mismatch (issue #155). The
+  // mismatch is a fixed property of (where the request came from → which
+  // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
+  // once and every later tool call reuses the result — never shelling out to
+  // git on the hot path. `undefined` = not computed yet; `null` = no mismatch.
+  private worktreeMismatchCache: Map<string, WorktreeIndexMismatch | null> = new Map();
 
   constructor(private cg: CodeGraph | null) {}
 
@@ -643,6 +696,7 @@ export class ToolHandler {
    */
   setDefaultCodeGraph(cg: CodeGraph): void {
     this.cg = cg;
+    this.worktreeMismatchCache.clear();
   }
 
   /**
@@ -774,6 +828,19 @@ export class ToolHandler {
       return this.cg;
     }
 
+    // When this.cg is null (not yet initialized after engine startup),
+    // check projectCache for any existing instance at the same root so
+    // we don't open a duplicate that the engine will open moments later.
+    if (!this.cg) {
+      for (const [, cachedCg] of this.projectCache) {
+        try {
+          if (cachedCg.getProjectRoot() === resolvedRoot) {
+            return cachedCg;
+          }
+        } catch { /* instance may be closed */ }
+      }
+    }
+
     // Check if we already have this resolved root cached (different path, same project)
     if (this.projectCache.has(resolvedRoot)) {
       const cg = this.projectCache.get(resolvedRoot)!;
@@ -803,6 +870,54 @@ export class ToolHandler {
       }
     }
     this.projectCache.clear();
+    this.worktreeMismatchCache.clear();
+  }
+
+  /**
+   * Cached git worktree/index mismatch for a tool call's effective project.
+   *
+   * The "effective project" is what the request targets: an explicit
+   * `projectPath` arg, else the directory the server resolved its default
+   * project from (`defaultProjectHint`), else cwd. Memoized per start path —
+   * see `worktreeMismatchCache`. Best-effort: if the project can't be resolved
+   * (e.g. nothing initialized yet), it reports "no mismatch" so a tool is never
+   * broken by this check.
+   */
+  private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
+    const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
+    const cached = this.worktreeMismatchCache.get(startPath);
+    if (cached !== undefined) return cached;
+
+    let mismatch: WorktreeIndexMismatch | null = null;
+    try {
+      mismatch = detectWorktreeIndexMismatch(startPath, this.getCodeGraph(projectPath).getProjectRoot());
+      this.worktreeMismatchCache.set(startPath, mismatch);
+    } catch {
+      // No resolvable project (or any other resolution error) → don't cache;
+      // a later retry (e.g. lazy init) may succeed.
+      return null;
+    }
+    return mismatch;
+  }
+
+  /**
+   * Prefix a successful read-tool result with a compact worktree-mismatch
+   * notice when the resolved index belongs to a different git working tree than
+   * the caller's. Without this, an agent in a nested worktree silently trusts
+   * main-branch results. No-op on error results and when there is no mismatch.
+   * `codegraph_status` is excluded — it embeds its own verbose warning.
+   */
+  private withWorktreeNotice(result: ToolResult, projectPath?: string): ToolResult {
+    if (result.isError) return result;
+    const mismatch = this.worktreeMismatchFor(projectPath);
+    if (!mismatch) return result;
+
+    const notice = worktreeMismatchNotice(mismatch);
+    const [first, ...rest] = result.content;
+    if (first && first.type === 'text') {
+      return { ...result, content: [{ type: 'text', text: `${notice}\n\n${first.text}` }, ...rest] };
+    }
+    return result;
   }
 
   /**
@@ -850,6 +965,81 @@ export class ToolHandler {
   }
 
   /**
+   * Annotate a successful read-tool result with per-file staleness — the
+   * non-blocking answer to issue #403. The file watcher tracks every event
+   * between sync cycles; this inspects its pending set and prepends a
+   * compact banner when the response references files that changed since
+   * the last index refresh. A footer covers pending files NOT in the
+   * response, giving the agent project-wide freshness awareness.
+   */
+  private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
+    if (result.isError) return result;
+
+    let cg: CodeGraph;
+    try {
+      cg = this.getCodeGraph(projectPath);
+    } catch {
+      return result;
+    }
+
+    // Cross-project projectPath calls open a cached CodeGraph WITHOUT a
+    // watcher. When the cross-project path happens to be the same project
+    // as the default cg, prefer the default so pendingFiles (only populated
+    // by the default's watcher) is non-empty when there are pending edits.
+    if (this.cg && cg !== this.cg) {
+      try {
+        const sameProject =
+          resolvePath(this.cg.getProjectRoot()) === resolvePath(cg.getProjectRoot())
+          // On macOS /var is a symlink to /private/var — resolvePath
+          // normalises but doesn't resolve symlinks, so two instances
+          // pointing at the same real directory may compare as different.
+          // realpathSync resolves that; fall back to resolvePath on error.
+          || (() => { try { return realpathSync(this.cg!.getProjectRoot()) === realpathSync(cg.getProjectRoot()); } catch { return false; } })();
+        if (sameProject) cg = this.cg;
+      } catch {
+        /* getProjectRoot may throw on a closed instance */
+      }
+    }
+
+    let pending: PendingFile[] = [];
+    try {
+      pending = cg.getPendingFiles?.() ?? [];
+    } catch {
+      return result;
+    }
+    if (pending.length === 0) return result;
+
+    const [first, ...rest] = result.content;
+    if (!first || first.type !== 'text') return result;
+
+    const text = first.text;
+    const inResponse: PendingFile[] = [];
+    const elsewhere: PendingFile[] = [];
+    for (const p of pending) {
+      // \b word-boundary match around the escaped path avoids false
+      // positives on short names ("app" in "application") while matching
+      // paths inside markdown (**path**, `path`, path:line). File paths
+      // use ASCII characters so \b works correctly here.
+      const escaped = p.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (new RegExp('\\b' + escaped + '\\b').test(text)) inResponse.push(p);
+      else elsewhere.push(p);
+    }
+
+    let banner = '';
+    if (inResponse.length > 0) {
+      banner = formatStaleBanner(inResponse);
+    }
+    let footer = '';
+    if (elsewhere.length > 0) {
+      footer = formatStaleFooter(elsewhere);
+    }
+    if (!banner && !footer) return result;
+
+    const composed = [banner, text, footer].filter(Boolean).join('\n\n');
+    return { ...result, content: [{ type: 'text', text: composed }, ...rest] };
+  }
+
+  /**
    * Execute a tool by name
    */
   async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
@@ -878,32 +1068,38 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
+      // Read tools resolve through a single result variable so cross-cutting
+      // notices — worktree-index mismatch — can be applied in one place.
+      // status embeds its own verbose worktree warning.
+      let result: ToolResult;
       switch (toolName) {
         case 'codegraph_search':
-          return await this.handleSearch(args);
+          result = await this.handleSearch(args); break;
         case 'codegraph_context':
-          return await this.handleContext(args);
+          result = await this.handleContext(args); break;
         case 'codegraph_callers':
-          return await this.handleCallers(args);
+          result = await this.handleCallers(args); break;
         case 'codegraph_callees':
-          return await this.handleCallees(args);
+          result = await this.handleCallees(args); break;
         case 'codegraph_impact':
-          return await this.handleImpact(args);
+          result = await this.handleImpact(args); break;
         case 'codegraph_explore':
-          return await this.handleExplore(args);
+          result = await this.handleExplore(args); break;
         case 'codegraph_node':
-          return await this.handleNode(args);
+          result = await this.handleNode(args); break;
         case 'codegraph_status':
           return await this.handleStatus(args);
         case 'codegraph_files':
-          return await this.handleFiles(args);
+          result = await this.handleFiles(args); break;
         case 'codegraph_usages':
-          return await this.handleUsages(args);
+          result = await this.handleUsages(args); break;
         case 'codegraph_trace':
-          return await this.handleTrace(args);
+          result = await this.handleTrace(args); break;
         default:
           return this.errorResult(`Unknown tool: ${toolName}`);
       }
+      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
+      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
       return this.errorResult(`Tool execution failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1848,7 +2044,10 @@ export class ToolHandler {
               const container = segs.length >= 2 ? segs[segs.length - 2] : '';
               return !!container && segPool.has(container);
             });
-        for (const n of pick.slice(0, 6)) named.set(n.id, n);
+        // If the disambiguation filter dropped everything, fall back to
+        // the unfiltered candidates rather than silently losing the token.
+        const chosen = pick.length > 0 ? pick : cands;
+        for (const n of chosen.slice(0, 6)) named.set(n.id, n);
         if (named.size > 40) break;
       }
       if (named.size < 2) return '';
@@ -1929,9 +2128,8 @@ export class ToolHandler {
     // P1: Strict mode — limit results to files under the path directory
     const strict = args.strict === true;
 
-    // Reset gap tracking at the start of every explore call so a
-    // mid-format exception doesn't leak stale gaps into the next call.
-    this._exploreGaps = undefined;
+    // Per-call gap accumulator — local so concurrent explore calls don't race.
+    let exploreGaps: Map<string, { totalTopLevelSymbols: number; fullyShown: number; symbolsInGap: Array<{ name: string; lines: string; kind: string }> }> | undefined;
 
     // Resolve adaptive output budget from project size. Falls back to the
     // largest-tier defaults if stats aren't available, which preserves
@@ -2391,8 +2589,8 @@ export class ToolHandler {
           }
         }
         if (gapSymbols.length > 0) {
-          if (!this._exploreGaps) this._exploreGaps = new Map();
-          this._exploreGaps.set(filePath, {
+          if (!exploreGaps) exploreGaps = new Map();
+          exploreGaps.set(filePath, {
             totalTopLevelSymbols: group.nodes.length,
             fullyShown: allSymbols.length,
             symbolsInGap: gapSymbols,
@@ -2449,12 +2647,12 @@ export class ToolHandler {
     }
 
     // Gap summary: tell the agent what symbols were omitted from truncated files
-    if (this._exploreGaps && this._exploreGaps.size > 0) {
+    if (exploreGaps && exploreGaps.size > 0) {
       lines.push('### Gap Summary');
       lines.push('');
       lines.push('The following symbols were omitted due to output budget limits. Use `codegraph_explore` with more specific query terms or increase `maxFiles` to include them.');
       lines.push('');
-      for (const [file, gap] of this._exploreGaps) {
+      for (const [file, gap] of exploreGaps) {
         lines.push(`**${file}** — ${gap.totalTopLevelSymbols} total symbols, ${gap.fullyShown} fully shown, ${gap.symbolsInGap.length} in gap:`);
         for (const sym of gap.symbolsInGap.slice(0, 15)) {
           lines.push(`  - ${sym.name} (${sym.kind}) @ lines ${sym.lines}`);
@@ -2668,14 +2866,24 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const stats = cg.getStats();
 
+    // Warn when this index actually belongs to a different git working tree
+    // (e.g. the server resolved up from a nested worktree to the main checkout).
+    // Queries then reflect that tree's branch, not the worktree being edited.
+    const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
+
     const lines: string[] = [
       '## CodeGraph Status',
       '',
+    ];
+    if (mismatch) {
+      lines.push(`> ⚠ ${worktreeMismatchWarning(mismatch).replace(/\n/g, '\n> ')}`, '');
+    }
+    lines.push(
       `**Files indexed:** ${stats.fileCount}`,
       `**Total nodes:** ${stats.nodeCount}`,
       `**Total edges:** ${stats.edgeCount}`,
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,
-    ];
+    );
 
     // Surface the active SQLite backend (node:sqlite, Node's built-in real
     // SQLite — full WAL + FTS5, no native build).
@@ -2707,6 +2915,18 @@ export class ToolHandler {
     for (const [lang, count] of Object.entries(stats.filesByLanguage)) {
       if ((count as number) > 0) {
         lines.push(`- ${lang}: ${count}`);
+      }
+    }
+
+    // Per-file freshness (issue #403). Only populated by the default's watcher.
+    const pending = cg.getPendingFiles?.() ?? [];
+    if (pending.length > 0) {
+      lines.push('', '### Pending sync:');
+      const now = Date.now();
+      for (const p of pending) {
+        const ageMs = Math.max(0, now - p.lastSeenMs);
+        const label = p.indexing ? 'indexing in progress' : 'pending sync';
+        lines.push(`- ${p.path} (edited ${ageMs}ms ago, ${label})`);
       }
     }
 
@@ -3432,11 +3652,15 @@ export class ToolHandler {
     const WE = `(?![\\p{L}\\p{N}_])`;
 
     // Mutable: ResMut<Type>, &mut Type
-    if (new RegExp(`ResMut\\s*<[^>]*${WB}${escaped}${WE}`, 'u').test(signature)) return 'mut';
+    // Depth-aware: (?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)* handles up to 2 levels
+    // of nested generics (e.g. ResMut<Query<Filter<Type>>>) instead of
+    // stopping at the first > like [^>]* would.
+    const NESTED = `(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*`;
+    if (new RegExp(`ResMut\\s*<${NESTED}${WB}${escaped}${WE}`, 'u').test(signature)) return 'mut';
     if (new RegExp(`&mut\\s+${WB}${escaped}${WE}`, 'u').test(signature)) return 'mut';
 
     // Shared: Res<Type> (but not ResMut), &Type (but not &mut)
-    if (new RegExp(`(?<!Mut)Res\\s*<[^>]*${WB}${escaped}${WE}`, 'u').test(signature)) return 'shared';
+    if (new RegExp(`(?<!Mut)Res\\s*<${NESTED}${WB}${escaped}${WE}`, 'u').test(signature)) return 'shared';
     if (new RegExp(`(?<!&mut\\s)&${WB}${escaped}${WE}`, 'u').test(signature)) return 'shared';
 
     // Owned: return type (-> Type or -> impl ... Type ...), or plain param without &
@@ -3458,7 +3682,31 @@ export class ToolHandler {
         continue;
       }
       const allMatches = this.findAllSymbols(cg, valid);
-      if (allMatches.nodes.length === 0) { allLines.push(`### ${valid}: not found`); allLines.push(""); continue; }
+      if (allMatches.nodes.length === 0) {
+        // Try unresolved-refs fallback — external symbols (e.g. Bevy types)
+        // have usage edges recorded in unresolved_refs but no project-internal node.
+        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), kindFilter);
+        if (unresolvedResult !== null) {
+          const text = (unresolvedResult.content[0] as { type: 'text'; text: string }).text;
+          allLines.push(text);
+          allLines.push("");
+        } else {
+          allLines.push(`### ${valid}: not found`); allLines.push("");
+        }
+        continue;
+      }
+      // Exact-match guard: if FTS matches a node by signature text but not
+      // by name, prefer unresolved-refs for external symbol coverage.
+      const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, valid));
+      if (!exactMatch) {
+        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), kindFilter);
+        if (unresolvedResult !== null) {
+          const text = (unresolvedResult.content[0] as { type: 'text'; text: string }).text;
+          allLines.push(text);
+          allLines.push("");
+          continue;
+        }
+      }
       const seen = new Set<string>();
       const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
       for (const node of allMatches.nodes) {

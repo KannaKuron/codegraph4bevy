@@ -84,22 +84,9 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-proj-'));
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     if (child && !child.killed) {
-      // Wait for the child process to actually exit before cleaning up its
-      // CWD. On Windows the OS holds a lock on the working directory until the
-      // process terminates — rmSync's force:true won't help if the process
-      // hasn't released its handle yet.
-      const exited = new Promise<void>((resolve) => {
-        child!.on('close', () => resolve());
-        child!.kill('SIGKILL');
-      });
-      let timerId: ReturnType<typeof setTimeout>;
-      const timeout = new Promise<void>((resolve) => {
-        timerId = setTimeout(resolve, 5000);
-      });
-      await Promise.race([exited, timeout]);
-      clearTimeout(timerId!);
+      child.kill('SIGKILL');
       child = null;
     }
     fs.rmSync(cwdDir, { recursive: true, force: true });

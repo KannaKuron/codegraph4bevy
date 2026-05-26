@@ -543,8 +543,8 @@ const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)
 // nested fn bodies). Keyed by short name (last ::-segment) so that
 // crate::IntroState matches IntroState::Done via startsWith('IntroState::').
 const IMPL_HEADER_RE = /impl\s+ComputedStates\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)(?:\s+where\s+[^{]+)?\s*\{/gu;
-const ADD_SYSTEMS_ONENTER_RE = /\.add_systems\s*\(\s*OnEnter\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*,\s*([\p{L}\p{N}_]+)/gu;
-const ADD_SYSTEMS_ONEXIT_RE = /\.add_systems\s*\(\s*OnExit\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*,\s*([\p{L}\p{N}_]+)/gu;
+const ADD_SYSTEMS_ONENTER_RE = /\.add_systems\s*\(\s*OnEnter\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*,\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)/gu;
+const ADD_SYSTEMS_ONEXIT_RE = /\.add_systems\s*\(\s*OnExit\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*,\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)/gu;
 
 // SubStates: #[source(ParentType = ParentType::Variant)] pub enum Name {
 const SUBSTATES_SOURCE_RE = /#\[\s*source\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*=\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?enum\s+([\p{L}\p{N}_]+)\s*\{/gu;

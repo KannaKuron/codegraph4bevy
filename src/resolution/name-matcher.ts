@@ -443,17 +443,14 @@ export function matchFuzzy(
 
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
   const candidates = context.getNodesByLowerName(lowerName);
-  if (candidates.length === 0) return null;
+
+  // Filter to callable kinds only (function, method, class)
+  const callableKinds = new Set(['function', 'method', 'class']);
+  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind));
 
   // Prefer same-language matches
-  const sameLanguageCandidates = candidates.filter(n => n.language === ref.language);
-  const langFiltered = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : candidates;
-
-  // Prefer callable kinds, but fall back to any kind so that enum_member,
-  // constant, and other non-callable references can still resolve.
-  const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = langFiltered.filter((n) => callableKinds.has(n.kind));
-  const finalCandidates = callableCandidates.length > 0 ? callableCandidates : langFiltered;
+  const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
+  const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
   if (finalCandidates.length === 1) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;

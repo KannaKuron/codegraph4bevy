@@ -48,7 +48,7 @@ import {
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
-import { FileWatcher, WatchOptions } from './sync';
+import { FileWatcher, WatchOptions, PendingFile } from './sync';
 
 // Re-export types for consumers
 export * from './types';
@@ -77,7 +77,7 @@ export {
   defaultLogger,
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
-export { FileWatcher, WatchOptions } from './sync';
+export { FileWatcher, WatchOptions, PendingFile } from './sync';
 export { MCPServer } from './mcp';
 
 /**
@@ -499,6 +499,24 @@ export class CodeGraph {
    */
   isWatching(): boolean {
     return this.watcher?.isActive() ?? false;
+  }
+
+  /**
+   * Return the watcher's current set of files that changed since the last
+   * sync cycle completed. Empty when there is no active watcher.
+   */
+  getPendingFiles(): PendingFile[] {
+    return this.watcher?.getPendingFiles() ?? [];
+  }
+
+  /**
+   * Resolve when the file watcher is ready (chokidar has finished its
+   * initial scan). Rejects after timeoutMs (default 10s) if the watcher
+   * never becomes ready. Used by tests that need to trigger file writes
+   * after the watcher is guaranteed to detect them.
+   */
+  async waitUntilWatcherReady(timeoutMs?: number): Promise<void> {
+    return this.watcher?.waitUntilReady(timeoutMs);
   }
 
   /**

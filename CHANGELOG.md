@@ -7,6 +7,108 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Shared MCP daemon — running multiple AI agents in the same project no
+  longer multiplies the file-watch, SQLite, and indexing cost.** Point more
+  than one `codegraph serve --mcp` at a project (two Claude Code windows, an
+  agent in a git worktree, `/loop` alongside an interactive session, parallel
+  sub-agents) and they now share **one** background daemon per project: a
+  single file watcher (one inotify set on Linux), one SQLite connection, and
+  one tree-sitter warm-up — instead of N independent copies. Measured on Linux:
+  three agents register **~3× fewer inotify watches** sharing one watcher
+  versus three standalone servers. Resolves issue #411. (Composable with the
+  per-watcher pruning in #276/#346 — that shrinks each watch set; this shares
+  one across agents.)
+- The daemon runs as a **detached background process** that outlives any single
+  session, so closing one editor or terminal never severs the others. Each
+  `serve --mcp` your agent host launches is a thin stdio↔socket proxy to it (a
+  Unix-domain socket, or a named pipe on Windows). When the last client
+  disconnects the daemon lingers for `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`
+  (default `300000`) so back-to-back sessions skip the startup cost, then exits
+  and removes its lockfile — an OOM-killed or force-quit host can't leak it.
+- **`CODEGRAPH_NO_DAEMON=1`** opts out, restoring one independent server per
+  client (handy for debugging or sandboxes that disallow local IPC sockets).
+  The daemon is also version-pinned: after you upgrade codegraph, sessions
+  already attached to the old daemon keep using it while new sessions run
+  standalone until it idles out — they never mix versions over the socket.
+
+- **Per-file staleness banner — codegraph responses now tell the agent which
+  files are pending re-index (#403).** When the file watcher has seen edits
+  since the last successful sync, MCP tool responses (`codegraph_search`,
+  `context`, `callers`, `callees`, `impact`, `trace`, `explore`, `node`,
+  `files`) prepend a `⚠️` banner naming the stale files referenced in that
+  response, with their edit age and indexing state; pending files elsewhere in
+  the project appear as a small footer. The agent is told which specific files
+  to Read directly; the rest of the response is fresh and codegraph stays
+  authoritative for it. No artificial wait, no static "wait ~500ms" guess —
+  the cost is zero when nothing's pending. `codegraph_status` also surfaces a
+  `### Pending sync:` section so an agent can ask "is the index caught up?" in
+  one call.
+- **`CODEGRAPH_WATCH_DEBOUNCE_MS` env var lets you tune the file-watcher quiet
+  window (#403).** Default stays at 2000ms; workspaces with bursty writes
+  (formatter-on-save chains, multi-file refactors, large generated outputs)
+  can raise it (e.g. `5000` or `10000`) without touching their agent's command
+  line. Clamped to `[100ms, 60s]`; out-of-range or non-numeric values fall
+  back to the default and the active value is logged to stderr on watcher
+  startup so it's discoverable. Pairs with the staleness banner above: the
+  banner stays accurate at any debounce value because it's per-file, not a
+  static "wait N ms" instruction.
+
+### Fixed
+- **Git worktrees no longer silently borrow another tree's index (#155).**
+  When a worktree is nested inside the main checkout — exactly what agent
+  tools that place worktrees under gitignored paths like
+  `.claude/worktrees/<name>/` do — running CodeGraph from that worktree used
+  to walk *up* to the main checkout's `.codegraph/` and silently return that
+  tree's code (usually a different branch). Symbols changed only in the
+  worktree were invisible and nothing told you. Now `codegraph status` (CLI +
+  MCP) calls out the conflict explicitly, and every MCP read tool
+  (`codegraph_search`/`context`/`trace`/`callers`/`callees`/`impact`/
+  `explore`/`node`/`files`) prefixes a one-line notice naming the borrowed
+  index and the fix (`codegraph init -i` in the worktree). Detection is
+  best-effort (no git / not a repo / monorepo subdir → no warning) and runs
+  once per session per start path, so it never costs more than a single pair
+  of `git rev-parse` invocations.
+- **The file watcher no longer exhausts the OS file-watch budget on large
+  repos (#276).** It used to register a recursive watch over the *entire*
+  project — `node_modules/`, build output, caches and all — and filter only
+  after the fact. On Linux that meant hundreds of thousands of inotify watches
+  per project; enough that a second project, or codegraph alongside your editor
+  / `next dev`, could hit the per-user ceiling and fail with "OS file watch
+  limit reached." The watcher now excludes the same directories the indexer
+  ignores (the built-in default-ignore set **plus** your `.gitignore`) *before*
+  registering a watch — so on a repo with a 900-directory `node_modules` the
+  watch count drops from ~1,200 to ~14, even when the project has no
+  `.gitignore`. (Stacks with the shared daemon from #411: one watcher across
+  agents, and now that watcher is small.)
+
+## [0.9.5] - 2026-05-25
+
+### Fixed
+- **The index now stays in sync after `git pull`, branch switches, and edits made
+  outside your editor.** Incremental sync detected changes via `git status`, which
+  only sees *uncommitted* edits — so code pulled or checked out (which leaves a
+  clean working tree) was silently missed until a full `codegraph index -f`.
+  Change detection is now filesystem-based and git-independent: a `(size, mtime)`
+  stat pre-filter skips unchanged files, then a content hash confirms the rest. It
+  reconciles committed changes from `pull`/`checkout`/`merge`/`rebase`, plain edits
+  in non-git projects, and deletions alike.
+- **The MCP server catches up on connect.** When your editor connects, codegraph
+  reconciles anything that changed while it wasn't running (e.g. a `git pull` from
+  the terminal), so the first query reflects the current code instead of a stale
+  snapshot — rather than waiting for the next live edit.
+- **Dependency, build, and cache directories are now excluded by default** —
+  `node_modules`, `vendor`, `dist`, `build`, `target`, `.venv`, `__pycache__`,
+  `Pods`, `.next`, and the like across every supported language/framework — so
+  `context` and `search` reflect your code instead of third-party noise, even in a
+  project with no `.gitignore` (#407). The defaults apply uniformly, including to
+  committed files (vendoring a dependency into the repo doesn't make it project
+  code). To index one anyway, add a `.gitignore` negation (e.g. `!vendor/`).
+  First-party-prone names like `packages/`, `lib/`, `app/`, and `src/` are never on
+  the default list.
+
 ## [0.9.4] - 2026-05-24
 
 ### Added
@@ -228,6 +330,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   find its bundle. The release pipeline now verifies every package reached the
   registry (and is idempotent), so a release can't pass green-but-broken again.
 
+[0.9.5]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.5
 [0.9.4]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.4
 [0.9.3]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.3
 [0.9.2]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.2

@@ -71,25 +71,42 @@ function extractSingleLineComments(
   const docPrefix = prefix + prefix[0];
 
   for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i]!.trimStart();
-    if (trimmed.startsWith(prefix) && !trimmed.startsWith('/*') && !trimmed.startsWith('*/')) {
-      // Skip if inside a string (rough heuristic)
-      const beforeComment = lines[i]!.substring(0, lines[i]!.indexOf(prefix));
-      if (isInsideString(beforeComment)) continue;
+    const line = lines[i]!;
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith(prefix)) continue;
+    if (trimmed.startsWith('/*') || trimmed.startsWith('*/')) continue;
 
-      const text = trimmed.startsWith(docPrefix)
-        ? trimmed.substring(3).trim()  // doc comment
-        : trimmed.substring(prefix.length).trim();
-      if (!text) continue;
-
-      comments.push({
-        filePath,
-        startLine: i + 1,
-        endLine: i + 1,
-        text,
-        kind: trimmed.startsWith(docPrefix) ? 'doc' : 'line',
-      });
+    // Find the first comment prefix that is NOT inside a string literal.
+    // Handles cases like:
+    //   let url = "http://example.com"; // real comment
+    // where a naive indexOf would match the // inside the URL first and
+    // isInsideString would skip the entire line, losing the real comment.
+    let prefixPos = -1;
+    let searchFrom = 0;
+    while (true) {
+      const pos = line.indexOf(prefix, searchFrom);
+      if (pos === -1) break;
+      if (!isInsideString(line.substring(0, pos))) {
+        prefixPos = pos;
+        break;
+      }
+      searchFrom = pos + prefix.length;
     }
+    if (prefixPos === -1) continue;
+
+    const isDoc = line.substring(prefixPos).startsWith(docPrefix);
+    const text = isDoc
+      ? line.substring(prefixPos + 3).trim()
+      : line.substring(prefixPos + prefix.length).trim();
+    if (!text) continue;
+
+    comments.push({
+      filePath,
+      startLine: i + 1,
+      endLine: i + 1,
+      text,
+      kind: isDoc ? 'doc' : 'line',
+    });
   }
 }
 

@@ -901,6 +901,14 @@ export class TreeSitterExtractor {
   private extractStruct(node: SyntaxNode): void {
     if (!this.extractor) return;
 
+    // Skip forward declarations (no body = not a definition). Rust unit
+    // structs (struct Foo;) and tuple structs (struct Foo(i32);) are valid
+    // definitions without a body field, so Rust is excluded.
+    if (this.language !== 'rust') {
+      const body = getChildByField(node, this.extractor.bodyField);
+      if (!body) return;
+    }
+
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
@@ -938,6 +946,14 @@ export class TreeSitterExtractor {
    */
   private extractEnum(node: SyntaxNode): void {
     if (!this.extractor) return;
+
+    // Skip forward declarations (no body = not a definition). Same rule as
+    // extractStruct: Rust is excluded because its enum definitions always
+    // carry a body, but the guard is harmless either way.
+    if (this.language !== 'rust') {
+      const body = getChildByField(node, this.extractor.bodyField);
+      if (!body) return;
+    }
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
@@ -2128,8 +2144,10 @@ export class TreeSitterExtractor {
    */
   private static readonly ADD_SYSTEMS_RE = /\.?(add_systems|add_plugins|observe)\s*\(/;
   private static readonly IDENT_EXCLUDE_RE = /^(?:Update|FixedUpdate|PreUpdate|PostUpdate|Last|Startup|First|OnEnter|OnExit|in_state|resource_exists|run_if|after|before|chain|pipe|and_then|or_else|map|filter|let|mut|use|fn|pub|impl|for|self|app|Res|ResMut|Commands|Query|EventWriter|EventReader|MessageWriter|MessageReader|Local|NextState|DespawnOnExit|with_child|spawn|insert|remove|entity|commands)$/;
-  // Matches standalone identifiers optionally followed by .method, comma, or closing paren
-  private static readonly SYSTEM_IDENT_RE = /(?:^|[,\s(]+)([\w一-鿿][\w一-鿿]*(?:::\w+)?)\s*(?=\.\w|[,\\)]|$)/g;
+  // Matches standalone identifiers optionally followed by .method, comma, or closing paren.
+  // The qualified-name suffix uses the full CJK-aware character class so
+  // Rust paths like 设置::导航上 are captured whole, not just the first segment.
+  private static readonly SYSTEM_IDENT_RE = /(?:^|[,\s(]+)([\w一-鿿][\w一-鿿]*(?:::(?:[\w一-鿿]+))*)\s*(?=\.\w|[,\\)]|$)/g;
 
   private scanBevyPatternsFallback(): void {
     const existingKeys = new Set(

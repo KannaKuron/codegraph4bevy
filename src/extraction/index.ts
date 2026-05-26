@@ -18,6 +18,7 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
+import { extractComments } from './comment-extractor';
 import { detectLanguage, isSourceFile, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { logDebug, logWarn } from '../errors';
 import { enrichCJKForFTS } from '../search/query-utils';
@@ -100,6 +101,84 @@ export function hashContent(content: string): string {
  * symbols. 1 MB covers essentially all hand-written source.
  */
 const MAX_FILE_SIZE = 1024 * 1024;
+
+/**
+ * Directory names that are dependency, build, cache, or tooling output across the
+ * languages/frameworks CodeGraph supports — curated from the canonical
+ * github/gitignore templates. Excluded by default so the graph reflects your code,
+ * not third-party noise, without requiring a `.gitignore` (issue #407). The
+ * exclusion applies uniformly (git or not, tracked or not); the only opt-in is an
+ * explicit `.gitignore` negation (e.g. `!vendor/`). First-party-prone or generic
+ * names (`packages`, `lib`, `app`, `bin`, `src`, `deps`, `env`, `tmp`, `storage`,
+ * `Library`) are deliberately NOT listed, to avoid ever hiding real source.
+ *
+ * Only dirs that actually contain *indexable source* (or are enormous) earn a slot
+ * — IDE/state dirs like `.idea`/`.vs` are omitted because CodeGraph indexes only
+ * recognized source extensions, so they produce no symbols regardless.
+ */
+const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
+  // JS / TS — dependency directories
+  'node_modules', 'bower_components', 'jspm_packages', 'web_modules',
+  '.yarn', '.pnpm-store',
+  // JS / TS — framework & bundler build / cache / deploy output
+  '.next', '.nuxt', '.svelte-kit', '.turbo', '.vite', '.parcel-cache', '.angular',
+  '.docusaurus', 'storybook-static', '.vinxi', '.nitro', 'out-tsc',
+  '.vercel', '.netlify', '.wrangler',
+  // Build output (common across ecosystems)
+  'dist', 'build', 'out', '.output',
+  // Test / coverage
+  'coverage', '.nyc_output',
+  // Python
+  '__pycache__', '__pypackages__', '.venv', 'venv', '.pixi', '.pdm-build',
+  '.mypy_cache', '.pytest_cache', '.ruff_cache', '.tox', '.nox', '.hypothesis',
+  '.ipynb_checkpoints', '.eggs',
+  // Rust / JVM (Maven, Gradle, Scala)
+  'target', '.gradle',
+  // .NET
+  'obj',
+  // Vendored deps (Go, PHP/Composer, Ruby/Bundler)
+  'vendor',
+  // Swift / iOS
+  '.build', 'Pods', 'Carthage', 'DerivedData', '.swiftpm',
+  // Dart / Flutter
+  '.dart_tool', '.pub-cache',
+  // Native (Android NDK, C/C++ deps)
+  '.cxx', '.externalNativeBuild', 'vcpkg_installed',
+  // Scala tooling
+  '.bloop', '.metals',
+  // Lua / Luau (LuaRocks)
+  'lua_modules', '.luarocks',
+  // Delphi / RAD Studio IDE backups (duplicate .pas source — would double-count)
+  '__history', '__recovery',
+  // Generic cache
+  '.cache',
+]);
+
+/** Gitignore-style patterns for the `ignore` matcher: the dirs above plus a few globs. */
+const DEFAULT_IGNORE_PATTERNS: string[] = [
+  ...Array.from(DEFAULT_IGNORE_DIRS, (d) => `${d}/`),
+  '*.egg-info/',     // Python packaging metadata
+  'cmake-build-*/',  // CLion / CMake build trees
+  'bazel-*/',        // Bazel output symlink trees
+];
+
+/**
+ * An `ignore` matcher seeded with the built-in defaults, merged with the project's
+ * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default. Shared
+ * by both enumeration paths so behavior is identical with or without git — and so
+ * the defaults apply to tracked files too (committing a dependency dir doesn't make
+ * it project code; the explicit `.gitignore` negation is the only opt-in).
+ */
+export function buildDefaultIgnore(rootDir: string): Ignore {
+  const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
+  try {
+    const rootGitignore = path.join(rootDir, '.gitignore');
+    if (fs.existsSync(rootGitignore)) ig.add(fs.readFileSync(rootGitignore, 'utf-8'));
+  } catch {
+    // Unreadable root .gitignore — the built-in defaults still apply.
+  }
+  return ig;
+}
 
 /**
  * Collect git-visible files (tracked + untracked, .gitignore-respected) from the
@@ -185,7 +264,11 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
 
     const files = new Set<string>();
     collectGitFiles(rootDir, '', files);
-    return files;
+    // Apply built-in default ignores uniformly — to tracked files too, since
+    // committing a dependency/build dir doesn't make it project code. A
+    // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
+    const ig = buildDefaultIgnore(rootDir);
+    return new Set([...files].filter((f) => !ig.ignores(f)));
   } catch {
     return null;
   }
@@ -360,7 +443,9 @@ function scanDirectoryWalk(
     visitedDirs.add(realDir);
 
     // This directory's own .gitignore (if present) applies to everything below it.
-    const own = loadIgnore(dir);
+    // The root's .gitignore is already merged into the seeded base matcher (so a
+    // negation there can override a built-in default), so skip it here.
+    const own = dir === rootDir ? null : loadIgnore(dir);
     const active = own ? [...matchers, own] : matchers;
 
     let entries: fs.Dirent[];
@@ -413,7 +498,9 @@ function scanDirectoryWalk(
     }
   }
 
-  walk(rootDir, []);
+  // Seed a base matcher with the built-in default ignores (merged with the root
+  // .gitignore so a negation can override). Nested .gitignores still layer per-dir.
+  walk(rootDir, [{ dir: rootDir, ig: buildDefaultIgnore(rootDir) }]);
   return files;
 }
 
@@ -824,10 +911,8 @@ export class ExtractionOrchestrator {
         if (result.nodes.length > 0 || result.errors.length === 0) {
           const language = detectLanguage(filePath, content);
           this.storeExtractionResult(filePath, content, language, stats, result);
+          this.extractAndStoreComments(filePath, content, language, result.nodes);
         }
-
-        // Extract and store comments for FTS search
-        this.extractAndStoreComments(filePath, content, detectLanguage(filePath, content), result.nodes);
 
         if (result.errors.length > 0) {
           for (const err of result.errors) {
@@ -901,7 +986,7 @@ export class ExtractionOrchestrator {
           const language = detectLanguage(filePath, content);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
           this.storeExtractionResult(filePath, content, language, stats, result);
-          this.extractAndStoreComments(filePath, content, language);
+          this.extractAndStoreComments(filePath, content, language, result.nodes);
 
           const idx = errors.indexOf(errEntry);
           if (idx >= 0) errors.splice(idx, 1);
@@ -953,7 +1038,7 @@ export class ExtractionOrchestrator {
             const language = detectLanguage(filePath, fullContent);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
             this.storeExtractionResult(filePath, fullContent, language, stats, result);
-            this.extractAndStoreComments(filePath, fullContent, language);
+            this.extractAndStoreComments(filePath, fullContent, language, result.nodes);
 
             const idx = errors.indexOf(errEntry);
             if (idx >= 0) errors.splice(idx, 1);
@@ -1139,50 +1224,6 @@ export class ExtractionOrchestrator {
   }
 
   /**
-   * Extract comments from source and store in comments table.
-   * Associates each comment with its nearest enclosing symbol and
-   * enriches CJK text with jieba-segmented tokens for FTS search.
-   */
-  private extractAndStoreComments(filePath: string, content: string, language: string, extractionNodes?: Node[]): void {
-    try {
-      const { extractComments } = require('./comment-extractor');
-      const comments = extractComments(content, filePath, language);
-
-      // Use pre-computed nodes from the current extraction when available
-      // (avoids stale nodes when storeExtractionResult was skipped due to
-      // content-hash match or extraction failure).
-      const fileNodes = extractionNodes ?? this.queries.getNodesByFile(filePath);
-      const enclosingKinds = new Set([
-        'function', 'method', 'class', 'struct', 'interface', 'trait',
-        'enum', 'type_alias', 'component', 'namespace', 'module', 'protocol', 'constant',
-      ]);
-      // Sort by start_line descending so the FIRST node whose start_line <= comment.start_line
-      // is the tightest enclosing symbol.
-      const candidates = fileNodes
-        .filter(n => enclosingKinds.has(n.kind))
-        .sort((a, b) => b.startLine - a.startLine || a.endLine - b.endLine);
-
-      this.queries.transaction(() => {
-        this.queries.deleteComments(filePath);
-        for (const c of comments) {
-          const associatedSymbol = associateCommentWithSymbol(c, candidates);
-
-          // Enrich CJK text for FTS; non-CJK comments don't need duplicate tokens
-          const ftsTokens = /\p{Script=Han}/u.test(c.text) ? enrichCJKForFTS(c.text) : '';
-
-          this.queries.insertComment({
-            ...c,
-            associatedSymbol,
-            ftsTokens,
-          });
-        }
-      });
-    } catch (e) {
-      logDebug('Comment extraction failed', { filePath, error: String(e) });
-    }
-  }
-
-  /**
    * Store extraction result in database
    */
   private storeExtractionResult(
@@ -1256,8 +1297,62 @@ export class ExtractionOrchestrator {
   }
 
   /**
-   * Sync with current file state.
-   * Uses git status as a fast path when available, falling back to full scan.
+   * Extract comments from source and store in comments table.
+   * Associates each comment with its nearest enclosing symbol and
+   * enriches CJK text with jieba-segmented tokens for FTS search.
+   */
+  private extractAndStoreComments(filePath: string, content: string, language: string, extractionNodes?: Node[]): void {
+    try {
+      const comments = extractComments(content, filePath, language);
+
+      // Use pre-computed nodes from the current extraction when available
+      // (avoids stale nodes when storeExtractionResult was skipped due to
+      // content-hash match or extraction failure).
+      const fileNodes = extractionNodes ?? this.queries.getNodesByFile(filePath);
+      const enclosingKinds = new Set([
+        'function', 'method', 'class', 'struct', 'interface', 'trait',
+        'enum', 'type_alias', 'component', 'namespace', 'module', 'protocol', 'constant',
+      ]);
+      // Sort by start_line descending so the FIRST node whose start_line <= comment.start_line
+      // is the tightest enclosing symbol.
+      const candidates = fileNodes
+        .filter(n => enclosingKinds.has(n.kind))
+        .sort((a, b) => b.startLine - a.startLine || a.endLine - b.endLine);
+
+      this.queries.transaction(() => {
+        this.queries.deleteComments(filePath);
+        for (const c of comments) {
+          const associatedSymbol = associateCommentWithSymbol(c, candidates);
+
+          // Enrich CJK text for FTS; non-CJK comments don't need duplicate tokens
+          const ftsTokens = /\p{Script=Han}/u.test(c.text) ? enrichCJKForFTS(c.text) : '';
+
+          this.queries.insertComment({
+            ...c,
+            associatedSymbol,
+            ftsTokens,
+          });
+        }
+      });
+    } catch (e) {
+      // Distinguish comment-extractor crashes (bug) from per-file parse
+      // failures (expected on malformed sources) — only debug-log the latter.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('comment-extractor') || msg.includes('extractComments')) {
+        logWarn('Comment extraction failed', { filePath, error: msg });
+      } else {
+        logDebug('Comment extraction failed', { filePath, error: msg });
+      }
+    }
+  }
+
+  /**
+   * Sync the index with the current file state.
+   *
+   * Change detection is filesystem-based, never git: a (size, mtime) stat
+   * pre-filter skips unchanged files, then a content-hash compare confirms real
+   * changes. This works in non-git projects and catches committed changes from
+   * `git pull`/`checkout`/`merge`/`rebase` that `git status` cannot see.
    */
   async sync(onProgress?: (progress: IndexProgress) => void): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
@@ -1276,93 +1371,75 @@ export class ExtractionOrchestrator {
     });
 
     const filesToIndex: string[] = [];
-    const gitChanges = getGitChangedFiles(this.rootDir);
+    // === Filesystem reconcile (git-independent) ===
+    // The source of truth for "what changed" is the filesystem vs the indexed
+    // state — never git. We enumerate the current source files and reconcile
+    // each against the DB. A cheap (size, mtime) stat pre-filter skips unchanged
+    // files without reading or hashing them, so the expensive read+hash+parse
+    // only runs for files that actually changed. This catches edits/adds/deletes
+    // whether or not the project uses git, and crucially also catches committed
+    // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
+    // cannot see, because the working tree is clean afterward.
+    const currentFiles = scanDirectory(this.rootDir);
+    filesChecked = currentFiles.length;
+    const currentSet = new Set(currentFiles);
 
-    if (gitChanges) {
-      // === Git fast path ===
-      // Only inspect the files git reports as changed instead of scanning everything.
-      filesChecked = gitChanges.modified.length + gitChanges.added.length + gitChanges.deleted.length;
+    const trackedFiles = this.queries.getAllFiles();
+    const trackedMap = new Map<string, FileRecord>();
+    for (const f of trackedFiles) {
+      trackedMap.set(f.path, f);
+    }
 
-      // Handle deleted files
-      for (const filePath of gitChanges.deleted) {
-        const tracked = this.queries.getFileByPath(filePath);
-        if (tracked) {
-          this.queries.deleteFile(filePath);
-          filesRemoved++;
-        }
+    // Removals: tracked in the DB but no longer a present source file. Check the
+    // filesystem directly — `scanDirectory` (via `git ls-files`) still lists a
+    // file deleted from disk but not yet staged, so set membership alone misses it.
+    for (const tracked of trackedFiles) {
+      if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
+        this.queries.deleteFile(tracked.path);
+        filesRemoved++;
       }
+    }
 
-      // Handle modified + added files — read + hash only these. Untracked
-      // (`??`) files stay untracked in git even after we index them, so they
-      // can't be trusted as "new": re-hash and compare against the DB exactly
-      // like modified files. Otherwise every sync re-indexes them and status
-      // reports them as pending forever. (See issue #206.)
-      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
-        const fullPath = path.join(this.rootDir, filePath);
-        let content: string;
+    // Adds / modifications.
+    for (const filePath of currentFiles) {
+      const fullPath = path.join(this.rootDir, filePath);
+      const tracked = trackedMap.get(filePath);
+
+      // Cheap pre-filter: an already-indexed file whose size AND mtime both match
+      // the DB is unchanged — skip it without reading or hashing. (A content
+      // change that preserves both exactly is the blind spot every mtime-based
+      // incremental tool accepts; `index --force` is the escape hatch. Git bumps
+      // mtime on every file it writes during checkout/merge, so pulls are caught.)
+      if (tracked) {
         try {
-          content = fs.readFileSync(fullPath, 'utf-8');
+          const stat = fs.statSync(fullPath);
+          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
+            continue;
+          }
         } catch (error) {
-          logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
+          logDebug('Skipping unstattable file during sync', { filePath, error: String(error) });
           continue;
         }
-
-        const contentHash = hashContent(content);
-        const tracked = this.queries.getFileByPath(filePath);
-
-        if (!tracked) {
-          filesToIndex.push(filePath);
-          changedFilePaths.push(filePath);
-          filesAdded++;
-        } else if (tracked.contentHash !== contentHash) {
-          filesToIndex.push(filePath);
-          changedFilePaths.push(filePath);
-          filesModified++;
-        }
-      }
-    } else {
-      // === Fallback: full scan (non-git project or git failure) ===
-      const currentFiles = new Set(scanDirectory(this.rootDir));
-      filesChecked = currentFiles.size;
-
-      // Build Map for O(1) lookups instead of .find() per file
-      const trackedFiles = this.queries.getAllFiles();
-      const trackedMap = new Map<string, FileRecord>();
-      for (const f of trackedFiles) {
-        trackedMap.set(f.path, f);
       }
 
-      // Find files to remove (in DB but not on disk)
-      for (const tracked of trackedFiles) {
-        if (!currentFiles.has(tracked.path)) {
-          this.queries.deleteFile(tracked.path);
-          filesRemoved++;
-        }
+      // New, or size/mtime changed — read + hash to confirm a real content change.
+      let content: string;
+      try {
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch (error) {
+        logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
+        continue;
       }
+      const contentHash = hashContent(content);
 
-      // Find files to add or update
-      for (const filePath of currentFiles) {
-        const fullPath = path.join(this.rootDir, filePath);
-        let content: string;
-        try {
-          content = fs.readFileSync(fullPath, 'utf-8');
-        } catch (error) {
-          logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
-          continue;
-        }
-
-        const contentHash = hashContent(content);
-        const tracked = trackedMap.get(filePath);
-
-        if (!tracked) {
-          filesToIndex.push(filePath);
-          changedFilePaths.push(filePath);
-          filesAdded++;
-        } else if (tracked.contentHash !== contentHash) {
-          filesToIndex.push(filePath);
-          changedFilePaths.push(filePath);
-          filesModified++;
-        }
+      if (!tracked) {
+        filesToIndex.push(filePath);
+        changedFilePaths.push(filePath);
+        filesAdded++;
+      } else if (tracked.contentHash !== contentHash) {
+        filesToIndex.push(filePath);
+        changedFilePaths.push(filePath);
+        filesModified++;
       }
     }
 
@@ -1496,10 +1573,6 @@ export class ExtractionOrchestrator {
   }
 }
 
-// Re-export useful types and functions
-export { extractFromSource } from './tree-sitter';
-export { detectLanguage, isSourceFile, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './grammars';
-
 /**
  * Associate a comment with the nearest enclosing or following symbol.
  *
@@ -1522,7 +1595,7 @@ export function associateCommentWithSymbol(
     }
   }
 
-  // Doc comments appear BEFORE the documented item.  Fall back to the
+  // Doc comments appear BEFORE the documented item. Fall back to the
   // nearest candidate whose startLine follows the comment's endLine.
   if (comment.kind === 'doc') {
     let bestGap = Infinity;
@@ -1539,3 +1612,7 @@ export function associateCommentWithSymbol(
 
   return undefined;
 }
+
+// Re-export useful types and functions
+export { extractFromSource } from './tree-sitter';
+export { detectLanguage, isSourceFile, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './grammars';
