@@ -58,7 +58,14 @@ export type EdgeKind =
   | 'instantiates'    // Creates instance of class
   | 'overrides'       // Method overrides parent method
   | 'decorates'       // Decorator applied to symbol
-  | 'pattern_match';  // Match/if-let pattern references an enum variant
+  | 'pattern_match'   // Match/if-let pattern references an enum variant
+  | 'runs_in'         // Bevy: system runs in a schedule
+  | 'on_enter'        // Bevy: handler registered via OnEnter(state)
+  | 'on_exit'         // Bevy: handler registered via OnExit(state)
+  | 'registers_resource'  // Bevy: plugin registers a resource
+  | 'registers_message'   // Bevy: plugin registers a message
+  | 'contains_plugin'     // Bevy: PluginGroup contains a plugin
+  | 'registers_system';   // Bevy: plugin registers a system (internal)
 
 /**
  * Supported programming languages. See NODE_KINDS for why this is a

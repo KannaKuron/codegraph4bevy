@@ -112,7 +112,7 @@ files → ExtractionOrchestrator (tree-sitter) → DB (nodes/edges/files)
 | 提取 | `src/extraction/tree-sitter.ts`、`languages/rust.ts` | Bevy DSL 模式、Rust match/if-let/macro 引用提取、语言感知的 forward-decl guard（仅对非 Rust 语言跳过无 body struct/enum） | 删除所有语言特定语义提取、无差别 forward-decl guard |
 | 提取流程 | `src/extraction/index.ts` | `extractAndStoreComments()` + `associateCommentWithSymbol()` 注释关联、`extractFile` 和 sync 路径中 4 处 hook 调用 | 删除注释提取（无 comments 表） |
 | 解析 | `src/resolution/callback-synthesizer.ts`、`frameworks/rust.ts`、`index.ts`、`name-matcher.ts` | Bevy ECS 边合成（N11/N12）、保留 `RUST_STD_MACROS`、`crate::` 前缀处理 | 删除所有框架特定合成、简化引用删除 |
-| MCP 工具 | `src/mcp/tools.ts`、`server-instructions.ts` | `codegraph_usages` 工具、批处理模式、`include_external`、`referencesType`/`impl_for` 参数、Bevy 合成边标签、worktree 不匹配检测 | 简化 API 表面积、删除 usages 工具、删除批处理 |
+| MCP 工具 | `src/mcp/tools.ts`、`server-instructions.ts` | `codegraph_callers` kind 参数扩展、批处理模式、`include_external`、`referencesType`/`impl_for` 参数、Bevy 合成边标签、worktree 不匹配检测 | 简化 API 表面积、删除批处理 |
 | 搜索 | `src/search/jieba-helper.ts`、`query-utils.ts` | jieba CJK 分词、`escapeLike`、`isDependencyFile`、Unicode 感知的 token 拆分 | 删除 CJK 支持、仅 ASCII token 化 |
 | 数据库 | `src/db/schema.sql`、`migrations.ts`、`queries.ts` | `comments` 表、`fts_tokens` 列、`findImplementors()`、`findNodesByReferencedType()`、`searchComments()` | 删除 comments 表、删除实现者查询、schema 版本回退 |
 | 上下文 | `src/context/index.ts`、`formatter.ts` | Bevy ECS state/resource 标签、CJK 查询分词、`EntryPointUsage` 统计 | 删除框架特定标签、CJK 处理、入口点统计 |
@@ -233,6 +233,9 @@ npm run build
 
 ## 开发规则
 
+- **每次完成任务后必须 `npm run build && npm link`**，确保全局 `codegraph` 二进制指向最新构建。全局部署通过 `npm link` 完成，后续只需 `npm run build` 即可更新
+- **编译后必须 `npm test` 跑测试**，确认无回归
+- **编译+MCP 代码变更后必须提醒用户重启**：`build` 只更新 `dist/` 中的代码，已运行的 MCP 服务器不自动重载。提示用户重启 MCP 服务器（或在 Claude Code 中 reconnect）使新代码生效。如果不提醒，用户测试时 `codegraph_*` MCP 工具仍使用旧代码
 - 修改 MCP 工具行为或 agent 使用方式时，需同步更新 `src/mcp/server-instructions.ts`、`src/installer/instructions-template.ts` 和 `.cursor/rules/codegraph.mdc`——它们写在不同位置但内容相同
 - CodeGraph 提供**代码上下文**，而非产品需求。新功能需要用户确认 UX、边界条件和验收标准——图谱不会告诉你这些
 - **正则表达式必须匹配类型/函数/方法名，绝不能用变量名。** 编写检测 API 使用模式的正则时，匹配不变的部分——类型路径（`NextState::Pending`）、函数名（`in_state`）或方法调用（`.add_systems(` 带前导点）。绝不要硬编码变量名如 `next_state`、`commands`、`app` 或 `router`——这些是开发者自由命名的标识符；CJK 名称、缩写或任何有效标识符都会让模式静默失效。对接收者/变量槽使用通用标识符类（`[\p{L}\p{N}_]+`、`\w+`）

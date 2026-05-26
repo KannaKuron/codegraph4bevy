@@ -543,8 +543,7 @@ const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)
 // nested fn bodies). Keyed by short name (last ::-segment) so that
 // crate::IntroState matches IntroState::Done via startsWith('IntroState::').
 const IMPL_HEADER_RE = /impl\s+ComputedStates\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)(?:\s+where\s+[^{]+)?\s*\{/gu;
-const ADD_SYSTEMS_ONENTER_RE = /\.add_systems\s*\(\s*OnEnter\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*,\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)/gu;
-const ADD_SYSTEMS_ONEXIT_RE = /\.add_systems\s*\(\s*OnExit\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*,\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)/gu;
+const ADD_SYSTEMS_ONENTEREXIT_RE = /\.add_systems\s*\(\s*(OnEnter|OnExit)\s*\(/g;
 
 // SubStates: #[source(ParentType = ParentType::Variant)] pub enum Name {
 const SUBSTATES_SOURCE_RE = /#\[\s*source\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*=\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?enum\s+([\p{L}\p{N}_]+)\s*\{/gu;
@@ -751,7 +750,10 @@ function stripRustComments(src: string): string {
       result += ' ';
       i++;
       while (i < src.length && src[i] !== '"') {
-        if (src[i] === '\\' && i + 1 < src.length) { result += ' '; i += 2; continue; }
+        if (src[i] === '\\' && i + 1 < src.length) {
+          if (src[i + 1] === '\n') { result += '\n'; i += 2; continue; }
+          result += ' '; i += 2; continue;
+        }
         if (src[i] === '\n') result += '\n'; else result += ' ';
         i++;
       }
@@ -930,7 +932,8 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
     }
   }
 
-  // Phase 2b: OnEnter/OnExit consumer detection — app.add_systems(OnEnter(X), handler)
+  // Phase 2b: OnEnter/OnExit consumer detection — app.add_systems(OnEnter(X), handlers)
+  // Reuses parseHandlerNames() for robust tuple/method-chain support (CR2).
   for (const [file, content] of strippedByFile) {
     const fileNodes = ctx.getNodesInFile(file);
     const fnByName = new Map<string, Node>();
@@ -939,22 +942,53 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
         if (!fnByName.has(n.name)) fnByName.set(n.name, n);
       }
     }
-    for (const re of [ADD_SYSTEMS_ONENTER_RE, ADD_SYSTEMS_ONEXIT_RE]) {
-      re.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(content))) {
-        const stateRaw = m[1]!.trim();
-        const handlerName = m[2]!.trim();
-        const { full, variant } = normalizeStateName(stateRaw);
-        const line = content.substring(0, m.index).split('\n').length;
-        let handlerNode = fnByName.get(handlerName);
+    ADD_SYSTEMS_ONENTEREXIT_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ADD_SYSTEMS_ONENTEREXIT_RE.exec(content))) {
+      // m.index points to start of ".add_systems(OnEnter(" or ".add_systems(OnExit("
+      const onOpen = m.index + m[0].length; // position after "OnEnter(" or "OnExit("
+      // Find matching ")" for the OnEnter/OnExit call
+      let onDepth = 0;
+      let onClose = -1;
+      for (let i = onOpen; i < content.length; i++) {
+        if (content[i] === '(') onDepth++;
+        else if (content[i] === ')') {
+          if (onDepth === 0) { onClose = i; break; }
+          onDepth--;
+        }
+      }
+      if (onClose < 0) continue;
+      const stateRaw = content.slice(onOpen, onClose).trim();
+      const { full, variant } = normalizeStateName(stateRaw);
+      // Find the comma after the OnEnter/OnExit call → start of handler args
+      let comma = -1;
+      for (let i = onClose + 1; i < content.length; i++) {
+        if (content[i] === ',') { comma = i; break; }
+        if (content[i] !== ' ' && content[i] !== '\t' && content[i] !== '\n') break;
+      }
+      if (comma < 0) continue;
+      // Find matching ")" for the add_systems call — start from the opening paren
+      const addSysOpen = content.indexOf('(', m.index);
+      if (addSysOpen < 0) continue;
+      let addSysDepth = 0;
+      let addSysClose = -1;
+      for (let i = addSysOpen; i < content.length; i++) {
+        if (content[i] === '(') addSysDepth++;
+        else if (content[i] === ')') { addSysDepth--; if (addSysDepth === 0) { addSysClose = i; break; } }
+      }
+      if (addSysClose < 0) continue;
+      const handlerArg = content.slice(comma + 1, addSysClose);
+      const handlerNames = parseHandlerNames(handlerArg);
+      const lineBase = content.substring(0, m.index).split('\n').length;
+      for (const hName of handlerNames) {
+        let handlerNode = fnByName.get(hName);
         if (!handlerNode) {
-          const globalNodes = ctx.getNodesByName(handlerName);
+          const globalNodes = ctx.getNodesByName(hName);
           handlerNode = globalNodes.length > 0 ? globalNodes[0] : undefined;
         }
         if (!handlerNode) continue;
         const entry = ensure(variant);
-        entry.consumers.set(handlerNode.id + '\0' + full, { line, full });
+        entry.consumers.set(handlerNode.id + '\0' + full, { line: lineBase, full });
       }
     }
   }
@@ -997,6 +1031,31 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
           source: producerId,
           target: consumerId,
           kind: 'calls',
+          line: pInfo.line,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'bevy-ecs-state', stateName: stateKey },
+        });
+      }
+    }
+  }
+
+  // CR7: producer→state_variant (enum_member) reference edges — separate loop
+  // because variant edges must be created even when no consumers are registered
+  // (e.g. bare variant names via `use Enum::*` glob imports have no consumers).
+  for (const [stateKey, data] of states) {
+    if (data.producers.size === 0) continue;
+    for (const [producerKey, pInfo] of data.producers) {
+      const producerId = producerKey.split('\0')[0]!;
+      const variantNodes = ctx.getNodesByName(stateKey);
+      for (const vn of variantNodes) {
+        if (vn.kind !== 'enum_member') continue;
+        const refDedupKey = `${producerId}>${vn.id}:ref`;
+        if (seen.has(refDedupKey)) continue;
+        seen.add(refDedupKey);
+        edges.push({
+          source: producerId,
+          target: vn.id,
+          kind: 'references',
           line: pInfo.line,
           provenance: 'heuristic',
           metadata: { synthesizedBy: 'bevy-ecs-state', stateName: stateKey },
@@ -1091,6 +1150,409 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
   return edges;
 }
 
+// ===========================================================================
+// Bevy DSL Semantic Edges (N12)
+// ===========================================================================
+
+const WELL_KNOWN_SCHEDULES = new Set([
+  'Update', 'FixedUpdate', 'PreUpdate', 'PostUpdate',
+  'Startup', 'PostStartup', 'First', 'Last',
+]);
+
+/** Extract a bracket-delimited block starting at position `open` in `src`. */
+function extractBlock(src: string, open: number): string | null {
+  const openChar = src[open];
+  if (openChar !== '{' && openChar !== '(') return null;
+  const closer = openChar === '{' ? '}' : ')';
+  let depth = 1;
+  let i = open + 1;
+  while (i < src.length && depth > 0) {
+    if (src[i] === openChar) depth++;
+    else if (src[i] === closer) depth--;
+    i++;
+  }
+  return depth === 0 ? src.slice(open + 1, i - 1) : null;
+}
+
+/** Find the first node named `name` in `file`, then fall back to global search. */
+function resolveNode(name: string, file: string, ctx: ResolutionContext): Node | null {
+  const fileNodes = ctx.getNodesInFile(file);
+  const match = fileNodes.find(n => n.name === name);
+  if (match) return match;
+  const global = ctx.getNodesByName(name);
+  return global.find(n => n.kind === 'struct' || n.kind === 'class') ?? global[0] ?? null;
+}
+
+/**
+ * Parse system function names from add_systems handler arguments.
+ * Handles: single fn, scoped fn (a::b), tuples (a, b), and simple
+ * method chains (fn.run_if(…).after(…)).
+ */
+function parseHandlerNames(handlerExpr: string): string[] {
+  const names: string[] = [];
+  const trimmed = handlerExpr.trim();
+  if (!trimmed) return names;
+
+  // Tuple: (handler1, handler2, ...)
+  if (trimmed.startsWith('(')) {
+    const inner = extractBlock('(' + trimmed.slice(1), 0);
+    if (inner) {
+      const parts = splitTopLevelCommas(inner);
+      for (const p of parts) names.push(...parseHandlerNames(p));
+    }
+    return names;
+  }
+
+  // Method chain or bare identifier — take the first identifier as the fn name.
+  const firstId = /^([\p{L}\p{N}_]+(?:::\s*[\p{L}\p{N}_]+)*)/u.exec(trimmed);
+  if (firstId) names.push(firstId[1]!.replace(/\s+/g, ''));
+  return names;
+}
+
+/** Split by commas at brace-depth 0. */
+function splitTopLevelCommas(s: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '(' || s[i] === '<') depth++;
+    else if (s[i] === ')' || s[i] === '>') depth--;
+    else if (s[i] === ',' && depth === 0) {
+      parts.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(s.slice(start));
+  return parts;
+}
+
+/**
+ * Parse `app.add_systems(…)` calls in `buildBody` and create
+ * on_enter / on_exit / runs_in edges.
+ */
+function parseAddSystems(
+  buildBody: string,
+  pluginNode: Node,
+  file: string,
+  lineOffset: number,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  queries: QueryBuilder,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.add_systems\s*\(/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const open = m.index + m[0].length;
+    // Find the matching closing paren for add_systems(...)
+    let depth = 0;
+    let close = -1;
+    for (let i = open - 1; i < buildBody.length; i++) {
+      if (buildBody[i] === '(') depth++;
+      else if (buildBody[i] === ')') { depth--; if (depth === 0) { close = i; break; } }
+    }
+    if (close < 0) continue;
+    const argsStr = buildBody.slice(open, close);
+    const args = splitTopLevelCommas(argsStr);
+    if (args.length < 2) continue;
+
+    const scheduleArg = args[0]!.trim();
+    const handlerArg = args.slice(1).join(',');
+
+    // Determine edge kind from schedule expression
+    let scheduleName: string | null = null;
+    const onEnterMatch = /^OnEnter\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
+    const onExitMatch = /^OnExit\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
+
+    if (onEnterMatch || onExitMatch) {
+      const stateName = (onEnterMatch ?? onExitMatch)![1]!.replace(/\s+/g, '');
+      const edgeKind: 'on_enter' | 'on_exit' = onEnterMatch ? 'on_enter' : 'on_exit';
+      // Enum variants are stored with `name` = the variant segment (e.g. "主菜单"),
+      // and `qualified_name` = the full path (e.g. "游戏流程_状态::主菜单").
+      // Search by the variant name, then verify qualified_name matches.
+      const variantName = stateName.split('::').pop() ?? stateName;
+      const allVariantNodes = ctx.getNodesByName(variantName);
+      const stateNodes = allVariantNodes.filter(n =>
+        n.kind === 'enum_member' && n.qualifiedName === stateName,
+      );
+      // Fallback: if qualified name doesn't match, accept any enum_member with the variant name
+      const effectiveStateNodes = stateNodes.length > 0
+        ? stateNodes
+        : allVariantNodes.filter(n => n.kind === 'enum_member');
+
+      // Resolve handler function names
+      const handlerNames = parseHandlerNames(handlerArg);
+      for (const hName of handlerNames) {
+        const handlerNode = resolveNode(hName, file, ctx);
+        if (!handlerNode) continue;
+
+        // registers_system edge: plugin → handler
+        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleArg}`;
+        if (!seen.has(rsKey)) {
+          seen.add(rsKey);
+          const rsLine = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+          edges.push({
+            source: pluginNode.id,
+            target: handlerNode.id,
+            kind: 'registers_system',
+            line: rsLine,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'bevy-dsl', schedule: scheduleArg.replace(/\s+/g, '') },
+          });
+        }
+
+        // on_enter / on_exit edge: handler → state variant
+        for (const sn of effectiveStateNodes) {
+          const key = `${handlerNode.id}>${sn.id}>${edgeKind}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+          edges.push({
+            source: handlerNode.id,
+            target: sn.id,
+            kind: edgeKind,
+            line,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'bevy-dsl', plugin: pluginNode.name },
+          });
+        }
+      }
+    } else {
+      // Named schedule or other expression
+      const sched = scheduleArg.split('::').pop()!;
+      scheduleName = WELL_KNOWN_SCHEDULES.has(sched) ? sched : scheduleArg;
+
+      // Create virtual schedule node
+      const schedNodeId = `bevy-schedule-${scheduleName}`;
+      try {
+        queries.insertNodes([{
+          id: schedNodeId,
+          name: scheduleName,
+          kind: 'variable',
+          qualifiedName: scheduleName,
+          filePath: pluginNode.filePath,
+          language: 'rust',
+          startLine: 0, endLine: 0,
+          startColumn: 0, endColumn: 0,
+          updatedAt: Date.now(),
+        }]);
+      } catch { /* node already exists or insert failed — safe to ignore */ }
+
+      const handlerNames = parseHandlerNames(handlerArg);
+      for (const hName of handlerNames) {
+        const handlerNode = resolveNode(hName, file, ctx);
+        if (!handlerNode) continue;
+
+        // registers_system edge: plugin → handler
+        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleName}`;
+        if (!seen.has(rsKey)) {
+          seen.add(rsKey);
+          const rsLine = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+          edges.push({
+            source: pluginNode.id,
+            target: handlerNode.id,
+            kind: 'registers_system',
+            line: rsLine,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'bevy-dsl', schedule: scheduleName },
+          });
+        }
+
+        // runs_in edge: handler → schedule node
+        const key = `${handlerNode.id}>${schedNodeId}>runs_in`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+        edges.push({
+          source: handlerNode.id,
+          target: schedNodeId,
+          kind: 'runs_in',
+          line,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'bevy-dsl', plugin: pluginNode.name },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+/** Parse `app.init_resource::<T>()` → registers_resource edges. */
+function parseInitResource(
+  buildBody: string,
+  pluginNode: Node,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  lineOffset: number,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.init_resource\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const typeName = m[1]!.replace(/\s+/g, '');
+    const resNodes = ctx.getNodesByName(typeName);
+    for (const rn of resNodes) {
+      if (rn.kind !== 'struct' && rn.kind !== 'enum') continue;
+      const key = `${pluginNode.id}>${rn.id}>registers_resource`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+      edges.push({
+        source: pluginNode.id,
+        target: rn.id,
+        kind: 'registers_resource',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'bevy-dsl' },
+      });
+    }
+  }
+  return edges;
+}
+
+/** Parse `app.add_message::<T>()` → registers_message edges. */
+function parseAddMessage(
+  buildBody: string,
+  pluginNode: Node,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  lineOffset: number,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.add_message\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const typeName = m[1]!.replace(/\s+/g, '');
+    const msgNodes = ctx.getNodesByName(typeName);
+    for (const mn of msgNodes) {
+      if (mn.kind !== 'struct' && mn.kind !== 'enum') continue;
+      const key = `${pluginNode.id}>${mn.id}>registers_message`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+      edges.push({
+        source: pluginNode.id,
+        target: mn.id,
+        kind: 'registers_message',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'bevy-dsl' },
+      });
+    }
+  }
+  return edges;
+}
+
+/** Parse PluginGroup::build() → `.add(PluginType)` → contains_plugin edges. */
+function parsePluginGroupBuild(
+  buildBody: string,
+  groupNode: Node,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  lineOffset: number,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.add\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const typeName = m[1]!.replace(/\s+/g, '');
+    // Scoped names like "module::Struct" — try full name first, then last segment
+    let pluginNodes = ctx.getNodesByName(typeName).filter(n => n.kind === 'struct');
+    if (pluginNodes.length === 0) {
+      const lastSeg = typeName.split('::').pop() ?? typeName;
+      if (lastSeg !== typeName) {
+        pluginNodes = ctx.getNodesByName(lastSeg).filter(n => n.kind === 'struct');
+      }
+    }
+    for (const pn of pluginNodes) {
+      const key = `${groupNode.id}>${pn.id}>contains_plugin`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+      edges.push({
+        source: groupNode.id,
+        target: pn.id,
+        kind: 'contains_plugin',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'bevy-dsl' },
+      });
+    }
+  }
+  return edges;
+}
+
+/**
+ * Synthesize Bevy DSL semantic edges (N12).
+ *
+ * Scans Plugin/PluginGroup `build()` method bodies for
+ * add_systems, init_resource, add_message, and PluginGroup::build
+ * patterns, creating structured edges (on_enter, on_exit, runs_in,
+ * registers_resource, registers_message, contains_plugin) that
+ * static tree-sitter extraction treats as opaque calls.
+ */
+function bevyDslEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  const IMPL_RE = /impl\s+(Plugin(?:Group)?)\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)/gu;
+
+  for (const file of ctx.getAllFiles()) {
+    if (!file.endsWith('.rs')) continue;
+    const raw = ctx.readFile(file);
+    if (!raw) continue;
+    const content = stripRustComments(raw);
+
+    IMPL_RE.lastIndex = 0;
+    let implMatch: RegExpExecArray | null;
+    while ((implMatch = IMPL_RE.exec(content))) {
+      const traitName = implMatch[1]!;   // "Plugin" or "PluginGroup"
+      const structName = implMatch[2]!;
+      const structNode = resolveNode(structName, file, ctx);
+      if (!structNode) continue;
+
+      // Extract impl block body
+      const implOpen = content.indexOf('{', implMatch.index);
+      if (implOpen < 0) continue;
+      const implBody = extractBlock(content, implOpen);
+      if (!implBody) continue;
+
+      // Find fn build(…) inside the impl body
+      const buildRe = /fn\s+build\s*\([^)]*\)\s*(?:->\s*[^{]+)?\s*\{/g;
+      buildRe.lastIndex = 0;
+      let buildMatch: RegExpExecArray | null;
+      while ((buildMatch = buildRe.exec(implBody))) {
+        const buildOpen = implBody.indexOf('{', buildMatch.index);
+        if (buildOpen < 0) continue;
+        const buildBody = extractBlock(implBody, buildOpen);
+        if (!buildBody) continue;
+
+        // Line offset: impl body start line + build body start line
+        const implStartLine = content.slice(0, implOpen).split('\n').length;
+        const buildStartLine = implBody.slice(0, buildOpen).split('\n').length;
+        const lineOffset = implStartLine + buildStartLine - 1;
+
+        if (traitName === 'Plugin') {
+          edges.push(...parseAddSystems(buildBody, structNode, file, lineOffset, ctx, seen, queries));
+          edges.push(...parseInitResource(buildBody, structNode, ctx, seen, lineOffset));
+          edges.push(...parseAddMessage(buildBody, structNode, ctx, seen, lineOffset));
+        } else {
+          // PluginGroup
+          edges.push(...parsePluginGroupBuild(buildBody, structNode, ctx, seen, lineOffset));
+        }
+      }
+    }
+  }
+
+  return edges;
+}
+
+// ===========================================================================
+
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
   const fieldEdges = fieldChannelEdges(queries, ctx);
   const emitterEdges = eventEmitterEdges(ctx);
@@ -1105,7 +1567,8 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const seen = new Set<string>();
   const bevyEdges = bevyEcsEdges(ctx);
   const stateEdges = bevyStateEdges(ctx);
-  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges, ...bevyEdges, ...stateEdges]) {
+  const dslEdges = bevyDslEdges(queries, ctx);
+  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges, ...bevyEdges, ...stateEdges, ...dslEdges]) {
     const key = `${e.source}>${e.target}>${(e.metadata as Record<string, unknown>)?.synthesizedBy ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);

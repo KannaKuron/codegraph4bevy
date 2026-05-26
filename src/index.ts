@@ -416,6 +416,12 @@ export class CodeGraph {
                 total,
               });
             });
+
+            // N13: Re-synthesize heuristic callback/dispatcher edges (e.g.,
+            // Bevy state transitions). These cross file boundaries and were
+            // cascade-deleted when the changed file's nodes were removed
+            // during re-extraction.
+            this.resolver.synthesizeCallbackEdges();
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();

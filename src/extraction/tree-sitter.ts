@@ -1131,7 +1131,7 @@ export class TreeSitterExtractor {
   /**
    * Extract a `calls` edge from a macro_invocation node so that
    * `warn!()`, `error!()`, `info!()`, `println!()` etc. are searchable
-   * via codegraph_callers / codegraph_usages / codegraph_callees.
+   * via codegraph_callers / codegraph_callees (or callers with kind filter).
    */
   private extractMacroCall(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;

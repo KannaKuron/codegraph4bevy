@@ -1259,7 +1259,11 @@ program
       const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        const exactMatch = match.node.name === symbol
+          || match.node.name.endsWith(`.${symbol}`)
+          || match.node.name.endsWith(`::${symbol}`)
+          || match.node.qualifiedName === symbol
+          || match.node.qualifiedName?.endsWith(`::${symbol}`);
         if (!exactMatch && matches.length > 1) continue;
         for (const c of cg.getCallers(match.node.id)) {
           if (!seen.has(c.node.id)) {
@@ -1338,7 +1342,11 @@ program
       const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        const exactMatch = match.node.name === symbol
+          || match.node.name.endsWith(`.${symbol}`)
+          || match.node.name.endsWith(`::${symbol}`)
+          || match.node.qualifiedName === symbol
+          || match.node.qualifiedName?.endsWith(`::${symbol}`);
         if (!exactMatch && matches.length > 1) continue;
         for (const c of cg.getCallees(match.node.id)) {
           if (!seen.has(c.node.id)) {
@@ -1418,7 +1426,11 @@ program
       let edgeCount = 0;
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        const exactMatch = match.node.name === symbol
+          || match.node.name.endsWith(`.${symbol}`)
+          || match.node.name.endsWith(`::${symbol}`)
+          || match.node.qualifiedName === symbol
+          || match.node.qualifiedName?.endsWith(`::${symbol}`);
         if (!exactMatch && matches.length > 1) continue;
         const impact = cg.getImpactRadius(match.node.id, depth);
         for (const [id, n] of impact.nodes) {

@@ -304,7 +304,7 @@ export interface ToolResult {
  */
 const projectPathProperty: PropertySchema = {
   type: 'string',
-  description: 'Path to a different project with .codegraph/ initialized. If omitted, uses current project. Use this to query other codebases.',
+  description: '其他已初始化 .codegraph/ 的项目路径。省略则使用当前项目。用于查询其他代码库。',
 };
 
 /**
@@ -318,35 +318,35 @@ const projectPathProperty: PropertySchema = {
 export const tools: ToolDefinition[] = [
   {
     name: 'codegraph_search',
-    description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_context instead for comprehensive task context.',
+    description: '按名称快速搜索符号。只返回位置（不含源码）。需要全面的任务上下文时用 codegraph_context。',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Symbol name or partial name (e.g., "auth", "signIn", "UserService")',
+          description: '符号名或部分名称（如 "auth"、"signIn"、"UserService"）',
         },
         kind: {
           type: 'string',
-          description: 'Filter by node kind',
+          description: '按节点类型过滤',
           enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component', 'comment'],
         },
         referencesType: {
           type: 'string',
-          description: 'Find symbols that reference this type (via type_of/references/returns edges). When set, query is used only as a fallback if referencesType yields no results.',
+          description: '查找引用此类型的所有符号（通过 type_of/references/returns 边）。设置后 query 仅作 fallback。',
         },
         mutability: {
           type: 'string',
-          description: 'When referencesType is set, filter by borrowing mode: "mut" (mutable borrow, ResMut), "shared" (shared borrow, Res, &T), or "owning" (owned value, return type). Use to separate writers from readers of a resource.',
+          description: 'referencesType 时过滤借用模式："mut"（可变借用，ResMut）、"shared"（共享借用，Res、&T）、"owning"（拥有值，返回类型）。用于区分资源的读写者。',
           enum: ['mut', 'shared', 'owning'],
         },
         impl_for: {
           type: 'string',
-          description: 'Find all types that implement the given trait/interface (via implements edges or unresolved references). When set, query is used only as a fallback if impl_for yields no results.',
+          description: '查找实现指定 trait/interface 的所有类型（通过 implements 边或未解析引用）。设置后 query 仅作 fallback。',
         },
         limit: {
           type: 'number',
-          description: 'Maximum results (default: 10)',
+          description: '最大结果数（默认: 10）',
           default: 10,
         },
         projectPath: projectPathProperty,
@@ -356,22 +356,22 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_context',
-    description: 'PRIMARY TOOL — call this FIRST for any "how does X work", architecture, feature, or bug-context question. Composes search + node + callers + callees and returns entry points, related symbols, and key code in ONE call — usually enough to answer with no further search/Read/Grep. Prefer this over chaining codegraph_search + codegraph_node, and over codegraph_explore. NOTE: provides CODE context, not product requirements; for new features still clarify UX/edge cases with the user.',
+    description: '主工具 — 任何"X 怎么工作"、架构、功能或 bug 上下文问题都先调这个。组合 search + node + callers + callees，一次调用返回入口点、相关符号和关键代码 — 通常无需进一步搜索/Read/Grep。优于链式 codegraph_search + codegraph_node 和 codegraph_explore。注意：提供的是代码上下文，不是产品需求；新功能仍需与用户确认 UX/边界条件。',
     inputSchema: {
       type: 'object',
       properties: {
         task: {
           type: 'string',
-          description: 'Description of the task, bug, or feature to build context for',
+          description: '要构建上下文的任务、bug 或功能描述',
         },
         maxNodes: {
           type: 'number',
-          description: 'Maximum symbols to include (default: 20)',
+          description: '包含的最大符号数（默认: 20）',
           default: 20,
         },
         includeCode: {
           type: 'boolean',
-          description: 'Include code snippets for key symbols (default: true)',
+          description: '包含关键符号的代码片段（默认: true）',
           default: true,
         },
         projectPath: projectPathProperty,
@@ -381,22 +381,27 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callers',
-    description: 'Find all functions/methods that call a specific symbol. Returns call-site line numbers and single-line source snippets, not just function definition locations. Useful for understanding usage patterns and impact of changes.',
+    description: '查找调用指定符号的所有函数/方法。返回调用点行号和单行源码片段。加 "kind" 参数可查非调用关系：references、type_of、pattern_match、instantiates 及框架特定边。支持 symbols 数组批量查询。',
     inputSchema: {
       type: 'object',
       properties: {
         symbol: {
           type: 'string',
-          description: 'Name of the function, method, or class to find callers for',
+          description: '要查找调用者的函数、方法或类名',
         },
         symbols: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Batch query: multiple symbol names to find callers for. Results grouped by symbol. Use instead of calling codegraph_callers N times. When both "symbol" and "symbols" are provided, "symbols" takes precedence.',
+          description: '批量查询：多个符号名，结果按符号分组',
+        },
+        kind: {
+          type: 'string',
+          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。通用类型："references"、"type_of"、"pattern_match"、"instantiates"、"contains"。框架特定（Bevy ECS）："runs_in"、"on_enter"、"on_exit"、"registers_resource"、"registers_message"、"contains_plugin"。',
+          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'runs_in', 'on_enter', 'on_exit', 'registers_resource', 'registers_message', 'contains_plugin'],
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of callers to return (default: 20)',
+          description: '返回的最大调用者数（默认: 20）',
           default: 20,
         },
         projectPath: projectPathProperty,
@@ -410,22 +415,22 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callees',
-    description: 'Find all functions/methods that a specific symbol calls. Returns call-site line numbers and single-line source snippets. Useful for understanding dependencies and code flow.',
+    description: '查找指定符号调用的所有函数/方法。返回调用点行号和单行源码片段。include_external 显示对外部 API 的调用。支持 symbols 数组批量查询。',
     inputSchema: {
       type: 'object',
       properties: {
         symbol: {
           type: 'string',
-          description: 'Name of the function, method, or class to find callees for',
+          description: '要查找被调用者的函数、方法或类名',
         },
         include_external: {
           type: 'boolean',
-          description: 'Include calls to external symbols (no project-internal node). Shows unresolved refs for external crate types like Bevy APIs. Default: false.',
+          description: '包含对外部符号的调用（无项目内节点）。显示外部 crate 类型的未解析引用。默认: false。',
           default: false,
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of callees to return (default: 20)',
+          description: '返回的最大被调用者数（默认: 20）',
           default: 20,
         },
         projectPath: projectPathProperty,
@@ -435,22 +440,22 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_impact',
-    description: 'Analyze the impact radius of changing a symbol. Shows what code could be affected by modifications.',
+    description: '分析修改某符号的影响半径 — 改了会破坏什么？显示可能受影响的代码，按依赖距离排序。includeCode 内联受影响符号的源码。',
     inputSchema: {
       type: 'object',
       properties: {
         symbol: {
           type: 'string',
-          description: 'Name of the symbol to analyze impact for',
+          description: '要分析影响的符号名',
         },
         depth: {
           type: 'number',
-          description: 'How many levels of dependencies to traverse (default: 2)',
+          description: '遍历依赖的层数（默认: 2）',
           default: 2,
         },
         includeCode: {
           type: 'boolean',
-          description: 'Include source code snippets for Level 1 nodes (default: false). Each snippet capped at 8 lines/400 chars.',
+          description: '包含一级节点的源码片段（默认: false）。每段上限 8 行/400 字符。',
           default: false,
         },
         projectPath: projectPathProperty,
@@ -460,22 +465,22 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_node',
-    description: 'Get ONE symbol\'s details (location, signature, docstring) PLUS its TRAIL — what it calls and what calls it, each with file:line. Pass includeCode=true for source (functions return their body; containers return a member outline). Use this to WALK the call graph hop-by-hop — node a symbol, then node one of its trail entries — the structural, no-Read way to follow "what calls/triggers/handles X" across files. For a broad first overview of many symbols at once use codegraph_explore; use node to drill along a specific path from there. (If a trail is empty on a non-leaf, that hop is likely dynamic dispatch — read just that line.) Source returned with includeCode is the verbatim live file content — identical to Read.',
+    description: '获取一个符号的详情（位置、签名、文档）及上下游 — 调用什么、被谁调用，各带 file:line。includeCode=true 返回函数体/成员概览源码。用于逐跳遍历调用图。批量总览用 codegraph_explore，深入具体路径用 node。返回的源码与 Read 逐字节一致。',
     inputSchema: {
       type: 'object',
       properties: {
         symbol: {
           type: 'string',
-          description: 'Name of the symbol to get details for',
+          description: '要获取详情的符号名',
         },
         symbols: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Batch query: multiple symbol names to get details for. Results grouped by symbol. Use instead of calling codegraph_node N times. When both "symbol" and "symbols" are provided, "symbols" takes precedence.',
+          description: '批量查询：多个符号名获取详情。结果按符号分组。替代多次调用 codegraph_node。',
         },
         includeCode: {
           type: 'boolean',
-          description: 'Include full source code (default: false to minimize context)',
+          description: '包含完整源码（默认: false 以最小化上下文）',
           default: false,
         },
         projectPath: projectPathProperty,
@@ -489,31 +494,31 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: 'Returns source for SEVERAL related symbols grouped by file, plus a relationship map, in ONE capped call. This is the efficient way to inspect many related symbols at once — strongly prefer it over a series of codegraph_node or Read calls (each separate call re-reads the whole context, so 8 node calls cost far more than 1 explore). Use it after codegraph_context when you need to see the actual source of several symbols. Query with specific symbol/file/code terms, NOT natural-language sentences — run codegraph_search first to find names. Bad: "how are agent prompts loaded and passed to the CLI". Good: "renderStaticScene drawElementOnCanvas ShapeCache renderElement.ts". The code it returns is the VERBATIM live file source (byte-for-byte identical to Read), line-numbered — not a summary; treat files it shows as already Read, no need to re-open them.',
+    description: '一次有上限调用返回多个相关符号的源码（按文件分组）和关系图。高效查看多个相关符号的首选 — 优于多次 codegraph_node 或 Read（每次单独调用重读整个上下文，10 次 node 远比 1 次 explore 开销大）。codegraph_context 后需要看实际源码时使用。用具体符号/文件/代码术语查询，不要用自然语言句子 — 先用 codegraph_search 找名字。好的查询："renderStaticScene drawElementOnCanvas ShapeCache"。差的查询："agent prompts are loaded"。返回的是原始源码（与 Read 逐字节一致），带行号，非摘要。',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Symbol names, file names, or short code terms to explore (e.g., "AuthService loginUser session-manager", "GraphTraverser BFS impact traversal.ts"). Use codegraph_search first to find relevant names.',
+          description: '要探索的符号名、文件名或短代码术语（如 "AuthService loginUser session-manager"）。先用 codegraph_search 找相关名。',
         },
         path: {
           type: 'string',
-          description: 'Limit exploration to files under this directory path (e.g., "src/components")',
+          description: '限定探索此目录下的文件（如 "src/components"）',
         },
         maxFiles: {
           type: 'number',
-          description: 'Maximum number of files to include source code from (default: 12)',
+          description: '包含源码的最大文件数（默认: 12）',
           default: 12,
         },
         sourceOnly: {
           type: 'boolean',
-          description: 'Skip relationship map, return only source code (default: false)',
+          description: '跳过关系图，只返回源码（默认: false）',
           default: false,
         },
         strict: {
           type: 'boolean',
-          description: 'When true, limit results to only files under the path directory (default: false)',
+          description: '为 true 时结果仅限 path 目录下的文件（默认: false）',
           default: false,
         },
         projectPath: projectPathProperty,
@@ -523,7 +528,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_status',
-    description: 'Get the status of the CodeGraph index, including statistics about indexed files, nodes, and edges.',
+    description: '获取 CodeGraph 索引状态。返回已索引文件数、节点数、边数等统计信息及当前使用的数据库后端（better-sqlite3 或 WASM）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -533,36 +538,36 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_files',
-    description: 'REQUIRED for file/folder exploration. Get the project file structure from the CodeGraph index. Returns a tree view of all indexed files with metadata (language, symbol count). Much faster than Glob/filesystem scanning. Use this FIRST when exploring project structure, finding files, or understanding codebase organization.',
+    description: '从索引返回项目文件结构。展示所有已索引文件的树状视图及元数据（语言、符号数）。比 glob/文件系统扫描快得多。探索项目结构、找文件、理解代码库组织时先用这个。symbols: true 包含每个文件的顶层符号名。',
     inputSchema: {
       type: 'object',
       properties: {
         path: {
           type: 'string',
-          description: 'Filter to files under this directory path (e.g., "src/components"). Returns all files if not specified.',
+          description: '过滤此目录下的文件（如 "src/components"）。未指定返回所有文件。',
         },
         pattern: {
           type: 'string',
-          description: 'Filter files matching this glob pattern (e.g., "*.tsx", "**/*.test.ts")',
+          description: '按 glob 模式过滤文件（如 "*.tsx"、"**/*.test.ts"）',
         },
         format: {
           type: 'string',
-          description: 'Output format: "tree" (hierarchical, default), "flat" (simple list), "grouped" (by language)',
+          description: '输出格式："tree"（树状，默认）、"flat"（平铺）、"grouped"（按语言分组）',
           enum: ['tree', 'flat', 'grouped'],
           default: 'tree',
         },
         includeMetadata: {
           type: 'boolean',
-          description: 'Include file metadata like language and symbol count (default: true)',
+          description: '包含文件元数据如语言和符号数（默认: true）',
           default: true,
         },
         maxDepth: {
           type: 'number',
-          description: 'Maximum directory depth to show (default: unlimited)',
+          description: '显示的最大目录深度（默认: 无限制）',
         },
         symbols: {
           type: 'boolean',
-          description: 'Include top-level symbol names and kinds for each file (default: false)',
+          description: '包含每个文件的顶层符号名和类型（默认: false）',
           default: false,
         },
         projectPath: projectPathProperty,
@@ -570,56 +575,22 @@ export const tools: ToolDefinition[] = [
     },
   },
   {
-    name: 'codegraph_usages',
-    description: 'Find all usages of a symbol (calls, references, pattern matches, type annotations, instantiations). Broader than callers — covers every edge kind that references the symbol. Supports batch mode: pass `symbols` (array) to query multiple symbols at once, results grouped by symbol.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        symbol: {
-          type: 'string',
-          description: 'Name of the symbol to find usages for',
-        },
-        symbols: {
-          type: 'array',
-          description: 'Batch query: multiple symbol names to find usages for. Results grouped by symbol. Use instead of calling codegraph_usages N times. When both "symbol" and "symbols" are provided, "symbols" takes precedence.',
-          items: { type: 'string' },
-        },
-        kind: {
-          type: 'string',
-          description: 'Filter by usage kind (default: all kinds)',
-          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match'],
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum usages to return per symbol (default: 20)',
-          default: 20,
-        },
-        projectPath: projectPathProperty,
-      },
-      required: [],
-      anyOf: [
-        { required: ['symbol'] },
-        { required: ['symbols'] },
-      ],
-    },
-  },
-  {
     name: 'codegraph_trace',
-    description: 'Trace the CALL PATH between two symbols — "how does <from> reach/become <to>?" Returns the chain of functions from one to the other (each hop with file:line and its body inlined, plus the outgoing calls of the destination itself) in ONE call. This is something grep/Read structurally cannot do: there is no text pattern for "the path from A to B". Ideal for flow questions — how an update triggers a render, how a request reaches a handler, how a QuerySet becomes SQL. If no static path exists the chain likely breaks at dynamic dispatch (callbacks/descriptors/metaclasses); the tool says where and points you to codegraph_node to bridge it.',
+    description: '追踪两个符号之间的调用路径 — "from 如何到达/变成 to？" 一次调用返回完整函数链（每跳带 file:line 和内联源码及目的地本身的被调用者）。这是 grep/Read 结构上无法做到的 — 没有"从 A 到 B 的路径"这种文本模式。适用于流程问题 — 更新如何触发渲染、请求如何到达处理器。如无静态路径则链在动态调度处断开（回调/描述符/元类）；工具会指出断开点。',
     inputSchema: {
       type: 'object',
       properties: {
         from: {
           type: 'string',
-          description: 'Symbol the flow starts at (e.g., "QuerySet", "handleRequest", "mutateElement")',
+          description: '流程起始符号（如 "QuerySet"、"handleRequest"）',
         },
         to: {
           type: 'string',
-          description: 'Symbol the flow should reach (e.g., "execute_sql", "render", "setState")',
+          description: '流程目标符号（如 "execute_sql"、"render"）',
         },
         includeCode: {
           type: 'boolean',
-          description: 'Include source code for each hop (default: true). Set to false for a compact symbol-only trace.',
+          description: '包含每跳源码（默认: true）。false 仅返回符号名。',
           default: true,
         },
         projectPath: projectPathProperty,
@@ -1091,8 +1062,6 @@ export class ToolHandler {
           return await this.handleStatus(args);
         case 'codegraph_files':
           result = await this.handleFiles(args); break;
-        case 'codegraph_usages':
-          result = await this.handleUsages(args); break;
         case 'codegraph_trace':
           result = await this.handleTrace(args); break;
         default:
@@ -1261,12 +1230,15 @@ export class ToolHandler {
    */
   private async handleCallers(args: Record<string, unknown>): Promise<ToolResult> {
     const limit = clamp((args.limit as number) || 20, 1, 100);
+    const kindFilter = args.kind as string | undefined;
 
-    // Batch mode: symbols array — check BEFORE getCodeGraph (args check needs no DB)
+    // Batch mode: symbols array
     const symbolsArr = args.symbols as string[] | undefined;
     if (symbolsArr && Array.isArray(symbolsArr) && symbolsArr.length > 0) {
       const cg = this.getCodeGraph(args.projectPath as string | undefined);
-      return this.handleBatchCallers(cg, symbolsArr, limit);
+      return kindFilter
+        ? this.handleBatchUsagesMode(cg, symbolsArr, limit, kindFilter)
+        : this.handleBatchCallers(cg, symbolsArr, limit);
     }
 
     if (args.symbols !== undefined && !Array.isArray(args.symbols)) {
@@ -1278,13 +1250,18 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
 
+    // Kind mode: general usages query (incoming + outgoing)
+    if (kindFilter) {
+      return this.handleCallersWithKind(cg, symbol, limit, kindFilter);
+    }
+
+    // Default mode: callers (calls edges + call-site snippets)
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
       return this.textResult(`Symbol "${symbol}" not found in the codebase`);
     }
 
     // Collect call sites: each entry is (caller node, edge with call-site line).
-    // A single caller function may have multiple call sites for the same target.
     const callSites: Array<{ caller: Node; edge: Edge }> = [];
     const seen = new Set<string>();
     for (const node of allMatches.nodes) {
@@ -1325,6 +1302,151 @@ export class ToolHandler {
     }
 
     lines.push(allMatches.note);
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  /**
+   * Handle callers with a kind filter — general usages mode.
+   * Checks both incoming and outgoing edges for the specified kind.
+   */
+  private handleCallersWithKind(cg: CodeGraph, symbol: string, limit: number, kindFilter: string): ToolResult {
+    const allMatches = this.findAllSymbols(cg, symbol);
+    if (allMatches.nodes.length === 0) {
+      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+    }
+    const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, symbol));
+    if (!exactMatch) {
+      const unresolvedResult = this.handleUsagesFromUnresolved(cg, symbol, limit, kindFilter);
+      if (unresolvedResult !== null) return unresolvedResult;
+    }
+
+    const seen = new Set<string>();
+    const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
+    const edgeKinds = [kindFilter as EdgeKind];
+
+    for (const node of allMatches.nodes) {
+      // Incoming: node is the TARGET
+      for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
+        const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const sourceNode = cg.getNode(edge.source);
+        if (sourceNode) {
+          usages.push({ sourceNode, targetNode: node, edgeKind: edge.kind, line: edge.line ?? sourceNode.startLine });
+        }
+      }
+      // Outgoing: node is the SOURCE
+      for (const edge of cg.getOutgoingEdges(node.id)) {
+        if (!edgeKinds.includes(edge.kind)) continue;
+        const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const targetNode = cg.getNode(edge.target);
+        if (targetNode) {
+          usages.push({ sourceNode: node, targetNode, edgeKind: edge.kind, line: edge.line ?? node.startLine });
+        }
+      }
+    }
+
+    if (usages.length === 0) {
+      return this.textResult(`No usages of kind "${kindFilter}" found for "${symbol}"${allMatches.note}`);
+    }
+
+    const byFile = new Map<string, typeof usages>();
+    for (const u of usages) {
+      const existing = byFile.get(u.sourceNode.filePath) || [];
+      existing.push(u);
+      byFile.set(u.sourceNode.filePath, existing);
+    }
+
+    const lines: string[] = [
+      `## ${kindFilter} usages of "${symbol}" (${Math.min(usages.length, limit)} shown, ${usages.length} total)`,
+      '',
+    ];
+
+    let count = 0;
+    for (const [file, fileUsages] of byFile) {
+      if (count >= limit) break;
+      lines.push(`**${file}:**`);
+      for (const u of fileUsages) {
+        if (count >= limit) break;
+        const lineInfo = u.line ? `:${u.line}` : '';
+        lines.push(`- ${u.sourceNode.name} (${u.sourceNode.kind}) ${u.edgeKind}→ ${u.targetNode.name}${lineInfo}`);
+        count++;
+      }
+      lines.push('');
+    }
+
+    if (usages.length > limit) {
+      lines.push(`... and ${usages.length - limit} more usages`);
+    }
+    lines.push(allMatches.note);
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  /**
+   * Batch mode for kind-filtered callers (general usages).
+   */
+  private handleBatchUsagesMode(cg: CodeGraph, symbols: string[], limit: number, kindFilter: string): ToolResult {
+    const batchLimit = Math.min(symbols.length, 20);
+    const lines: string[] = [`## Batch ${kindFilter} Usages (${batchLimit} symbols)`, ''];
+    let totalUsages = 0;
+
+    for (const symbol of symbols.slice(0, batchLimit)) {
+      const valid = this.validateString(symbol, 'symbols');
+      if (typeof valid !== 'string') {
+        lines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
+        lines.push('');
+        continue;
+      }
+      const allMatches = this.findAllSymbols(cg, valid);
+      if (allMatches.nodes.length === 0) {
+        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), kindFilter);
+        if (unresolvedResult !== null) {
+          lines.push((unresolvedResult.content[0] as { type: 'text'; text: string }).text);
+          lines.push('');
+        } else {
+          lines.push(`### ${valid}: not found`); lines.push('');
+        }
+        continue;
+      }
+      const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, valid));
+      if (!exactMatch) {
+        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), kindFilter);
+        if (unresolvedResult !== null) {
+          lines.push((unresolvedResult.content[0] as { type: 'text'; text: string }).text);
+          lines.push('');
+          continue;
+        }
+      }
+      const seen = new Set<string>();
+      const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
+      const edgeKinds = [kindFilter as EdgeKind];
+      for (const node of allMatches.nodes) {
+        for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
+          const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const sourceNode = cg.getNode(edge.source);
+          if (sourceNode) { usages.push({ sourceNode, targetNode: node, edgeKind: edge.kind, line: edge.line ?? sourceNode.startLine }); }
+        }
+        for (const edge of cg.getOutgoingEdges(node.id)) {
+          if (!edgeKinds.includes(edge.kind)) continue;
+          const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const targetNode = cg.getNode(edge.target);
+          if (targetNode) { usages.push({ sourceNode: node, targetNode, edgeKind: edge.kind, line: edge.line ?? node.startLine }); }
+        }
+      }
+      const perLimit = Math.max(3, Math.ceil(limit / batchLimit));
+      lines.push(this.formatUsageResults(valid, usages, perLimit));
+      lines.push('');
+      if (allMatches.note) lines.push(allMatches.note);
+      totalUsages += usages.length;
+    }
+    lines.push('---');
+    lines.push(`Total: ${totalUsages} usages across ${batchLimit} symbols`);
     return this.textResult(this.truncateOutput(lines.join('\n')));
   }
 
@@ -1469,12 +1591,20 @@ export class ToolHandler {
     ];
     for (const cs of shownResolved) {
       const defLine = cs.callee.startLine ? `:${cs.callee.startLine}` : '';
+      const meta = cs.edge.metadata as Record<string, unknown> | undefined;
+      // ComputedStates edges: OnEnter/OnExit registration is in the handler's
+      // file (target), not the type definition's file (source).
+      const isComputedStateEdge = meta?.computedState != null;
+      const sourceNode = cg.getNode(cs.edge.source);
+      const callSiteFile = isComputedStateEdge
+        ? cs.callee.filePath
+        : (sourceNode?.filePath ?? cs.callee.filePath);
       const callLine = cs.edge.line ?? cs.callee.startLine;
-      const fileRef = `${cs.callee.filePath}:${callLine}`;
+      const fileRef = `${callSiteFile}:${callLine}`;
       const snippet = this.sourceLineAt(cg, fileRef, fileCache);
       lines.push(`- **${cs.callee.name}** (${cs.callee.kind})`);
       lines.push(`  def: ${cs.callee.filePath}${defLine}`);
-      lines.push(`  call: ${cs.callee.filePath}:${callLine}${snippet ? ` — \`${snippet}\`` : ''}`);
+      lines.push(`  call: ${callSiteFile}:${callLine}${snippet ? ` — \`${snippet}\`` : ''}`);
       lines.push('');
     }
     for (const ext of shownExternal) {
@@ -1537,110 +1667,7 @@ export class ToolHandler {
   }
 
   /**
-  /**
-   * Handle codegraph_usages — find all usages of a symbol
-   *
-   * Broader than callers: returns every incoming edge regardless of kind
-   * (calls, references, type_of, instantiates, etc.), grouped by file.
-   */
-  private async handleUsages(args: Record<string, unknown>): Promise<ToolResult> {
-    const limit = clamp((args.limit as number) || 20, 1, 100);
-    const kindFilter = args.kind as string | undefined;
-
-    // Batch mode: symbols array — check BEFORE getCodeGraph (args check needs no DB)
-    const symbolsArr = args.symbols as string[] | undefined;
-    if (symbolsArr && Array.isArray(symbolsArr) && symbolsArr.length > 0) {
-      const cg = this.getCodeGraph(args.projectPath as string | undefined);
-      return this.handleBatchUsages(cg, symbolsArr, limit, kindFilter);
-    }
-
-    if (args.symbols !== undefined && !Array.isArray(args.symbols)) {
-      return this.errorResult('symbols must be an array of strings, e.g. symbols: ["X","Y","Z"]');
-    }
-
-    const symbol = this.validateString(args.symbol, 'symbol');
-    if (typeof symbol !== 'string') return symbol;
-
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
-
-    const allMatches = this.findAllSymbols(cg, symbol);
-    // Check if any returned node is an exact name match. When FTS finds nodes
-    // whose signature text contains the symbol (e.g. a function that calls
-    // DespawnOnExit), findAllSymbols returns them even though the node name
-    // doesn't match — those should not drive the main usage path.
-    const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, symbol));
-    if (!exactMatch) {
-      const unresolvedResult = this.handleUsagesFromUnresolved(cg, symbol, limit, kindFilter);
-      if (unresolvedResult !== null) {
-        return unresolvedResult;
-      }
-    }
-
-    // Collect all incoming edges across all matching symbols.
-    // Pass kindFilter at DB level to avoid fetching rows that will be discarded.
-    const seen = new Set<string>();
-    const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
-    for (const node of allMatches.nodes) {
-      const edgeKinds = kindFilter ? [kindFilter as EdgeKind] : undefined;
-      for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
-        const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        // Look up the source node (the caller/referencer)
-        const sourceNode = cg.getNode(edge.source);
-        if (sourceNode) {
-          usages.push({
-            sourceNode,
-            targetNode: node,
-            edgeKind: edge.kind,
-            line: edge.line ?? sourceNode.startLine,
-          });
-        }
-      }
-    }
-
-    if (usages.length === 0) {
-      return this.textResult(`No usages found for "${symbol}"${allMatches.note}`);
-    }
-
-    // Group by file
-    const byFile = new Map<string, typeof usages>();
-    for (const u of usages) {
-      const existing = byFile.get(u.sourceNode.filePath) || [];
-      existing.push(u);
-      byFile.set(u.sourceNode.filePath, existing);
-    }
-
-    const lines: string[] = [
-      `## Usages of "${symbol}" (${Math.min(usages.length, limit)} shown, ${usages.length} total)`,
-      '',
-    ];
-
-    let count = 0;
-    for (const [file, fileUsages] of byFile) {
-      if (count >= limit) break;
-      lines.push(`**${file}:**`);
-      for (const u of fileUsages) {
-        if (count >= limit) break;
-        const lineInfo = u.line ? `:${u.line}` : '';
-        lines.push(`- ${u.sourceNode.name} (${u.sourceNode.kind}) ${u.edgeKind}→ ${u.targetNode.name}${lineInfo}`);
-        count++;
-      }
-      lines.push('');
-    }
-
-    if (usages.length > limit) {
-      lines.push(`... and ${usages.length - limit} more usages`);
-    }
-
-    lines.push(allMatches.note);
-
-    return this.textResult(this.truncateOutput(lines.join('\n')));
-  }
-
-  /**
-   * Fallback for codegraph_usages when no project-internal node exists.
+   * Fallback for caller queries when no project-internal node exists.
    * Searches unresolved_refs for external symbols (e.g. external crate types
    * like Bevy's DespawnOnExit) and returns the referencing nodes.
    */
@@ -3570,11 +3597,18 @@ export class ToolHandler {
       case 'implements':
       case 'overrides':
       case 'pattern_match':
+      case 'on_enter':
+      case 'on_exit':
         return 'high';
       case 'instantiates':
       case 'imports':
       case 'exports':
       case 'decorates':
+      case 'runs_in':
+      case 'registers_resource':
+      case 'registers_message':
+      case 'contains_plugin':
+      case 'registers_system':
         return 'medium';
       case 'references':
       case 'type_of':
@@ -3668,66 +3702,6 @@ export class ToolHandler {
     if (new RegExp(`${WB}${escaped}${WE}`, 'u').test(signature)) return 'owning';
 
     return 'unknown';
-  }
-
-  private handleBatchUsages(cg: CodeGraph, symbols: string[], limit: number, kindFilter: string | undefined): ToolResult {
-    const batchLimit = Math.min(symbols.length, 20);
-    const allLines: string[] = [`## Batch Usages (${batchLimit} symbols)`, ""];
-    let totalUsages = 0;
-    for (const symbol of symbols.slice(0, batchLimit)) {
-      const valid = this.validateString(symbol, 'symbols');
-      if (typeof valid !== 'string') {
-        allLines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
-        allLines.push("");
-        continue;
-      }
-      const allMatches = this.findAllSymbols(cg, valid);
-      if (allMatches.nodes.length === 0) {
-        // Try unresolved-refs fallback — external symbols (e.g. Bevy types)
-        // have usage edges recorded in unresolved_refs but no project-internal node.
-        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), kindFilter);
-        if (unresolvedResult !== null) {
-          const text = (unresolvedResult.content[0] as { type: 'text'; text: string }).text;
-          allLines.push(text);
-          allLines.push("");
-        } else {
-          allLines.push(`### ${valid}: not found`); allLines.push("");
-        }
-        continue;
-      }
-      // Exact-match guard: if FTS matches a node by signature text but not
-      // by name, prefer unresolved-refs for external symbol coverage.
-      const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, valid));
-      if (!exactMatch) {
-        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), kindFilter);
-        if (unresolvedResult !== null) {
-          const text = (unresolvedResult.content[0] as { type: 'text'; text: string }).text;
-          allLines.push(text);
-          allLines.push("");
-          continue;
-        }
-      }
-      const seen = new Set<string>();
-      const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
-      for (const node of allMatches.nodes) {
-        const edgeKinds = kindFilter ? [kindFilter as EdgeKind] : undefined;
-        for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
-          const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const sourceNode = cg.getNode(edge.source);
-          if (sourceNode) { usages.push({ sourceNode, targetNode: node, edgeKind: edge.kind, line: edge.line ?? sourceNode.startLine }); }
-        }
-      }
-      const perLimit = Math.max(3, Math.ceil(limit / batchLimit));
-      allLines.push(this.formatUsageResults(valid, usages, perLimit));
-      allLines.push("");
-      if (allMatches.note) allLines.push(allMatches.note);
-      totalUsages += usages.length;
-    }
-    allLines.push("---");
-    allLines.push(`Total: ${totalUsages} usages across ${batchLimit} symbols`);
-    return this.textResult(this.truncateOutput(allLines.join("\n")));
   }
 
   private formatUsageResults(symbol: string, usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }>, limit: number): string {

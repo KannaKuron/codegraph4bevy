@@ -613,6 +613,21 @@ export class ReferenceResolver {
   }
 
   /**
+   * Re-synthesize heuristic callback/dispatcher edges after scoped resolution.
+   * These edges (e.g., Bevy state transitions) cross file boundaries and are
+   * cascade-deleted when nodes are removed during re-extraction. Must be called
+   * after any scoped resolveAndPersist to restore whole-graph synthesized edges.
+   * Best-effort — failures are silently ignored.
+   */
+  synthesizeCallbackEdges(): number {
+    try {
+      return synthesizeCallbackEdges(this.queries, this.context);
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * Resolve and persist in batches to keep memory bounded.
    * Processes unresolved references in chunks, persisting edges and cleaning
    * up resolved refs after each batch to avoid accumulating large arrays.

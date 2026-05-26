@@ -23,47 +23,46 @@ export const CODEGRAPH_SECTION_END = '<!-- CODEGRAPH_END -->';
 export const INSTRUCTIONS_TEMPLATE = `${CODEGRAPH_SECTION_START}
 ## CodeGraph
 
-This project has a CodeGraph MCP server (\`codegraph_*\` tools) configured. CodeGraph is a tree-sitter-parsed knowledge graph of every symbol, edge, and file. Reads are sub-millisecond and return structural information grep cannot.
+本项目配置了 CodeGraph MCP 服务器（\`codegraph_*\` 工具）。CodeGraph 是基于 tree-sitter 的代码知识图谱，存储每个符号、边和文件的结构化信息。查询亚毫秒级，返回 grep 无法获取的结构关系。
 
-### When to prefer codegraph over native search
+### 何时用 codegraph 而非原生搜索
 
-Use codegraph for **structural** questions — what calls what, what would break, where is X defined, what is X's signature. Use native grep/read only for **literal text** queries (string contents, comments, log messages) or after you already have a specific file open.
+codegraph 用于**结构化**问题 — 谁调用了谁、改这个会影响什么、X 在哪里定义、X 的签名是什么。原生 grep/read 仅用于**文本字面**查询（字符串内容、注释、日志消息），或已打开具体文件之后。
 
-| Question | Tool |
+| 问题 | 工具 |
 |---|---|
-| "Where is X defined?" / "Find symbol named X" | \`codegraph_search\` (use \`referencesType\` to find symbols referencing a type, with \`mutability\` to filter by borrowing mode; use \`impl_for\` to find implementors of a trait/interface; use \`kind: "comment"\` to search comments) |
-| "What calls function Y?" | \`codegraph_callers\` (supports batch via \`symbols\` array) |
-| "What does Y call?" | \`codegraph_callees\` (use \`include_external\` to show calls to external/third-party APIs) |
-| "How does X reach/become Y? / trace the flow from X to Y" | \`codegraph_trace\` (one call = the whole path, incl. dynamic-dispatch hops — callbacks, React re-render, Bevy state transitions — that grep can't follow) |
-| "Where is this symbol used (any kind)?" | \`codegraph_usages\` (broader than callers — covers refs, type annotations, instantiations, pattern matches; supports batch via \`symbols\` array; use \`kind: "pattern_match"\` for match/if-let sites) |
-| "What would break if I changed Z?" | \`codegraph_impact\` (use \`includeCode\` to inline source snippets of directly affected symbols) |
-| "Show me Y's signature / source / docstring" | \`codegraph_node\` (supports batch via \`symbols\` array) |
-| "Give me focused context for a task/area" | \`codegraph_context\` |
-| "See several related symbols' source at once" | \`codegraph_explore\` (use \`path\` to filter by directory, \`strict\` to limit results to that directory, \`sourceOnly\` to skip the relationship map) |
-| "Search comments" | \`codegraph_search\` with \`kind: "comment"\` |
-| "What files exist under path/" | \`codegraph_files\` (use \`symbols: true\` to include top-level symbol names) |
-| "Is the index healthy?" | \`codegraph_status\` |
+| "X 在哪里定义？" / "查找符号 X" | \`codegraph_search\`（\`referencesType\` 查引用某类型的所有符号，\`mutability\` 过滤借用模式；\`impl_for\` 查 trait/interface 的所有实现者；\`kind: "comment"\` 搜索注释） |
+| "谁调用了 Y？" | \`codegraph_callers\`（支持 \`symbols\` 数组批量查询；加 \`kind\` 参数查非调用关系：\`"references"\`、\`"type_of"\`、\`"pattern_match"\`、\`"instantiates"\` 及框架特定边） |
+| "Y 调用了什么？" | \`codegraph_callees\`（\`include_external\` 显示对外部/第三方 API 的调用） |
+| "X 如何到达/变成 Y？" | \`codegraph_trace\`（一次调用返回完整路径，含动态调度跳转 — 回调、React re-render、状态转换等 grep 无法跟踪的链路） |
+| "改了 Z 会破坏什么？" | \`codegraph_impact\`（\`includeCode\` 内联受影响符号的源码） |
+| "显示 Y 的签名/源码/文档" | \`codegraph_node\`（支持 \`symbols\` 数组批量查询） |
+| "给我某个任务/领域的聚焦上下文" | \`codegraph_context\` |
+| "一次查看多个相关符号的源码" | \`codegraph_explore\`（\`path\` 过滤目录，\`strict\` 限定该目录，\`sourceOnly\` 跳过关系图） |
+| "搜索注释" | \`codegraph_search\` 加 \`kind: "comment"\` |
+| "某目录下有什么文件" | \`codegraph_files\`（\`symbols: true\` 包含顶层符号名） |
+| "索引是否正常" | \`codegraph_status\` |
 
-### Rules of thumb
+### 使用原则
 
-- **Answer directly — don't delegate exploration.** For "how does X work" / architecture questions, answer with 2-3 codegraph calls: \`codegraph_context\` first, then ONE \`codegraph_explore\` for the source of the symbols it surfaces. For a specific **flow** ("how does X reach Y") start with \`codegraph_trace\` from→to — one call returns the whole path with dynamic hops bridged — then ONE \`codegraph_explore\` for the bodies; don't rebuild the path with \`codegraph_search\` + \`codegraph_callers\`. Codegraph IS the pre-built index, so spawning a separate file-reading sub-task/agent — or running a grep + read loop — repeats work codegraph already did and costs more for the same answer.
-- **Trust codegraph results.** They come from a full AST parse. Do NOT re-verify them with grep — that's slower, less accurate, and wastes context.
-- **Don't grep first** when looking up a symbol by name. \`codegraph_search\` is faster and returns kind + location + signature in one call.
-- **Don't chain \`codegraph_search\` + \`codegraph_node\`** when you just want context — \`codegraph_context\` is one call.
-- **Don't loop \`codegraph_node\` over many symbols** — one \`codegraph_explore\` call returns several symbols' source grouped in a single capped call, while each separate node/Read call re-reads the whole context and costs far more.
-- **Explore returns verbatim source** — byte-for-byte identical to Read, line-numbered. Treat files shown by explore as already Read; don't re-open them.
-- **Index lag**: the file watcher debounces ~500ms behind writes; don't re-query immediately after editing a file in the same turn.
+- **直接回答，不要委托探索。** "X 怎么工作" / 架构问题：先 \`codegraph_context\`，再 ONE \`codegraph_explore\` 查看涉及符号的源码。具体**流程**（"X 如何到达 Y"）：先 \`codegraph_trace\` from→to — 一次调用返回完整路径含动态跳转 — 再 ONE \`codegraph_explore\` 查看跳转体。不要用 \`codegraph_search\` + \`codegraph_callers\` 手动重建路径 — 那正是 trace 一次完成的事。CodeGraph 是预建索引，启动子任务/agent 或用 grep + read 循环是重复已完成的工作且开销更大。
+- **信任 codegraph 结果。** 来自完整 AST 解析。不要用 grep 重新验证 — 更慢、更不准、浪费上下文。
+- **查符号名时不要先用 grep。** \`codegraph_search\` 更快，一次返回 kind + 位置 + 签名。
+- **不要 \`codegraph_search\` + \`codegraph_node\` 链式调用** — 一个 \`codegraph_context\` 就够。
+- **不要对多个符号循环调 \`codegraph_node\`** — 一次 \`codegraph_explore\` 返回多个符号的源码，分组在单次有上限的调用中；每个单独的 node/Read 调用都会重读整个上下文，开销大得多。
+- **explore 返回原始源码** — 与 Read 字节一致，带行号。explore 展示过的文件视为已 Read，不要重复打开。
+- **索引延迟**：文件监视器写入后约 500ms 去抖；同一轮内编辑文件后不要立即重新查询。
 
-### Common chains
+### 常用链路
 
-- **Flow / "how does X reach Y"**: \`codegraph_trace\` from→to FIRST — one call returns the entire path with dynamic-dispatch hops bridged (callbacks, React re-render, Bevy state transitions, Django ORM descriptors). Then ONE \`codegraph_explore\` for the hop bodies if needed. Do NOT reconstruct the path with \`codegraph_search\` + \`codegraph_callers\` — that's exactly what trace does in a single call.
-- **Onboarding**: \`codegraph_context\` first. If still unclear, \`codegraph_explore\` for breadth, then \`codegraph_node\` on specific symbols.
-- **Refactor planning**: \`codegraph_search\` → \`codegraph_callers\` → \`codegraph_impact\`. The blast-radius answer comes from impact, not from walking callers manually.
-- **Debugging a regression**: \`codegraph_callers\` of the suspected symbol; widen with \`codegraph_impact\` if an unexpected call appears.
+- **流程 / "X 如何到达 Y"**：FIRST \`codegraph_trace\` from→to — 一次调用返回完整路径含动态调度跳转（回调、React re-render、框架状态转换、Django ORM 描述符）。如需查看跳转体再 ONE \`codegraph_explore\`。不要用 \`codegraph_search\` + \`codegraph_callers\` 重建路径 — trace 一次完成。
+- **上手项目**：先 \`codegraph_context\`。不够清晰再用 \`codegraph_explore\` 扩展，然后 \`codegraph_node\` 深入具体符号。
+- **重构规划**：\`codegraph_search\` → \`codegraph_callers\` → \`codegraph_impact\`。影响范围的答案来自 impact，不是手动遍历 callers。
+- **调试回归**：对可疑符号 \`codegraph_callers\`；如有意外调用再 \`codegraph_impact\` 扩大范围。
 
-### If \`.codegraph/\` doesn't exist
+### 如果 \`.codegraph/\` 不存在
 
-The MCP server returns "not initialized." Ask the user: *"I notice this project doesn't have CodeGraph initialized. Want me to run \`codegraph init -i\` to build the index?"*
+MCP 服务器返回 "not initialized"。询问用户：*"本项目尚未初始化 CodeGraph，要我运行 \`codegraph init -i\` 构建索引吗？"*
 ${CODEGRAPH_SECTION_END}`;
 
 /**
