@@ -39,7 +39,7 @@ export function createShimmerProgress(): ShimmerProgress {
       let percent = -1;
       let count = 0;
       if (progress.total > 0) {
-        percent = Math.round((progress.current / progress.total) * 100);
+        percent = Math.min(100, Math.round((progress.current / progress.total) * 100));
       } else if (progress.current > 0) {
         count = progress.current;
       }
