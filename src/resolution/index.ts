@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Node, UnresolvedReference, Edge } from '../types';
+import { Node, UnresolvedReference, Edge, NodeKind } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -16,6 +16,13 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
+
+// B13: Node kinds that can be the target of a calls edge.
+// Fields, variables, constants, and other non-callable symbols
+// should not be resolved as call targets.
+const CALLABLE_NODE_KINDS = new Set<NodeKind>([
+  'function', 'method', 'class', 'struct', 'trait', 'interface',
+]);
 import { matchReference } from './name-matcher';
 import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
 import { detectFrameworks } from './frameworks';
@@ -571,7 +578,8 @@ export class ReferenceResolver {
    * Create edges from resolved references
    */
   createEdges(resolved: ResolvedRef[]): Edge[] {
-    return resolved.map((ref) => {
+    return resolved
+      .map((ref) => {
       let kind = ref.original.referenceKind;
 
       // Promote "extends" to "implements" when a class/struct targets an interface
@@ -586,14 +594,15 @@ export class ReferenceResolver {
       }
 
       // Promote "calls" to "instantiates" when the resolved target is a
-      // class/struct. Languages without a `new` keyword (Python, Ruby)
-      // express instantiation as `Foo()` — extraction can't tell that
-      // apart from a function call without symbol info, but resolution
-      // can: if `Foo` resolves to a class, the call IS an instantiation.
+      // class/struct.
       if (kind === 'calls') {
         const targetNode = this.queries.getNodeById(ref.targetNodeId);
         if (targetNode && (targetNode.kind === 'class' || targetNode.kind === 'struct')) {
           kind = 'instantiates';
+        }
+        // B13: Reject calls edges to non-callable nodes (fields, variables, etc.)
+        if (targetNode && !CALLABLE_NODE_KINDS.has(targetNode.kind)) {
+          return null;
         }
       }
 
@@ -608,7 +617,8 @@ export class ReferenceResolver {
           resolvedBy: ref.resolvedBy,
         },
       };
-    });
+    })
+    .filter((e) => e !== null) as Edge[];
   }
 
   /**
