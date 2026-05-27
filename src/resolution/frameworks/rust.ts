@@ -21,6 +21,7 @@ export const RUST_STD_MACROS = new Set([
   // Compiler/utility
   'compile_error', 'concat', 'concat_idents', 'env', 'option_env',
   'include', 'include_str', 'include_bytes', 'cfg', 'cfg_attr',
+  'stringify', 'line', 'column', 'file', 'module_path',
   // Test
   'test', 'bench',
   // Logging (log crate + tracing crate)

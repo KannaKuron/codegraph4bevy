@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Migration definition
@@ -62,6 +62,58 @@ const migrations: Migration[] = [
       db.exec(`
         DROP INDEX IF EXISTS idx_edges_source;
         DROP INDEX IF EXISTS idx_edges_target;
+      `);
+    },
+  },
+  {
+    version: 5,
+    description: 'Add external_symbols table for shallow crate indexing',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS external_symbols (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          crate_name TEXT NOT NULL,
+          crate_version TEXT NOT NULL,
+          symbol_name TEXT NOT NULL,
+          symbol_kind TEXT NOT NULL,
+          method_name TEXT NOT NULL DEFAULT '',
+          param_types TEXT,
+          return_type TEXT,
+          signature TEXT,
+          UNIQUE(crate_name, crate_version, symbol_name, method_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_external_symbols_type ON external_symbols(crate_name, symbol_name);
+        CREATE INDEX IF NOT EXISTS idx_external_symbols_method ON external_symbols(symbol_name, method_name);
+      `);
+    },
+  },
+  {
+    version: 6,
+    description: 'Ensure method_name NOT NULL in external_symbols (recreate to backfill nulls)',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS external_symbols_v6 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          crate_name TEXT NOT NULL,
+          crate_version TEXT NOT NULL,
+          symbol_name TEXT NOT NULL,
+          symbol_kind TEXT NOT NULL,
+          method_name TEXT NOT NULL DEFAULT '',
+          param_types TEXT,
+          return_type TEXT,
+          signature TEXT,
+          UNIQUE(crate_name, crate_version, symbol_name, method_name)
+        );
+        INSERT OR IGNORE INTO external_symbols_v6
+          (crate_name, crate_version, symbol_name, symbol_kind, method_name, param_types, return_type, signature)
+          SELECT crate_name, crate_version, symbol_name, symbol_kind,
+                 COALESCE(method_name, '') as method_name,
+                 param_types, return_type, signature
+          FROM external_symbols;
+        DROP TABLE external_symbols;
+        ALTER TABLE external_symbols_v6 RENAME TO external_symbols;
+        CREATE INDEX IF NOT EXISTS idx_external_symbols_type ON external_symbols(crate_name, symbol_name);
+        CREATE INDEX IF NOT EXISTS idx_external_symbols_method ON external_symbols(symbol_name, method_name);
       `);
     },
   },

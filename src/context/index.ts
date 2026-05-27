@@ -939,6 +939,21 @@ export class ContextBuilder {
     searchResults.sort((a, b) => b.score - a.score);
     searchResults = searchResults.slice(0, opts.searchLimit * 3);
 
+    // Plugin/hierarchy query boost: when the query is about plugin architecture,
+    // boost symbols that implement Plugin or PluginGroup traits so they surface
+    // as primary entry points instead of generic functions like main().
+    const PLUGIN_KEYWORDS = ['plugin', 'hierarchy', 'group', '架构', '层级', '插件'];
+    const queryLC = query.toLowerCase();
+    if (PLUGIN_KEYWORDS.some(kw => queryLC.includes(kw))) {
+      for (const result of searchResults) {
+        const sig = result.node.signature;
+        if (sig && /\b(impl(ements)?\s+)?Plugin(Group)?\b/.test(sig)) {
+          result.score *= 2.0;
+        }
+      }
+      searchResults.sort((a, b) => b.score - a.score);
+    }
+
     // Filter by minimum score
     let filteredResults = searchResults.filter((r) => r.score >= opts.minScore);
 

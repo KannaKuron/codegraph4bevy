@@ -13,9 +13,10 @@ Use codegraph for **structural** questions — what calls what, what would break
 
 | Question | Tool |
 |---|---|
-| "Where is X defined?" / "Find symbol named X" | `codegraph_search` |
-| "What calls function Y?" | `codegraph_callers` |
-| "What does Y call?" | `codegraph_callees` |
+| "Where is X defined?" / "Find symbol named X" | `codegraph_search` (kind: "macro" for macro calls like info!, println!) |
+| "What calls function Y?" | `codegraph_callers` (include_external for external dependencies; kind: "all" for all edge kinds) |
+| "What does Y call?" | `codegraph_callees` (include_external for third-party/standard-library calls) |
+| "Analyze a symbol completely" | `codegraph_symbol_info` (definition + all incoming edge kinds + callees + impact radius — replaces multiple callers calls) |
 | "How does X reach/become Y? / trace the flow from X to Y" | `codegraph_trace` (one call = the whole path, incl. callback/React/JSX dynamic hops) |
 | "What would break if I changed Z?" | `codegraph_impact` |
 | "Show me Y's signature / source / docstring" | `codegraph_node` |

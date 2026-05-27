@@ -12,7 +12,7 @@ import {
   type WorktreeIndexMismatch,
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
-import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, EdgeKind } from '../types';
+import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, EdgeKind, UnresolvedReference } from '../types';
 import { createHash } from 'crypto';
 import {
   constants as fsConstants,
@@ -329,7 +329,7 @@ export const tools: ToolDefinition[] = [
         kind: {
           type: 'string',
           description: '按节点类型过滤',
-          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component', 'comment'],
+          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component', 'comment', 'macro', 'method_call'],
         },
         referencesType: {
           type: 'string',
@@ -381,7 +381,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callers',
-    description: '查找调用指定符号的所有函数/方法。返回调用点行号和单行源码片段。加 "kind" 参数可查非调用关系：references、type_of、pattern_match、instantiates 及框架特定边。支持 symbols 数组批量查询。',
+    description: '查找调用指定符号的所有函数/方法。返回调用点行号和单行源码片段。加 "kind" 参数可查非调用关系：references、type_of、pattern_match、instantiates 及框架特定边。include_external 显示外部未解析引用。支持 symbols 数组批量查询。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -396,8 +396,18 @@ export const tools: ToolDefinition[] = [
         },
         kind: {
           type: 'string',
-          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。通用类型："references"、"type_of"、"pattern_match"、"instantiates"、"contains"。框架特定（Bevy ECS）："runs_in"、"on_enter"、"on_exit"、"registers_resource"、"registers_message"、"contains_plugin"。',
-          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'runs_in', 'on_enter', 'on_exit', 'registers_resource', 'registers_message', 'contains_plugin'],
+          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。通用类型："references"、"type_of"、"pattern_match"、"instantiates"、"contains"。框架特定边：runs_in、on_enter、on_exit、registers_resource、registers_message、contains_plugin。',
+          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'runs_in', 'on_enter', 'on_exit', 'registers_resource', 'registers_message', 'contains_plugin', 'all'],
+        },
+        mutability: {
+          type: 'string',
+          description: '配合 kind="type_of" 过滤借用模式："mut"（可变借用，ResMut、&mut）、"shared"（共享借用，Res、&T）、"owning"（拥有值，返回类型）。用于区分类型的读写者。',
+          enum: ['mut', 'shared', 'owning'],
+        },
+        include_external: {
+          type: 'boolean',
+          description: '包含对当前索引中无定义节点的符号的引用。即第三方依赖、标准库、框架 API 等在项目中没有源码的符号。默认: false。',
+          default: false,
         },
         limit: {
           type: 'number',
@@ -415,7 +425,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callees',
-    description: '查找指定符号调用的所有函数/方法。返回调用点行号和单行源码片段。include_external 显示对外部 API 的调用。支持 symbols 数组批量查询。',
+    description: '查找指定符号调用的所有函数/方法。返回调用点行号和单行源码片段。include_external 显示对项目外符号的调用（框架 API、第三方库、标准库宏等）。支持 symbols 数组批量查询。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -425,13 +435,28 @@ export const tools: ToolDefinition[] = [
         },
         include_external: {
           type: 'boolean',
-          description: '包含对外部符号的调用（无项目内节点）。显示外部 crate 类型的未解析引用。默认: false。',
+          description: '包含对当前索引中无定义节点的符号的调用。即第三方依赖、标准库、框架 API、宏等在项目中没有源码的符号。默认: false。',
           default: false,
         },
         limit: {
           type: 'number',
           description: '返回的最大被调用者数（默认: 20）',
           default: 20,
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['symbol'],
+    },
+  },
+  {
+    name: 'codegraph_symbol_info',
+    description: '聚合符号信息 — 一次返回：定义位置/签名、所有入边（按种类分组计数+前5条详情）、出向调用、影响半径。替代多次 callers(kind=references/type_of/pattern_match/...) 调用。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol: {
+          type: 'string',
+          description: '要分析的符号名',
         },
         projectPath: projectPathProperty,
       },
@@ -1052,6 +1077,8 @@ export class ToolHandler {
           result = await this.handleCallers(args); break;
         case 'codegraph_callees':
           result = await this.handleCallees(args); break;
+        case 'codegraph_symbol_info':
+          result = await this.handleSymbolInfo(args); break;
         case 'codegraph_impact':
           result = await this.handleImpact(args); break;
         case 'codegraph_explore':
@@ -1103,6 +1130,57 @@ export class ToolHandler {
         const symbolNote = c.associatedSymbol ? ` [${c.associatedSymbol}]` : '';
         lines.push(`**${c.filePath}:${c.startLine}** (${c.kind})${symbolNote}`);
         lines.push(`> ${c.text.length > 200 ? c.text.slice(0, 197) + '…' : c.text}`);
+        lines.push('');
+      }
+      return this.textResult(this.truncateOutput(lines.join('\n')));
+    } else if (kind === 'macro') {
+      // Macro call search — find all call sites of a specific macro (e.g., info!, println!)
+      const macroCalls = cg.searchMacroCalls(query, limit);
+      if (macroCalls.length === 0) {
+        return this.textResult(`No macro invocations of "${query}" found`);
+      }
+      const byFile = new Map<string, typeof macroCalls>();
+      for (const mc of macroCalls) {
+        const arr = byFile.get(mc.filePath) || [];
+        arr.push(mc);
+        byFile.set(mc.filePath, arr);
+      }
+      const lines: string[] = [
+        `## Macro invocations of "${query}" (${macroCalls.length} found)`,
+        '',
+      ];
+      for (const [file, calls] of byFile) {
+        lines.push(`**${file}:**`);
+        for (const c of calls) {
+          lines.push(`- line ${c.line}:${c.column}`);
+        }
+        lines.push('');
+      }
+      return this.textResult(this.truncateOutput(lines.join('\n')));
+    } else if (kind === 'method_call') {
+      // Method call search — find all .method() call sites across the project
+      const methodCalls = cg.searchMethodCalls(query, limit);
+      if (methodCalls.length === 0) {
+        return this.textResult(`No method calls "${query}" found`);
+      }
+      // Group by declared type (resolved from type_of edges), falling back
+      // to receiverHint (variable name from the call site).
+      const byReceiver = new Map<string, typeof methodCalls>();
+      for (const mc of methodCalls) {
+        const key = mc.declaredType || mc.receiverHint || '(unknown)';
+        const arr = byReceiver.get(key) || [];
+        arr.push(mc);
+        byReceiver.set(key, arr);
+      }
+      const lines: string[] = [
+        `## Method calls "${query}" (${methodCalls.length} found)`,
+        '',
+      ];
+      for (const [receiver, calls] of byReceiver) {
+        lines.push(`### ${receiver}::${query} (${calls.length})`);
+        for (const c of calls) {
+          lines.push(`- ${c.filePath}:${c.line}`);
+        }
         lines.push('');
       }
       return this.textResult(this.truncateOutput(lines.join('\n')));
@@ -1231,13 +1309,14 @@ export class ToolHandler {
   private async handleCallers(args: Record<string, unknown>): Promise<ToolResult> {
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const kindFilter = args.kind as string | undefined;
+    const mutability = args.mutability as string | undefined;
 
     // Batch mode: symbols array
     const symbolsArr = args.symbols as string[] | undefined;
     if (symbolsArr && Array.isArray(symbolsArr) && symbolsArr.length > 0) {
       const cg = this.getCodeGraph(args.projectPath as string | undefined);
       return kindFilter
-        ? this.handleBatchUsagesMode(cg, symbolsArr, limit, kindFilter)
+        ? this.handleBatchUsagesMode(cg, symbolsArr, limit, kindFilter, mutability)
         : this.handleBatchCallers(cg, symbolsArr, limit);
     }
 
@@ -1252,12 +1331,20 @@ export class ToolHandler {
 
     // Kind mode: general usages query (incoming + outgoing)
     if (kindFilter) {
-      return this.handleCallersWithKind(cg, symbol, limit, kindFilter);
+      return this.handleCallersWithKind(cg, symbol, limit, kindFilter, mutability);
     }
 
     // Default mode: callers (calls edges + call-site snippets)
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
+      // include_external: check unresolved refs even when no project symbol matches
+      const includeExternal = args.include_external === true;
+      if (includeExternal) {
+        const unresolved = cg.getUnresolvedByName(symbol);
+        if (unresolved.length > 0) {
+          return this.formatExternalCallers(unresolved, symbol, limit);
+        }
+      }
       return this.textResult(`Symbol "${symbol}" not found in the codebase`);
     }
 
@@ -1274,19 +1361,56 @@ export class ToolHandler {
       }
     }
 
-    if (callSites.length === 0) {
+    // include_external: supplement with unresolved references.
+    //
+    // "external" means the referenced symbol has no node in the current
+    // .codegraph/ index. This is determined by where codegraph init was run,
+    // not by the project boundary:
+    //   - init at repo root → all submodules/crates are "internal"
+    //   - init at subdirectory → sibling modules are "external"
+    //   - third-party deps, stdlib, macros → always "external"
+    //
+    // Language-agnostic: the same rule applies to Java, C++, Rust, Python, etc.
+    // A symbol is internal iff it has a node in the index.
+    const includeExternal = args.include_external === true;
+    const externalCallers: Array<{ name: string; line: number; kind: string; filePath: string }> = [];
+    if (includeExternal) {
+      const seenExt = new Set<string>();
+      const unresolved = cg.getUnresolvedByName(symbol);
+      for (const ref of unresolved) {
+        if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'references'
+            && ref.referenceKind !== 'type_of' && ref.referenceKind !== 'macro_call' && ref.referenceKind !== 'pattern_match') continue;
+        const srcNode = cg.getNode(ref.fromNodeId);
+        if (!srcNode) continue;
+        const key = `ext:${ref.fromNodeId}:${ref.referenceKind}:${ref.line}`;
+        if (seenExt.has(key)) continue;
+        seenExt.add(key);
+        externalCallers.push({
+          name: ref.referenceName,
+          line: ref.line,
+          kind: 'external',
+          filePath: ref.filePath ?? srcNode.filePath,
+        });
+      }
+    }
+
+    const totalCallers = callSites.length + externalCallers.length;
+    if (totalCallers === 0) {
       return this.textResult(`No callers found for "${symbol}"${allMatches.note}`);
     }
 
     // Read source snippets for call-site lines
     const fileCache = new Map<string, string[]>();
 
-    const shown = callSites.slice(0, limit);
+    const shownResolved = callSites.slice(0, limit);
+    const EXTERNAL_SUB_LIMIT = 10;
+    const shownExternal = externalCallers.slice(0, EXTERNAL_SUB_LIMIT);
+    const shownTotal = shownResolved.length + shownExternal.length;
     const lines: string[] = [
-      `## Callers of "${symbol}" (${shown.length} shown, ${callSites.length} total)`,
+      `## Callers of "${symbol}" (${shownTotal} shown, ${totalCallers} total)`,
       '',
     ];
-    for (const cs of shown) {
+    for (const cs of shownResolved) {
       const defLine = cs.caller.startLine ? `:${cs.caller.startLine}` : '';
       const callLine = cs.edge.line ?? cs.caller.startLine;
       const fileRef = `${cs.caller.filePath}:${callLine}`;
@@ -1296,9 +1420,14 @@ export class ToolHandler {
       lines.push(`  call: ${cs.caller.filePath}:${callLine}${snippet ? ` — \`${snippet}\`` : ''}`);
       lines.push('');
     }
+    for (const ext of shownExternal) {
+      lines.push(`- **${ext.name}** (external)`);
+      lines.push(`  call: ${ext.filePath}:${ext.line}`);
+      lines.push('');
+    }
 
-    if (callSites.length > limit) {
-      lines.push(`... and ${callSites.length - limit} more callers`);
+    if (totalCallers > shownTotal) {
+      lines.push(`... and ${totalCallers - shownTotal} more callers`);
     }
 
     lines.push(allMatches.note);
@@ -1309,7 +1438,7 @@ export class ToolHandler {
    * Handle callers with a kind filter — general usages mode.
    * Checks both incoming and outgoing edges for the specified kind.
    */
-  private handleCallersWithKind(cg: CodeGraph, symbol: string, limit: number, kindFilter: string): ToolResult {
+  private handleCallersWithKind(cg: CodeGraph, symbol: string, limit: number, kindFilter: string, mutability?: string): ToolResult {
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
       return this.textResult(`Symbol "${symbol}" not found in the codebase`);
@@ -1320,11 +1449,27 @@ export class ToolHandler {
       if (unresolvedResult !== null) return unresolvedResult;
     }
 
+    // Expand container nodes (enum, struct, trait, class, interface) to include
+    // their children — this fixes enum references returning 0 (B2) by querying
+    // variant-level edges too.
+    const CONTAINER_KINDS = new Set(['enum', 'struct', 'trait', 'class', 'interface']);
+    const nodesToQuery: Node[] = [...allMatches.nodes];
+    for (const node of allMatches.nodes) {
+      if (CONTAINER_KINDS.has(node.kind)) {
+        for (const child of cg.getChildren(node.id)) {
+          if (!nodesToQuery.some(n => n.id === child.id)) {
+            nodesToQuery.push(child);
+          }
+        }
+      }
+    }
+
     const seen = new Set<string>();
     const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
-    const edgeKinds = [kindFilter as EdgeKind];
+    // kind="all": no edge kind filter — collect all edge kinds
+    const edgeKinds: EdgeKind[] | undefined = kindFilter === 'all' ? undefined : [kindFilter as EdgeKind];
 
-    for (const node of allMatches.nodes) {
+    for (const node of nodesToQuery) {
       // Incoming: node is the TARGET
       for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
         const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
@@ -1337,7 +1482,7 @@ export class ToolHandler {
       }
       // Outgoing: node is the SOURCE
       for (const edge of cg.getOutgoingEdges(node.id)) {
-        if (!edgeKinds.includes(edge.kind)) continue;
+        if (edgeKinds !== undefined && !edgeKinds.includes(edge.kind)) continue;
         const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -1350,6 +1495,28 @@ export class ToolHandler {
 
     if (usages.length === 0) {
       return this.textResult(`No usages of kind "${kindFilter}" found for "${symbol}"${allMatches.note}`);
+    }
+
+    // Mutability filter for type_of queries — classify each usage by its
+    // borrowing pattern (mut/shared/owning) and keep only matching ones.
+    if (mutability && (mutability === 'mut' || mutability === 'shared' || mutability === 'owning')) {
+      const filtered: typeof usages = [];
+      for (const u of usages) {
+        if (this.classifyMutability(u.sourceNode.signature, symbol) === mutability) {
+          filtered.push(u);
+        }
+      }
+      usages.length = 0;
+      usages.push(...filtered.slice(0, limit));
+    }
+
+    if (usages.length === 0) {
+      return this.textResult(`No usages of kind "${kindFilter}" with mutability="${mutability}" found for "${symbol}"${allMatches.note}`);
+    }
+
+    // kind="all": group by edgeKind for structured output
+    if (kindFilter === 'all') {
+      return this.formatAllKindUsages(usages, symbol, limit, allMatches.note);
     }
 
     const byFile = new Map<string, typeof usages>();
@@ -1385,9 +1552,44 @@ export class ToolHandler {
   }
 
   /**
+   * Format usages grouped by edge kind for kind="all" output.
+   */
+  private formatAllKindUsages(
+    usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }>,
+    symbol: string, limit: number, note: string,
+  ): ToolResult {
+    const byKind = new Map<string, typeof usages>();
+    for (const u of usages) {
+      const arr = byKind.get(u.edgeKind) || [];
+      arr.push(u);
+      byKind.set(u.edgeKind, arr);
+    }
+
+    const lines: string[] = [
+      `## All usages of "${symbol}" (${usages.length} total across ${byKind.size} edge kinds)`,
+      '',
+    ];
+
+    for (const [kind, kindUsages] of byKind) {
+      lines.push(`### ${kind} (${kindUsages.length})`);
+      for (const u of kindUsages.slice(0, limit)) {
+        const lineInfo = u.line ? `:${u.line}` : '';
+        lines.push(`- ${u.sourceNode.name} (${u.sourceNode.kind}) → ${u.targetNode.name}${lineInfo}`);
+      }
+      if (kindUsages.length > limit) {
+        lines.push(`  ... and ${kindUsages.length - limit} more`);
+      }
+      lines.push('');
+    }
+
+    lines.push(note);
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  /**
    * Batch mode for kind-filtered callers (general usages).
    */
-  private handleBatchUsagesMode(cg: CodeGraph, symbols: string[], limit: number, kindFilter: string): ToolResult {
+  private handleBatchUsagesMode(cg: CodeGraph, symbols: string[], limit: number, kindFilter: string, mutability?: string): ToolResult {
     const batchLimit = Math.min(symbols.length, 20);
     const lines: string[] = [`## Batch ${kindFilter} Usages (${batchLimit} symbols)`, ''];
     let totalUsages = 0;
@@ -1419,10 +1621,22 @@ export class ToolHandler {
           continue;
         }
       }
+      const CONTAINER_KINDS_BATCH = new Set(['enum', 'struct', 'trait', 'class', 'interface']);
+      const nodesToQuery: Node[] = [...allMatches.nodes];
+      for (const node of allMatches.nodes) {
+        if (CONTAINER_KINDS_BATCH.has(node.kind)) {
+          for (const child of cg.getChildren(node.id)) {
+            if (!nodesToQuery.some(n => n.id === child.id)) {
+              nodesToQuery.push(child);
+            }
+          }
+        }
+      }
+
       const seen = new Set<string>();
       const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
-      const edgeKinds = [kindFilter as EdgeKind];
-      for (const node of allMatches.nodes) {
+      const edgeKinds: EdgeKind[] | undefined = kindFilter === 'all' ? undefined : [kindFilter as EdgeKind];
+      for (const node of nodesToQuery) {
         for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
           const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
           if (seen.has(key)) continue;
@@ -1431,7 +1645,7 @@ export class ToolHandler {
           if (sourceNode) { usages.push({ sourceNode, targetNode: node, edgeKind: edge.kind, line: edge.line ?? sourceNode.startLine }); }
         }
         for (const edge of cg.getOutgoingEdges(node.id)) {
-          if (!edgeKinds.includes(edge.kind)) continue;
+          if (edgeKinds !== undefined && !edgeKinds.includes(edge.kind)) continue;
           const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
           if (seen.has(key)) continue;
           seen.add(key);
@@ -1439,6 +1653,18 @@ export class ToolHandler {
           if (targetNode) { usages.push({ sourceNode: node, targetNode, edgeKind: edge.kind, line: edge.line ?? node.startLine }); }
         }
       }
+
+      if (mutability && (mutability === 'mut' || mutability === 'shared' || mutability === 'owning')) {
+        const filtered: typeof usages = [];
+        for (const u of usages) {
+          if (this.classifyMutability(u.sourceNode.signature, valid) === mutability) {
+            filtered.push(u);
+          }
+        }
+        usages.length = 0;
+        usages.push(...filtered);
+      }
+
       const perLimit = Math.max(3, Math.ceil(limit / batchLimit));
       lines.push(this.formatUsageResults(valid, usages, perLimit));
       lines.push('');
@@ -1558,7 +1784,7 @@ export class ToolHandler {
         const localResolved = resolvedBySource.get(node.id) ?? new Set<string>();
         const unresolved = cg.getUnresolvedByNode(node.id);
         for (const ref of unresolved) {
-          if (ref.referenceKind !== 'calls') continue;
+          if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'macro_call') continue;
           if (localResolved.has(ref.referenceName)) continue;
           const key = `ext:${ref.referenceName}:${ref.line}`;
           if (seen.has(key)) continue;
@@ -1566,7 +1792,7 @@ export class ToolHandler {
           externalCallees.push({
             name: ref.referenceName,
             line: ref.line,
-            kind: 'external',
+            kind: ref.referenceKind === 'macro_call' ? 'external macro' : 'external',
             filePath: ref.filePath ?? node.filePath,
           });
         }
@@ -1591,14 +1817,8 @@ export class ToolHandler {
     ];
     for (const cs of shownResolved) {
       const defLine = cs.callee.startLine ? `:${cs.callee.startLine}` : '';
-      const meta = cs.edge.metadata as Record<string, unknown> | undefined;
-      // ComputedStates edges: OnEnter/OnExit registration is in the handler's
-      // file (target), not the type definition's file (source).
-      const isComputedStateEdge = meta?.computedState != null;
       const sourceNode = cg.getNode(cs.edge.source);
-      const callSiteFile = isComputedStateEdge
-        ? cs.callee.filePath
-        : (sourceNode?.filePath ?? cs.callee.filePath);
+      const callSiteFile = sourceNode?.filePath ?? cs.callee.filePath;
       const callLine = cs.edge.line ?? cs.callee.startLine;
       const fileRef = `${callSiteFile}:${callLine}`;
       const snippet = this.sourceLineAt(cg, fileRef, fileCache);
@@ -1608,7 +1828,20 @@ export class ToolHandler {
       lines.push('');
     }
     for (const ext of shownExternal) {
-      lines.push(`- **${ext.name}** (external)`);
+      // Format method calls: capitalize receiver for readability
+      // "commands.spawn" → "Commands::spawn", "下一个状态.set" → "下一个状态::set"
+      let displayName = ext.name;
+      const dotIdx = ext.name.indexOf('.');
+      if (dotIdx > 0) {
+        const receiver = ext.name.slice(0, dotIdx);
+        const method = ext.name.slice(dotIdx + 1);
+        const capReceiver = receiver.charAt(0).toUpperCase() + receiver.slice(1);
+        displayName = `${capReceiver}::${method}`;
+      }
+      lines.push(`- **${displayName}** (${ext.kind})`);
+      if (displayName !== ext.name) {
+        lines.push(`  via: \`${ext.name}\``);
+      }
       lines.push(`  call: ${ext.filePath}:${ext.line}`);
       lines.push('');
     }
@@ -1667,10 +1900,149 @@ export class ToolHandler {
   }
 
   /**
-   * Fallback for caller queries when no project-internal node exists.
-   * Searches unresolved_refs for external symbols (e.g. external crate types
-   * like Bevy's DespawnOnExit) and returns the referencing nodes.
+   * Handle codegraph_symbol_info — aggregated symbol information.
+   * Returns definition, all incoming edge kinds (counted + top 5 details),
+   * outgoing callees, and impact radius in a single call.
    */
+  private async handleSymbolInfo(args: Record<string, unknown>): Promise<ToolResult> {
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const allMatches = this.findAllSymbols(cg, symbol);
+    if (allMatches.nodes.length === 0) {
+      return this.textResult(`Symbol "${symbol}" not found`);
+    }
+
+    const lines: string[] = [`## Symbol Info: "${symbol}"`, ''];
+
+    for (const node of allMatches.nodes) {
+      lines.push(`### ${node.name} (${node.kind})`);
+      lines.push(`- **定义**: ${node.filePath}:${node.startLine}`);
+      if (node.signature) lines.push(`- **签名**: \`${node.signature}\``);
+
+      // Incoming edges grouped by kind
+      const incoming = cg.getIncomingEdges(node.id);
+      const inByKind = new Map<string, Edge[]>();
+      for (const e of incoming) {
+        const arr = inByKind.get(e.kind) || [];
+        arr.push(e);
+        inByKind.set(e.kind, arr);
+      }
+      lines.push(`- **引用者** (${inByKind.size} kinds):`);
+      for (const [kind, edges] of inByKind) {
+        lines.push(`  - ${kind}: ${edges.length}`);
+      }
+
+      // Outgoing callees (top 5)
+      const callees = cg.getCallees(node.id);
+      if (callees.length > 0) {
+        lines.push(`- **被调用者** (${callees.length}):`);
+        for (const c of callees.slice(0, 5)) {
+          lines.push(`  - ${c.node.name} (${c.node.filePath}:${c.edge.line ?? c.node.startLine})`);
+        }
+        if (callees.length > 5) {
+          lines.push(`  ... and ${callees.length - 5} more`);
+        }
+      }
+
+      // Impact radius
+      const impact = cg.getImpactRadius(node.id, 2);
+      const rootSet = new Set(impact.roots);
+      let l1 = 0, l2 = 0, l3 = 0;
+      // Compute BFS distances from roots
+      const dist = new Map<string, number>();
+      const queue: string[] = [];
+      for (const rootId of impact.roots) {
+        dist.set(rootId, 0);
+        queue.push(rootId);
+      }
+      const adj = new Map<string, string[]>();
+      for (const e of impact.edges) {
+        if (e.kind === 'contains') continue;
+        const targets = adj.get(e.target) || [];
+        targets.push(e.source);
+        adj.set(e.target, targets);
+      }
+      for (let h = 0; h < queue.length; h++) {
+        const cur = queue[h]!;
+        const curDist = dist.get(cur)!;
+        const sources = adj.get(cur) || [];
+        for (const src of sources) {
+          if (!dist.has(src)) {
+            dist.set(src, curDist + 1);
+            queue.push(src);
+          }
+        }
+      }
+      for (const node of impact.nodes.values()) {
+        if (node.kind === 'file' || rootSet.has(node.id)) continue;
+        const d = dist.get(node.id) ?? 99;
+        if (d <= 1) l1++;
+        else if (d <= 2) l2++;
+        else l3++;
+      }
+      lines.push(`- **影响半径**: ${impact.nodes.size} nodes, L1=${l1}, L2=${l2}, L3=${l3}`);
+      lines.push('');
+    }
+
+    lines.push(allMatches.note);
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  /**
+   * Format external callers from unresolved references (include_external=true, no project symbol).
+   */
+  private formatExternalCallers(
+    unresolved: UnresolvedReference[], symbol: string, limit: number,
+  ): ToolResult {
+    const seen = new Set<string>();
+    const callers: Array<{ name: string; line: number; kind: string; filePath: string }> = [];
+    for (const ref of unresolved) {
+      if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'references'
+          && ref.referenceKind !== 'macro_call' && ref.referenceKind !== 'pattern_match') continue;
+      const key = `${ref.fromNodeId}:${ref.referenceKind}:${ref.line}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      callers.push({
+        name: ref.referenceName,
+        line: ref.line,
+        kind: ref.referenceKind === 'macro_call' ? 'external macro' : 'external',
+        filePath: ref.filePath ?? '',
+      });
+    }
+
+    if (callers.length === 0) {
+      return this.textResult(`No external callers found for "${symbol}"`);
+    }
+
+    const byFile = new Map<string, typeof callers>();
+    for (const c of callers) {
+      const arr = byFile.get(c.filePath) || [];
+      arr.push(c);
+      byFile.set(c.filePath, arr);
+    }
+
+    const shown = callers.slice(0, limit);
+    const lines: string[] = [
+      `## External Callers of "${symbol}" (${shown.length} shown, ${callers.length} total)`,
+      '',
+      '> External symbol — no project-internal node found. Results from unresolved references.',
+      '',
+    ];
+    for (const [file, fileCallers] of byFile) {
+      lines.push(`**${file}:**`);
+      for (const c of fileCallers) {
+        lines.push(`- ${c.name} (${c.kind}) line ${c.line}`);
+      }
+      lines.push('');
+    }
+    if (callers.length > limit) {
+      lines.push(`... and ${callers.length - limit} more callers`);
+    }
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
   private handleUsagesFromUnresolved(
     cg: CodeGraph, symbol: string, limit: number, kindFilter?: string,
   ): ToolResult | null {

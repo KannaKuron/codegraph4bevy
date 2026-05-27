@@ -518,6 +518,9 @@ export class ReferenceResolver {
       return null;
     }
 
+    // Skip macro_call references — they are not resolved to project symbols
+    if (ref.referenceKind === 'macro_call') return null;
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -706,7 +709,7 @@ export class ReferenceResolver {
       // Delete unresolved refs, but preserve type_of and calls — type_of
       // are structural relationships; calls to external symbols (e.g. Bevy
       // API, std library) are valuable for usages/search even when unresolved.
-      const PRESERVED_KINDS = new Set(['type_of', 'calls']);
+      const PRESERVED_KINDS = new Set(['type_of', 'calls', 'macro_call', 'method_call']);
       if (result.unresolved.length > 0) {
         const deletable = result.unresolved.filter(r => !PRESERVED_KINDS.has(r.referenceKind));
         if (deletable.length > 0) {

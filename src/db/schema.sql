@@ -196,3 +196,19 @@ CREATE TABLE IF NOT EXISTS project_metadata (
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+-- External crate symbols (shallow-indexed from cargo registry)
+CREATE TABLE IF NOT EXISTS external_symbols (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    crate_name TEXT NOT NULL,
+    crate_version TEXT NOT NULL,
+    symbol_name TEXT NOT NULL,
+    symbol_kind TEXT NOT NULL,
+    method_name TEXT NOT NULL DEFAULT '',
+    param_types TEXT,
+    return_type TEXT,
+    signature TEXT,
+    UNIQUE(crate_name, crate_version, symbol_name, method_name)
+);
+CREATE INDEX IF NOT EXISTS idx_external_symbols_type ON external_symbols(crate_name, symbol_name);
+CREATE INDEX IF NOT EXISTS idx_external_symbols_method ON external_symbols(symbol_name, method_name);

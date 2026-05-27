@@ -293,7 +293,7 @@ export class GraphTraverser {
     }
     visited.add(nodeId);
 
-    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports']);
+    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls']);
     if (outgoingEdges.length === 0) return;
 
     // Batch-fetch callee nodes (was N+1 — see getCallersRecursive note).
@@ -301,6 +301,10 @@ export class GraphTraverser {
     const calleeNodes = this.queries.getNodesByIds(targetIds);
 
     for (const edge of outgoingEdges) {
+      // Skip Bevy state transition synthetic edges — these are not real calls
+      const meta = edge.metadata as Record<string, unknown> | undefined;
+      if (meta?.synthesizedBy === 'bevy-ecs-state') continue;
+
       const calleeNode = calleeNodes.get(edge.target);
       if (calleeNode && !visited.has(calleeNode.id)) {
         result.push({ node: calleeNode, edge });
@@ -659,5 +663,39 @@ export class GraphTraverser {
       if (childNode) children.push(childNode);
     }
     return children;
+  }
+
+  /**
+   * Recursively get all descendants of a node following contains edges.
+   * Used to find parameter nodes nested inside closure bodies, which are
+   * not direct children of the function node.
+   *
+   * @param nodeId - ID of the container node
+   * @param maxDepth - Maximum recursion depth (default: 10)
+   * @returns Array of all descendant nodes
+   */
+  getDescendantsRecursive(nodeId: string, maxDepth: number = 10): Node[] {
+    const result: Node[] = [];
+    const visited = new Set<string>();
+    this.collectDescendants(nodeId, 0, maxDepth, result, visited);
+    return result;
+  }
+
+  private collectDescendants(
+    nodeId: string,
+    depth: number,
+    maxDepth: number,
+    result: Node[],
+    visited: Set<string>,
+  ): void {
+    if (visited.has(nodeId)) return;
+    visited.add(nodeId);
+    if (depth >= maxDepth) return;
+
+    const children = this.getChildren(nodeId);
+    for (const child of children) {
+      result.push(child);
+      this.collectDescendants(child.id, depth + 1, maxDepth, result, visited);
+    }
   }
 }

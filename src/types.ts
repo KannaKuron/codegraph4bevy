@@ -48,6 +48,8 @@ export type NodeKind = (typeof NODE_KINDS)[number];
 export type EdgeKind =
   | 'contains'        // Parent contains child (file→class, class→method)
   | 'calls'           // Function/method calls another
+  | 'macro_call'      // Rust macro call (info!, warn!, println!, etc.)
+  | 'method_call'     // Method call on a receiver (obj.method())
   | 'imports'         // File imports from another
   | 'exports'         // File exports a symbol
   | 'extends'         // Class/interface extends another

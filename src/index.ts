@@ -39,6 +39,8 @@ import {
   SyncResult,
   extractFromSource,
   initGrammars,
+  isGrammarLoaded,
+  loadGrammarsForLanguages,
 } from './extraction';
 import {
   ReferenceResolver,
@@ -48,7 +50,9 @@ import {
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
+import { logWarn } from './errors';
 import { FileWatcher, WatchOptions, PendingFile } from './sync';
+import { indexExternalCrates } from './extraction/external-crates';
 
 // Re-export types for consumers
 export * from './types';
@@ -361,6 +365,23 @@ export class CodeGraph {
               total,
             });
           });
+
+          // B4: Index external crate symbols (Bevy method signatures)
+          // Runs after resolution so external symbols are available for
+          // resolveReceiverType Tier 2 lookups.
+          try {
+            // Ensure Rust grammar is loaded before tree-sitter based shallow indexing
+            if (!isGrammarLoaded('rust')) {
+              await loadGrammarsForLanguages(['rust']);
+            }
+            const crateResult = indexExternalCrates(this.projectRoot, this.queries);
+            if (crateResult.cratesIndexed > 0 || crateResult.errors.length > 0) {
+              logWarn(`External crate indexing: ${crateResult.cratesIndexed} crates, ${crateResult.symbolsIndexed} symbols` +
+                (crateResult.errors.length > 0 ? `, ${crateResult.errors.length} errors` : ''));
+            }
+          } catch {
+            // Crate indexing is best-effort; failures don't block indexing
+          }
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -695,6 +716,58 @@ export class CodeGraph {
   }
 
   /**
+   * Search for macro call sites by macro name.
+   * Returns deduplicated call locations from unresolved macro_call references.
+   */
+  searchMacroCalls(name: string, limit: number = 20): Array<{ filePath: string; line: number; column: number; fromNodeId: string }> {
+    // Normalize: strip trailing ! — macro names are stored without it (tree-sitter
+    // parses info! as macro_name=info + bang), but users naturally search info!
+    const normalized = name.endsWith('!') ? name.slice(0, -1) : name;
+    const refs = this.queries.getUnresolvedByName(normalized);
+    const seen = new Set<string>();
+    const results: Array<{ filePath: string; line: number; column: number; fromNodeId: string }> = [];
+    for (const ref of refs) {
+      if (ref.referenceKind !== 'macro_call') continue;
+      const key = `${ref.filePath}:${ref.line}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push({ filePath: ref.filePath ?? '', line: ref.line, column: ref.column, fromNodeId: ref.fromNodeId });
+      if (results.length >= limit) break;
+    }
+    return results;
+  }
+
+  /**
+   * Search for method call sites by method name.
+   * Returns deduplicated call locations from unresolved method_call references.
+   */
+  searchMethodCalls(name: string, limit: number = 30): Array<{ filePath: string; line: number; column: number; fromNodeId: string; receiverHint: string; declaredType?: string }> {
+    const refs = this.queries.getUnresolvedByName(name);
+    const seen = new Set<string>();
+    const results: Array<{ filePath: string; line: number; column: number; fromNodeId: string; receiverHint: string; declaredType?: string }> = [];
+    for (const ref of refs) {
+      if (ref.referenceKind !== 'method_call') continue;
+      const key = `${ref.filePath}:${ref.line}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // Look up the corresponding calls ref for receiver context
+      const callerRefs = this.queries.getUnresolvedByNode(ref.fromNodeId);
+      let receiverHint = '';
+      for (const cr of callerRefs) {
+        if (cr.referenceKind === 'calls' && cr.line === ref.line && cr.referenceName.endsWith(`.${name}`)) {
+          receiverHint = cr.referenceName.slice(0, -(name.length + 1));
+          break;
+        }
+      }
+      // Resolve declared type from the receiver variable's type_of edge
+      const declaredType = receiverHint ? this.resolveReceiverType(ref.fromNodeId, receiverHint, name) : undefined;
+      results.push({ filePath: ref.filePath ?? '', line: ref.line, column: ref.column, fromNodeId: ref.fromNodeId, receiverHint, declaredType });
+      if (results.length >= limit) break;
+    }
+    return results;
+  }
+
+  /**
    * Get unresolved references by reference name.
    * Used for finding usages of external symbols (no project-internal node).
    */
@@ -894,6 +967,89 @@ export class CodeGraph {
    */
   getChildren(nodeId: string): Node[] {
     return this.traverser.getChildren(nodeId);
+  }
+
+  /**
+   * Get all descendants of a node recursively (following contains edges).
+   */
+  getDescendantsRecursive(nodeId: string, maxDepth?: number): Node[] {
+    return this.traverser.getDescendantsRecursive(nodeId, maxDepth);
+  }
+
+  /**
+   * Resolve the declared type name for a variable by following type_of edges.
+   * Three-tier resolution:
+   *
+   * Tier 1: Search all descendants (not just immediate children) for a parameter
+   *         node with matching name, then follow type_of edges to get declared type.
+   *         Covers: `commands: Commands`, `窗口: Single<&mut Window>`, etc.
+   *
+   * Tier 2: For closure parameters without type annotations (no type_of edge),
+   *         look up the method being called in external_symbols to infer the type.
+   *         Covers: `|父节点|` in `with_children` → `ChildBuilder`.
+   *
+   * Tier 3: Hardcoded fallback for well-known Bevy patterns.
+   *         Covers: `with_children` → `ChildBuilder` (safety net when crate index unavailable).
+   */
+  private resolveReceiverType(fromNodeId: string, varName: string, methodName?: string): string | undefined {
+    // ── Tier 1: Recursive parameter search with type_of edges ─────
+    const descendants = this.traverser.getDescendantsRecursive(fromNodeId);
+    for (const child of descendants) {
+      if (child.kind === 'parameter' && child.name === varName) {
+        const typeEdges = this.queries.getOutgoingEdges(child.id, ['type_of']);
+        if (typeEdges.length > 0) {
+          const typeNode = this.queries.getNodeById(typeEdges[0]!.target);
+          if (typeNode) return typeNode.name;
+        }
+        // Parameter found but no type_of edge → continue searching other descendants
+        continue;
+      }
+    }
+
+    // Also check immediate children (backward compat — non-parameter variable declarations)
+    const children = this.traverser.getChildren(fromNodeId);
+    for (const child of children) {
+      if (child.name === varName && child.kind !== 'parameter') {
+        const typeEdges = this.queries.getOutgoingEdges(child.id, ['type_of']);
+        if (typeEdges.length > 0) {
+          const typeNode = this.queries.getNodeById(typeEdges[0]!.target);
+          if (typeNode) return typeNode.name;
+        }
+      }
+    }
+
+    // ── Tier 2: External symbol lookup for closure parameters ────
+    if (methodName) {
+      // For closure parameters without type annotations, look up the method
+      // in external_symbols to infer the receiver type.
+      // Common Bevy types that have methods called in closure context:
+      const candidateTypes = ['Commands', 'ChildBuilder', 'EntityCommands', 'Query', 'Res', 'ResMut', 'World'];
+      for (const typeName of candidateTypes) {
+        const extSig = this.queries.getExternalMethodSignature(typeName, methodName);
+        if (extSig) return typeName;
+      }
+
+      // Generic external symbol search: find any type with this method
+      // Future: add a reverse index for efficient method→type lookup
+    }
+
+    // ── Tier 3: Hardcoded fallback for well-known Bevy patterns ──
+    if (methodName) {
+      // with_children is always on ChildBuilder
+      if (methodName === 'with_children' || methodName === 'spawn_children') {
+        return 'ChildBuilder';
+      }
+      // spawn, insert, remove, despawn are on EntityCommands (which Deref to Commands)
+      if (methodName === 'spawn' || methodName === 'insert' || methodName === 'remove' || methodName === 'despawn') {
+        return 'EntityCommands';
+      }
+      // Single, Query, etc. are Query/Res method wrappers
+      if (methodName === 'single' || methodName === 'get' || methodName === 'iter') {
+        return 'Query';
+      }
+    }
+
+    return undefined;
   }
 
   /**

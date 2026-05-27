@@ -185,7 +185,7 @@ function extractMacroCall(node: SyntaxNode, source: string, addRef: (ref: Unreso
   addRef({
     fromNodeId: callerId,
     referenceName: macroName,
-    referenceKind: 'calls',
+    referenceKind: 'macro_call',
     line: node.startPosition.row + 1,
     column: node.startPosition.column,
   });
@@ -867,7 +867,7 @@ export const rustExtractor: LanguageExtractor = {
   typeAliasTypes: ['type_item'], // Rust type aliases
   importTypes: ['use_declaration'],
   callTypes: ['call_expression'],
-  variableTypes: ['let_declaration', 'const_item', 'static_item'],
+  variableTypes: ['let_declaration', 'const_item', 'static_item', 'parameter', 'closure_parameters'],
   fieldTypes: ['field_declaration'],
   interfaceKind: 'trait',
   nameField: 'name',
@@ -938,6 +938,37 @@ export const rustExtractor: LanguageExtractor = {
       parent = parent.parent;
     }
     return undefined;
+  },
+
+  extractVariables: (node, source) => {
+    const results: Array<{ name: string; kind: NodeKind; signature?: string; positionNode?: SyntaxNode }> = [];
+
+    if (node.type === 'parameter') {
+      const patternNode = getChildByField(node, 'pattern');
+      if (!patternNode) return [];
+      const name = getNodeText(patternNode, source);
+      if (!name || name === '_') return [];
+      const typeNode = getChildByField(node, 'type');
+      const signature = typeNode ? getNodeText(typeNode, source) : undefined;
+      results.push({ name, kind: 'parameter', signature, positionNode: patternNode });
+      return results;
+    }
+
+    if (node.type === 'closure_parameters') {
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child && child.type === 'parameter') {
+          const patternNode = getChildByField(child, 'pattern');
+          if (!patternNode) continue;
+          const name = getNodeText(patternNode, source);
+          if (!name || name === '_') continue;
+          results.push({ name, kind: 'parameter', positionNode: patternNode });
+        }
+      }
+      return results;
+    }
+
+    return [];
   },
 
   extractImport: (node, source) => {

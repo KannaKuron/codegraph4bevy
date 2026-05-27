@@ -1760,4 +1760,102 @@ export class QueryBuilder {
       this.db.exec('DELETE FROM comments');
     })();
   }
+
+  // ===========================================================================
+  // External Symbol Operations (shallow crate indexing)
+  // ===========================================================================
+
+  /**
+   * Get the parameter types for a method on a type from external symbols.
+   * Returns the param_types JSON array string, or undefined if not found.
+   */
+  getExternalMethodSignature(typeName: string, methodName: string): string | undefined {
+    const row = this.db.prepare(
+      `SELECT param_types FROM external_symbols
+       WHERE symbol_name = ? AND method_name = ?
+       ORDER BY crate_version DESC
+       LIMIT 1`
+    ).get(typeName, methodName) as { param_types: string | null } | undefined;
+    return row?.param_types ?? undefined;
+  }
+
+  /**
+   * Get all external symbols for a type (all methods, constructors, etc.).
+   */
+  getExternalSymbolsForType(typeName: string): Array<{
+    crateName: string;
+    crateVersion: string;
+    symbolName: string;
+    symbolKind: string;
+    methodName: string | null;
+    paramTypes: string | null;
+    returnType: string | null;
+  }> {
+    const rows = this.db.prepare(
+      `SELECT crate_name, crate_version, symbol_name, symbol_kind, method_name, param_types, return_type
+       FROM external_symbols WHERE symbol_name = ?`
+    ).all(typeName) as Array<{
+      crate_name: string;
+      crate_version: string;
+      symbol_name: string;
+      symbol_kind: string;
+      method_name: string | null;
+      param_types: string | null;
+      return_type: string | null;
+    }>;
+    return rows.map(r => ({
+      crateName: r.crate_name,
+      crateVersion: r.crate_version,
+      symbolName: r.symbol_name,
+      symbolKind: r.symbol_kind,
+      methodName: r.method_name,
+      paramTypes: r.param_types,
+      returnType: r.return_type,
+    }));
+  }
+
+  /**
+   * Insert or update an external symbol entry.
+   */
+  upsertExternalSymbol(params: {
+    crateName: string;
+    crateVersion: string;
+    symbolName: string;
+    symbolKind: string;
+    methodName?: string;
+    paramTypes?: string;
+    returnType?: string;
+    signature?: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO external_symbols
+        (crate_name, crate_version, symbol_name, symbol_kind, method_name, param_types, return_type, signature)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(crate_name, crate_version, symbol_name, method_name) DO UPDATE SET
+        symbol_kind = excluded.symbol_kind,
+        param_types = excluded.param_types,
+        return_type = excluded.return_type,
+        signature = excluded.signature
+    `).run(
+      params.crateName,
+      params.crateVersion,
+      params.symbolName,
+      params.symbolKind,
+      params.methodName ?? '',
+      params.paramTypes ?? null,
+      params.returnType ?? null,
+      params.signature ?? null,
+    );
+  }
+
+  /**
+   * Clear external symbols, optionally filtered by crate name.
+   */
+  clearExternalSymbols(crateName?: string): void {
+    if (crateName) {
+      this.db.prepare('DELETE FROM external_symbols WHERE crate_name = ?').run(crateName);
+    } else {
+      this.db.exec('DELETE FROM external_symbols');
+    }
+  }
 }

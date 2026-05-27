@@ -126,6 +126,27 @@ const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Build the full dot-separated chain for a Rust field_expression AST node.
+ * e.g. a.b.c → "a.b.c". Recursively walks nested field_expression values.
+ * Returns null if the chain cannot be resolved.
+ */
+function buildFieldExpressionChain(node: SyntaxNode, source: string): string | null {
+  if (node.type === 'identifier' || node.type === 'scoped_identifier') {
+    return getNodeText(node, source);
+  }
+  if (node.type === 'field_expression') {
+    const value = getChildByField(node, 'value') || node.namedChild(0);
+    const field = getChildByField(node, 'field') || node.namedChild(1);
+    if (value && field) {
+      const receiver = buildFieldExpressionChain(value, source);
+      const method = getNodeText(field, source);
+      if (receiver && method) return `${receiver}.${method}`;
+    }
+  }
+  return null;
+}
+
+/**
  * TreeSitterExtractor - Main extraction class
  */
 export class TreeSitterExtractor {
@@ -1137,6 +1158,34 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const isExported = this.extractor.isExported?.(node, this.source) ?? false;
 
+    // Check if the language extractor has a custom extractVariables hook
+    const varInfos = this.extractor.extractVariables?.(node, this.source);
+    if (varInfos && varInfos.length > 0) {
+      for (const info of varInfos) {
+        const varKind = info.kind || kind;
+        const varNode = this.createNode(varKind, info.name, info.positionNode || node, {
+          docstring,
+          signature: info.signature,
+          isExported,
+        });
+        if (varNode && info.signature) {
+          // Try extractor's returnField first, then explicit 'type' field (Rust
+          // parameters use 'type', not 'return_type'), then fall back to annotation walk.
+          let typeNode: SyntaxNode | null = null;
+          if (this.extractor.returnField) {
+            typeNode = getChildByField(node, this.extractor.returnField);
+          }
+          if (!typeNode) typeNode = getChildByField(node, 'type');
+          if (typeNode) {
+            this.extractTypeRefsFromSubtree(typeNode, varNode.id);
+          } else {
+            this.extractVariableTypeAnnotation(node, varNode.id);
+          }
+        }
+      }
+      return; // hook handled extraction, skip generic fallback
+    }
+
     // Extract variable declarators based on language
     if (this.language === 'typescript' || this.language === 'javascript' ||
         this.language === 'tsx' || this.language === 'jsx') {
@@ -1540,6 +1589,7 @@ export class TreeSitterExtractor {
 
     // Get the function/method being called
     let calleeName = '';
+    let bareMethodName = ''; // method-only name for method_call ref (O5)
 
     // Java/Kotlin method_invocation has 'object' + 'name' fields instead of 'function'
     // PHP member_call_expression has 'object' + 'name', scoped_call_expression has 'scope' + 'name'
@@ -1583,6 +1633,7 @@ export class TreeSitterExtractor {
           methodKeywords.length === 1
             ? (methodKeywords[0] as string)
             : methodKeywords.map((k) => `${k}:`).join('');
+        bareMethodName = methodName;
         const receiverField = getChildByField(node, 'receiver');
         const SKIP_RECEIVERS = new Set(['self', 'super']);
         if (receiverField && receiverField.type !== 'message_expression') {
@@ -1616,6 +1667,7 @@ export class TreeSitterExtractor {
           }
           if (property) {
             const methodName = getNodeText(property, this.source);
+            bareMethodName = methodName;
             // Include receiver name for qualified resolution (e.g., console.print → "console.print")
             // This helps the resolver distinguish method calls from bare function calls
             // (e.g., Python's console.print() vs builtin print())
@@ -1631,6 +1683,28 @@ export class TreeSitterExtractor {
               }
             } else {
               calleeName = methodName;
+            }
+          }
+        } else if (func.type === 'field_expression') {
+          // Rust method call: receiver.method() or a.b.c()
+          // field_expression has 'value' (receiver) and 'field' (method name)
+          const field = getChildByField(func, 'field') || func.namedChild(1);
+          if (field) {
+            bareMethodName = getNodeText(field, this.source);
+            const value = getChildByField(func, 'value') || func.namedChild(0);
+            if (value) {
+              if (value.type === 'identifier' || value.type === 'scoped_identifier') {
+                const receiverName = getNodeText(value, this.source);
+                calleeName = `${receiverName}.${bareMethodName}`;
+              } else if (value.type === 'field_expression') {
+                const fullChain = buildFieldExpressionChain(func, this.source);
+                if (fullChain) calleeName = fullChain;
+                else calleeName = bareMethodName;
+              } else {
+                calleeName = bareMethodName;
+              }
+            } else {
+              calleeName = bareMethodName;
             }
           }
         } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
@@ -1650,6 +1724,21 @@ export class TreeSitterExtractor {
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
       });
+
+      // When this is a method call (obj.method()), also emit a method_call
+      // ref keyed on the bare method name so that kind="method_call" search
+      // can find all call sites regardless of receiver type.
+      // calleeName is "receiver.method" for qualified method calls,
+      // otherwise it matches the raw function name.
+      if (bareMethodName && calleeName !== bareMethodName) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: bareMethodName,
+          referenceKind: 'method_call',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
 
       // Track method/external calls in the caller node's signature so
       // queries like "insert_resource" or "add_message" are searchable

@@ -751,7 +751,7 @@ pub fn setup() {
       const func = result.nodes.find(n => n.name === 'process');
       expect(func).toBeDefined();
       const call = result.unresolvedReferences.find(
-        r => r.referenceKind === 'calls' && r.referenceName === 'println'
+        r => r.referenceKind === 'macro_call' && r.referenceName === 'println'
       );
       expect(call).toBeDefined();
       expect(call?.fromNodeId).toBe(func?.id);
@@ -760,7 +760,7 @@ pub fn setup() {
     it('should extract calls edge for warn!/error! macros', () => {
       const code = `pub fn handle() { warn!("msg"); error!("err"); }`;
       const result = extractFromSource('lib.rs', code);
-      const calls = result.unresolvedReferences.filter(r => r.referenceKind === 'calls');
+      const calls = result.unresolvedReferences.filter(r => r.referenceKind === 'macro_call');
       expect(calls.find(r => r.referenceName === 'warn')).toBeDefined();
       expect(calls.find(r => r.referenceName === 'error')).toBeDefined();
     });
@@ -770,12 +770,12 @@ pub fn setup() {
       const result = extractFromSource('lib.rs', code);
       // scoped_identifier is stripped to bare name for macro identity
       const call = result.unresolvedReferences.find(
-        r => r.referenceKind === 'calls' && r.referenceName === 'println'
+        r => r.referenceKind === 'macro_call' && r.referenceName === 'println'
       );
       expect(call).toBeDefined();
       // Should NOT produce "std::println" as referenceName
       const scoped = result.unresolvedReferences.find(
-        r => r.referenceKind === 'calls' && r.referenceName === 'std::println'
+        r => r.referenceKind === 'macro_call' && r.referenceName === 'std::println'
       );
       expect(scoped).toBeUndefined();
     });
@@ -784,7 +784,7 @@ pub fn setup() {
       const code = `println!("hello");`;
       const result = extractFromSource('lib.rs', code);
       const call = result.unresolvedReferences.find(
-        r => r.referenceKind === 'calls' && r.referenceName === 'println'
+        r => r.referenceKind === 'macro_call' && r.referenceName === 'println'
       );
       expect(call).toBeDefined();
     });
@@ -798,7 +798,7 @@ pub fn process() {
 }`;
       const result = extractFromSource('lib.rs', code);
       const warnCalls = result.unresolvedReferences.filter(
-        r => r.referenceKind === 'calls' && r.referenceName === 'warn'
+        r => r.referenceKind === 'macro_call' && r.referenceName === 'warn'
       );
       expect(warnCalls).toHaveLength(3);
       // Each should have distinct line numbers
