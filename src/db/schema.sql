@@ -212,3 +212,4 @@ CREATE TABLE IF NOT EXISTS external_symbols (
 );
 CREATE INDEX IF NOT EXISTS idx_external_symbols_type ON external_symbols(crate_name, symbol_name);
 CREATE INDEX IF NOT EXISTS idx_external_symbols_method ON external_symbols(symbol_name, method_name);
+CREATE INDEX IF NOT EXISTS idx_external_symbols_method_name ON external_symbols(method_name);

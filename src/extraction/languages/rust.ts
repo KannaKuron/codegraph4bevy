@@ -22,20 +22,21 @@ const BUILTIN_TYPES = new Set([
 ]);
 
 const BEVY_SYSTEM_METHODS = new Set([
-  'add_systems', 'observe',
+  'add_systems', 'observe', 'configure_sets',
 ]);
 const BEVY_INSTANTIATE_METHODS = new Set([
   'add_plugins', 'init_resource', 'add_event', 'insert_resource',
+  'init_state', 'add_sub_state', 'register_type',
 ]);
 const BEVY_STATE_FUNCTIONS = new Set([
-  'OnEnter', 'OnExit', 'in_state',
+  'OnEnter', 'OnExit', 'OnTransition', 'in_state',
 ]);
 const BEVY_STATE_CONSTRUCTORS = new Set([
   'DespawnOnExit', 'Pending',
 ]);
 
-const ADD_SYSTEMS_RE = /\.?(add_systems|add_plugins|observe)\s*\(/;
-const IDENT_EXCLUDE_RE = /^(?:Update|FixedUpdate|PreUpdate|PostUpdate|Last|Startup|First|OnEnter|OnExit|in_state|resource_exists|run_if|after|before|chain|pipe|and_then|or_else|map|filter|let|mut|use|fn|pub|impl|for|self|app|Res|ResMut|Commands|Query|EventWriter|EventReader|MessageWriter|MessageReader|Local|NextState|DespawnOnExit|with_child|spawn|insert|remove|entity|commands)$/;
+const ADD_SYSTEMS_RE = /\.?(add_systems|add_plugins|observe|configure_sets)\s*\(/;
+const IDENT_EXCLUDE_RE = /^(?:Update|FixedUpdate|PreUpdate|PostUpdate|Last|Startup|First|PreStartup|FixedPreUpdate|FixedPostUpdate|FixedFirst|FixedLast|RunOnce|PostStartup|OnEnter|OnExit|OnTransition|in_state|resource_exists|run_if|after|before|chain|pipe|and_then|or_else|map|filter|let|mut|use|fn|pub|impl|for|self|app|Res|ResMut|Commands|Query|EventWriter|EventReader|MessageWriter|MessageReader|Local|NextState|DespawnOnExit|ParamSet|NonSend|NonSendMut|Gizmos|Single|Populated|with_child|entity|commands)$/;
 const SYSTEM_IDENT_RE = /(?:^|[,\s(]+)([\w一-鿿][\w一-鿿]*(?:::(?:[\w一-鿿]+))*)\s*(?=\.\w|[,\\)]|$)/g;
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -466,10 +467,11 @@ function extractBevyNestedRefs(
         const name = getNodeText(func, source);
         if (BEVY_STATE_FUNCTIONS.has(name)) {
           extractBevyCallRefs(child, callerId, name, source, addRef);
-        } else if (name.endsWith('.add_systems') || name.endsWith('.observe')
-          || name.endsWith('.add_plugins') || name.includes('::init_resource')
-          || name.includes('::add_event') || name.includes('::insert_resource')) {
-          extractBevyCallRefs(child, callerId, name, source, addRef);
+        } else {
+          const methodName = name.split(/[.:]/).pop()!;
+          if (BEVY_SYSTEM_METHODS.has(methodName) || BEVY_INSTANTIATE_METHODS.has(methodName)) {
+            extractBevyCallRefs(child, callerId, name, source, addRef);
+          }
         }
       }
     }
@@ -933,6 +935,38 @@ export const rustExtractor: LanguageExtractor = {
             return source.substring(innerType.startIndex, innerType.endIndex);
           }
         }
+        // Handle scoped type identifier: impl Trait for crate::path::Type
+        const scopedType = children.find(
+          (c: SyntaxNode) => c.type === 'scoped_type_identifier'
+        );
+        if (scopedType) {
+          const nameChildren = scopedType.namedChildren.filter(
+            (c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'identifier'
+          );
+          const last = nameChildren[nameChildren.length - 1];
+          if (last) {
+            return source.substring(last.startIndex, last.endIndex);
+          }
+        }
+        // Handle reference/pointer types: impl Trait for &Type / *const Type
+        const refType = children.find(
+          (c: SyntaxNode) => c.type === 'reference_type' || c.type === 'pointer_type'
+        );
+        if (refType) {
+          const innerName = refType.namedChildren.find(
+            (c: SyntaxNode) => c.type === 'type_identifier'
+          );
+          if (innerName) {
+            return source.substring(innerName.startIndex, innerName.endIndex);
+          }
+        }
+        // Handle tuple type: impl Trait for (A, B)
+        const tupleType = children.find(
+          (c: SyntaxNode) => c.type === 'tuple_type'
+        );
+        if (tupleType) {
+          return source.substring(tupleType.startIndex, tupleType.endIndex);
+        }
         return undefined;
       }
       parent = parent.parent;
@@ -955,6 +989,24 @@ export const rustExtractor: LanguageExtractor = {
     }
 
     if (node.type === 'closure_parameters') {
+      // Walk up parent chain to find enclosing call_expression for method name.
+      // Start from closure_expression.parent (skip the closure_expression wrapper
+      // that is always the immediate parent of closure_parameters).
+      let methodName: string | undefined;
+      let parent = node.parent?.parent; // skip closure_expression → get arguments or expression
+      while (parent) {
+        if (parent.type === 'function_item' || parent.type === 'closure_expression') break;
+        if (parent.type === 'call_expression') {
+          const funcNode = getChildByField(parent, 'function');
+          if (funcNode) {
+            const fullName = getNodeText(funcNode, source);
+            const lastDot = fullName.lastIndexOf('.');
+            methodName = lastDot >= 0 ? fullName.slice(lastDot + 1) : fullName;
+          }
+          break;
+        }
+        parent = parent.parent;
+      }
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child && child.type === 'parameter') {
@@ -962,7 +1014,16 @@ export const rustExtractor: LanguageExtractor = {
           if (!patternNode) continue;
           const name = getNodeText(patternNode, source);
           if (!name || name === '_') continue;
-          results.push({ name, kind: 'parameter', positionNode: patternNode });
+          results.push({
+            name,
+            kind: 'parameter',
+            // Only store method name as signature when there's no explicit type
+            // annotation, so Tier 1.5 type inference has a fallback to work with.
+            // Parameters with type annotations already get type_of edges from
+            // the normal visitNode flow.
+            signature: getChildByField(child, 'type') ? undefined : methodName,
+            positionNode: patternNode,
+          });
         }
       }
       return results;

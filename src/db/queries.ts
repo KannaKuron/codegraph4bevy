@@ -1766,20 +1766,6 @@ export class QueryBuilder {
   // ===========================================================================
 
   /**
-   * Get the parameter types for a method on a type from external symbols.
-   * Returns the param_types JSON array string, or undefined if not found.
-   */
-  getExternalMethodSignature(typeName: string, methodName: string): string | undefined {
-    const row = this.db.prepare(
-      `SELECT param_types FROM external_symbols
-       WHERE symbol_name = ? AND method_name = ?
-       ORDER BY crate_version DESC
-       LIMIT 1`
-    ).get(typeName, methodName) as { param_types: string | null } | undefined;
-    return row?.param_types ?? undefined;
-  }
-
-  /**
    * Get all external symbols for a type (all methods, constructors, etc.).
    */
   getExternalSymbolsForType(typeName: string): Array<{
@@ -1857,5 +1843,23 @@ export class QueryBuilder {
     } else {
       this.db.exec('DELETE FROM external_symbols');
     }
+  }
+
+  /**
+   * Find all types that have a method with the given name.
+   * Returns distinct (symbol_name, param_types) pairs, newest crate versions first.
+   * Used by resolveReceiverType Tiers 1.5 and 2 for generalized receiver type inference.
+   */
+  findTypesByMethod(methodName: string): Array<{ symbolName: string; paramTypes: string | null }> {
+    const rows = this.db.prepare(
+      `SELECT symbol_name, param_types FROM (
+         SELECT symbol_name, param_types,
+           ROW_NUMBER() OVER (PARTITION BY symbol_name ORDER BY crate_version DESC) as rn
+         FROM external_symbols
+         WHERE method_name = ? AND method_name != ''
+       ) WHERE rn = 1
+       LIMIT 30`
+    ).all(methodName) as Array<{ symbol_name: string; param_types: string | null }>;
+    return rows.map(r => ({ symbolName: r.symbol_name, paramTypes: r.param_types }));
   }
 }

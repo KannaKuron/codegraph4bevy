@@ -188,7 +188,7 @@ export function matchMethodCall(
   const classCandidates = context.getNodesByName(objectOrClass!);
 
   for (const classNode of classCandidates) {
-    if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
+    if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface' || classNode.kind === 'trait' || classNode.kind === 'enum') {
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
 
@@ -217,7 +217,7 @@ export function matchMethodCall(
   if (capitalizedReceiver !== objectOrClass) {
     const fuzzyClassCandidates = context.getNodesByName(capitalizedReceiver);
     for (const classNode of fuzzyClassCandidates) {
-      if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
+      if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface' || classNode.kind === 'trait' || classNode.kind === 'enum') {
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
 
@@ -254,18 +254,11 @@ export function matchMethodCall(
     const sameLanguageMethods = methods.filter(m => m.language === ref.language);
     const targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
 
-    // If only one same-language method with this name exists, use it
-    if (targetMethods.length === 1 && targetMethods[0]!.language === ref.language) {
-      return {
-        original: ref,
-        targetNodeId: targetMethods[0]!.id,
-        confidence: 0.7,
-        resolvedBy: 'instance-method',
-      };
-    }
-
-    // Multiple methods: score by receiver name word overlap with class name
-    if (targetMethods.length > 1) {
+    // Multiple methods: score by receiver name word overlap with class name.
+    // (B13: removed single-match short-circuit — when Strategies 1/2 can't
+    // find a class/struct matching the receiver, a lone same-named method
+    // in the project is almost certainly a false match for an external call.)
+    if (targetMethods.length >= 1) {
       const receiverWords = splitCamelCase(objectOrClass!);
       let bestMatch: typeof targetMethods[0] | undefined;
       let bestScore = 0;

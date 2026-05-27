@@ -1590,6 +1590,7 @@ export class TreeSitterExtractor {
     // Get the function/method being called
     let calleeName = '';
     let bareMethodName = ''; // method-only name for method_call ref (O5)
+    let isMethodCall = false; // true when receiver.method() pattern (B12: chain calls)
 
     // Java/Kotlin method_invocation has 'object' + 'name' fields instead of 'function'
     // PHP member_call_expression has 'object' + 'name', scoped_call_expression has 'scope' + 'name'
@@ -1668,6 +1669,7 @@ export class TreeSitterExtractor {
           if (property) {
             const methodName = getNodeText(property, this.source);
             bareMethodName = methodName;
+            isMethodCall = true;
             // Include receiver name for qualified resolution (e.g., console.print → "console.print")
             // This helps the resolver distinguish method calls from bare function calls
             // (e.g., Python's console.print() vs builtin print())
@@ -1681,6 +1683,15 @@ export class TreeSitterExtractor {
               } else {
                 calleeName = methodName;
               }
+            } else if (receiver && (receiver.type === 'member_expression' || receiver.type === 'field_expression')) {
+              // Chained property access: a.b.method() → calleeName = "a.b.method"
+              const chain = buildFieldExpressionChain(receiver, this.source);
+              calleeName = chain ? `${chain}.${methodName}` : methodName;
+            } else if (receiver && receiver.type === 'call_expression') {
+              // Chained call: getX().method() → extract inner function name
+              const innerFunc = getChildByField(receiver, 'function') || receiver.namedChild(0);
+              const innerName = innerFunc ? getNodeText(innerFunc, this.source) : '';
+              calleeName = innerName ? `${innerName}.${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }
@@ -1691,6 +1702,7 @@ export class TreeSitterExtractor {
           const field = getChildByField(func, 'field') || func.namedChild(1);
           if (field) {
             bareMethodName = getNodeText(field, this.source);
+            isMethodCall = true;
             const value = getChildByField(func, 'value') || func.namedChild(0);
             if (value) {
               if (value.type === 'identifier' || value.type === 'scoped_identifier') {
@@ -1700,6 +1712,12 @@ export class TreeSitterExtractor {
                 const fullChain = buildFieldExpressionChain(func, this.source);
                 if (fullChain) calleeName = fullChain;
                 else calleeName = bareMethodName;
+              } else if (value.type === 'call_expression') {
+                // Chain call: foo().bar(). Extract inner function name for
+                // qualified reference (e.g., "commands.spawn.with_children").
+                const innerFunc = getChildByField(value, 'function') || value.namedChild(0);
+                const innerName = innerFunc ? getNodeText(innerFunc, this.source) : '';
+                calleeName = innerName ? `${innerName}.${bareMethodName}` : bareMethodName;
               } else {
                 calleeName = bareMethodName;
               }
@@ -1716,6 +1734,17 @@ export class TreeSitterExtractor {
       }
     }
 
+    // B13: Rust struct update syntax `Struct { ..default() }` generates
+    // a bare call_expression for `default()`. This is <TargetType as Default>::default(),
+    // not a call to a project-internal function. Detect by checking for `..`
+    // immediately before the call and skip the calls reference.
+    if (this.language === 'rust' && calleeName && !calleeName.includes('.') && !calleeName.includes('::')) {
+      const beforeText = this.source.slice(Math.max(0, node.startIndex - 10), node.startIndex);
+      if (/\.\.\s*$/.test(beforeText)) {
+        return; // struct update base, not a project call
+      }
+    }
+
     if (calleeName) {
       this.unresolvedReferences.push({
         fromNodeId: callerId,
@@ -1728,9 +1757,10 @@ export class TreeSitterExtractor {
       // When this is a method call (obj.method()), also emit a method_call
       // ref keyed on the bare method name so that kind="method_call" search
       // can find all call sites regardless of receiver type.
-      // calleeName is "receiver.method" for qualified method calls,
-      // otherwise it matches the raw function name.
-      if (bareMethodName && calleeName !== bareMethodName) {
+      // calleeName is "receiver.method" for simple receivers; for chain calls
+      // (a.b().c()) the receiver is a call_expression and calleeName equals
+      // bareMethodName. isMethodCall catches that case (B12).
+      if (bareMethodName && (calleeName !== bareMethodName || isMethodCall)) {
         this.unresolvedReferences.push({
           fromNodeId: callerId,
           referenceName: bareMethodName,
@@ -1937,6 +1967,15 @@ export class TreeSitterExtractor {
         // about `call_expression`, so constructor invocations
         // produced no graph edges at all.
         this.extractInstantiation(node);
+      } else if (nodeType === 'parameter' || nodeType === 'closure_parameters') {
+        // Extract parameter nodes for type resolution (B11).
+        // The main visitor skips function children (skipChildren=true),
+        // so parameters are never reached via the top-level walker.
+        // Without this, resolveReceiverType Tier 1 is dead code.
+        if (this.extractor!.variableTypes.includes(nodeType)) {
+          this.extractVariable(node);
+        }
+        return;
       } else if (this.extractor!.extractBareCall) {
         const calleeName = this.extractor!.extractBareCall(node, this.source);
         if (calleeName && this.nodeStack.length > 0) {

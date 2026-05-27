@@ -67,7 +67,8 @@ export type EdgeKind =
   | 'registers_message'  // Bevy: Plugin registers an event/message
   | 'contains_plugin'    // Bevy: PluginGroup contains a Plugin
   | 'on_enter'          // Bevy: State enter transition
-  | 'on_exit';          // Bevy: State exit transition
+  | 'on_exit'           // Bevy: State exit transition
+  | 'on_transition';    // Bevy: State transition (OnTransition)
 
 /**
  * Supported programming languages. See NODE_KINDS for why this is a

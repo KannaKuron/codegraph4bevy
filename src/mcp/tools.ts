@@ -435,8 +435,8 @@ export const tools: ToolDefinition[] = [
         },
         include_external: {
           type: 'boolean',
-          description: '包含对当前索引中无定义节点的符号的调用。即第三方依赖、标准库、框架 API、宏等在项目中没有源码的符号。默认: false。',
-          default: false,
+          description: '包含对当前索引中无定义节点的符号的调用。即第三方依赖、标准库、框架 API、宏等在项目中没有源码的符号。默认: true。设为 false 只显示项目内有定义节点的被调用者。',
+          default: true,
         },
         limit: {
           type: 'number',
@@ -1747,7 +1747,7 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
-    const includeExternal = args.include_external === true;
+    const includeExternal = args.include_external !== false; // default true
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
@@ -1801,7 +1801,11 @@ export class ToolHandler {
 
     const totalCallees = callSites.length + externalCallees.length;
     if (totalCallees === 0) {
-      return this.textResult(`No callees found for "${symbol}"${allMatches.note}`);
+      let hint = '';
+      if (!includeExternal) {
+        hint = '（该函数的所有被调用者均为外部符号，使用 include_external=true 查看）';
+      }
+      return this.textResult(`No callees found for "${symbol}"${allMatches.note}${hint}`);
     }
 
     const fileCache = new Map<string, string[]>();
@@ -3156,23 +3160,21 @@ export class ToolHandler {
     let code: string | null = null;
     let outline: string | null = null;
 
+    // O8: Always show member outline for container types (struct/enum/trait/interface)
+    if (CONTAINER_NODE_KINDS.has(match.node.kind)) {
+      outline = this.buildContainerOutline(cg, match.node);
+    }
+
     if (includeCode) {
-      // For container symbols (class/interface/struct/…), the full body is the
-      // sum of every method body — a wall of source (e.g. a 10k-char class)
-      // that bloats context and is rarely needed in full. Return a structural
-      // outline (members + signatures + line numbers) instead; the agent can
-      // Read or codegraph_node a specific method for its body. Leaf symbols
-      // (function/method/etc.) return their full body as before.
-      if (CONTAINER_NODE_KINDS.has(match.node.kind)) {
-        outline = this.buildContainerOutline(cg, match.node);
-      }
+      // For containers, outline suffices; for leaf symbols, fetch full source
       if (!outline) {
         code = await cg.getCode(match.node.id);
       }
     }
 
     const trail = this.formatTrail(cg, match.node);
-    const formatted = this.formatNodeDetails(match.node, code, outline) + trail + match.note;
+    const schedule = this.formatSchedule(cg, match.node);
+    const formatted = this.formatNodeDetails(match.node, code, outline) + schedule + trail + match.note;
     return this.textResult(this.truncateOutput(formatted));
   }
 
@@ -3199,17 +3201,18 @@ export class ToolHandler {
 
       let code: string | null = null;
       let outline: string | null = null;
+      if (CONTAINER_NODE_KINDS.has(match.node.kind)) {
+        outline = this.buildContainerOutline(cg, match.node);
+      }
       if (includeCode) {
-        if (CONTAINER_NODE_KINDS.has(match.node.kind)) {
-          outline = this.buildContainerOutline(cg, match.node);
-        }
         if (!outline) {
           code = await cg.getCode(match.node.id);
         }
       }
 
       const trail = this.formatTrail(cg, match.node);
-      const formatted = this.formatNodeDetails(match.node, code, outline) + trail + match.note;
+      const schedule = this.formatSchedule(cg, match.node);
+      const formatted = this.formatNodeDetails(match.node, code, outline) + schedule + trail + match.note;
       allLines.push(formatted);
       allLines.push('');
     }
@@ -3256,6 +3259,27 @@ export class ToolHandler {
       lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
     }
     return lines.join('\n');
+  }
+
+  /**
+   * O9: Show Bevy schedule registration info.
+   * Queries runs_in edges to tell which schedule a system runs in.
+   */
+  private formatSchedule(cg: CodeGraph, node: Node): string {
+    if (node.kind !== 'function' && node.kind !== 'method') return '';
+    const runsInEdges = cg.getOutgoingEdges(node.id, ['runs_in']);
+    if (runsInEdges.length === 0) return '';
+    const lines: string[] = [];
+    for (const edge of runsInEdges) {
+      const schedNode = cg.getNode(edge.target);
+      const schedName = schedNode?.name ?? 'unknown';
+      const loc = edge.line ? `:${edge.line}` : '';
+      const pluginMeta = (edge.metadata as Record<string, unknown> | undefined);
+      const plugin = pluginMeta?.plugin as string | undefined;
+      const by = plugin ? ` by ${plugin}` : '';
+      lines.push(`- **Schedule:** ${schedName}${by}${loc ? ` (line ${edge.line})` : ''}`);
+    }
+    return lines.length > 0 ? `\n${lines.join('\n')}` : '';
   }
 
   /**
@@ -4005,11 +4029,18 @@ export class ToolHandler {
       .sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
     if (children.length === 0) return '';
 
+    const MAX_MEMBERS = 50;
+    const shown = children.slice(0, MAX_MEMBERS);
+    const truncated = children.length > MAX_MEMBERS;
+
     const lines = [`**Members (${children.length}):**`, ''];
-    for (const c of children) {
+    for (const c of shown) {
       const loc = c.startLine ? `:${c.startLine}` : '';
       const sig = c.signature ? ` — \`${c.signature}\`` : '';
       lines.push(`- ${c.name} (${c.kind})${loc}${sig}`);
+    }
+    if (truncated) {
+      lines.push(`- ... and ${children.length - MAX_MEMBERS} more members`);
     }
     return lines.join('\n');
   }

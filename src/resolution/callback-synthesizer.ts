@@ -544,6 +544,8 @@ const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)
 // crate::IntroState matches IntroState::Done via startsWith('IntroState::').
 const IMPL_HEADER_RE = /impl\s+ComputedStates\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)(?:\s+where\s+[^{]+)?\s*\{/gu;
 const ADD_SYSTEMS_ONENTEREXIT_RE = /\.add_systems\s*\(\s*(OnEnter|OnExit)\s*\(/g;
+// OnTransition uses turbofish: OnTransition::<FromState, ToState>
+const ADD_SYSTEMS_ONTRANSITION_RE = /\.add_systems\s*\(\s*OnTransition\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
 
 // SubStates: #[source(ParentType = ParentType::Variant)] pub enum Name {
 const SUBSTATES_SOURCE_RE = /#\[\s*source\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*=\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?enum\s+([\p{L}\p{N}_]+)\s*\{/gu;
@@ -907,15 +909,18 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
       }
     }
 
-    // Producers: next_state.set(X) — Bevy 0.15+ ResMut<NextState<X>>.set()
-    NEXT_STATE_SET_RE.lastIndex = 0;
-    while ((m = NEXT_STATE_SET_RE.exec(content))) {
-      const { full, variant } = normalizeStateName(m[1]!.trim());
-      const line = content.substring(0, m.index).split('\n').length;
-      const fnId = findEnclosingFn(line);
-      if (fnId) {
-        const entry = ensure(variant);
-        entry.producers.set(fnId + '\0' + full, { line, full });
+    // Producers: .set(X) — Bevy 0.15+ ResMut<NextState<X>>.set().
+    // Guarded by NextState file-level check to avoid matching non-state .set() calls.
+    if (content.includes('NextState')) {
+      NEXT_STATE_SET_RE.lastIndex = 0;
+      while ((m = NEXT_STATE_SET_RE.exec(content))) {
+        const { full, variant } = normalizeStateName(m[1]!.trim());
+        const line = content.substring(0, m.index).split('\n').length;
+        const fnId = findEnclosingFn(line);
+        if (fnId) {
+          const entry = ensure(variant);
+          entry.producers.set(fnId + '\0' + full, { line, full });
+        }
       }
     }
 
@@ -968,6 +973,57 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
       }
       if (comma < 0) continue;
       // Find matching ")" for the add_systems call — start from the opening paren
+      const addSysOpen = content.indexOf('(', m.index);
+      if (addSysOpen < 0) continue;
+      let addSysDepth = 0;
+      let addSysClose = -1;
+      for (let i = addSysOpen; i < content.length; i++) {
+        if (content[i] === '(') addSysDepth++;
+        else if (content[i] === ')') { addSysDepth--; if (addSysDepth === 0) { addSysClose = i; break; } }
+      }
+      if (addSysClose < 0) continue;
+      const handlerArg = content.slice(comma + 1, addSysClose);
+      const handlerNames = parseHandlerNames(handlerArg);
+      const lineBase = content.substring(0, m.index).split('\n').length;
+      for (const hName of handlerNames) {
+        let handlerNode = fnByName.get(hName);
+        if (!handlerNode) {
+          const globalNodes = ctx.getNodesByName(hName);
+          handlerNode = globalNodes.length > 0 ? globalNodes[0] : undefined;
+        }
+        if (!handlerNode) continue;
+        const entry = ensure(variant);
+        entry.consumers.set(handlerNode.id + '\0' + full, { line: lineBase, full });
+      }
+    }
+  }
+
+  // Phase 2b OnTransition: app.add_systems(OnTransition::<From, To>, handlers)
+  // Detects consumers registered via OnTransition turbofish and registers them
+  // as consumers of the To (target) state.
+  for (const [file, content] of strippedByFile) {
+    const fileNodes = ctx.getNodesInFile(file);
+    const fnByName = new Map<string, Node>();
+    for (const n of fileNodes) {
+      if ((n.kind === 'function' || n.kind === 'method') && n.name) {
+        if (!fnByName.has(n.name)) fnByName.set(n.name, n);
+      }
+    }
+    ADD_SYSTEMS_ONTRANSITION_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ADD_SYSTEMS_ONTRANSITION_RE.exec(content))) {
+      const toStateFull = m[2]!.replace(/\s+/g, '');
+      const { full, variant } = normalizeStateName(toStateFull);
+      // Find the comma after the OnTransition turbofish → start of handler args
+      const angleClose = content.indexOf('>', m.index + m[0].length - 1);
+      if (angleClose < 0) continue;
+      let comma = -1;
+      for (let i = angleClose + 1; i < content.length; i++) {
+        if (content[i] === ',') { comma = i; break; }
+        if (content[i] !== ' ' && content[i] !== '\t' && content[i] !== '\n') break;
+      }
+      if (comma < 0) continue;
+      // Find matching ")" for the add_systems call
       const addSysOpen = content.indexOf('(', m.index);
       if (addSysOpen < 0) continue;
       let addSysDepth = 0;
@@ -1157,6 +1213,8 @@ function bevyStateEdges(ctx: ResolutionContext): Edge[] {
 const WELL_KNOWN_SCHEDULES = new Set([
   'Update', 'FixedUpdate', 'PreUpdate', 'PostUpdate',
   'Startup', 'PostStartup', 'First', 'Last',
+  'PreStartup', 'FixedPreUpdate', 'FixedPostUpdate',
+  'FixedFirst', 'FixedLast', 'RunOnce',
 ]);
 
 /** Extract a bracket-delimited block starting at position `open` in `src`. */
@@ -1264,6 +1322,7 @@ function parseAddSystems(
     let scheduleName: string | null = null;
     const onEnterMatch = /^OnEnter\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
     const onExitMatch = /^OnExit\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
+    const onTransitionMatch = /^OnTransition\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>$/u.exec(scheduleArg);
 
     if (onEnterMatch || onExitMatch) {
       const stateName = (onEnterMatch ?? onExitMatch)![1]!.replace(/\s+/g, '');
@@ -1315,6 +1374,72 @@ function parseAddSystems(
             line,
             provenance: 'heuristic',
             metadata: { synthesizedBy: 'bevy-dsl', plugin: pluginNode.name },
+          });
+        }
+      }
+    } else if (onTransitionMatch) {
+      const fromStateFull = onTransitionMatch[1]!.replace(/\s+/g, '');
+      const toStateFull = onTransitionMatch[2]!.replace(/\s+/g, '');
+      const fromVariant = fromStateFull.split('::').pop() ?? fromStateFull;
+      const toVariant = toStateFull.split('::').pop() ?? toStateFull;
+
+      // Resolve both state variant nodes
+      const fromStateNodes = ctx.getNodesByName(fromVariant).filter(n =>
+        n.kind === 'enum_member' && (n.qualifiedName === fromStateFull || n.qualifiedName.endsWith('::' + fromVariant)),
+      );
+      const toStateNodes = ctx.getNodesByName(toVariant).filter(n =>
+        n.kind === 'enum_member' && (n.qualifiedName === toStateFull || n.qualifiedName.endsWith('::' + toVariant)),
+      );
+      const effectiveFromNodes = fromStateNodes.length > 0 ? fromStateNodes : ctx.getNodesByName(fromVariant).filter(n => n.kind === 'enum_member');
+      const effectiveToNodes = toStateNodes.length > 0 ? toStateNodes : ctx.getNodesByName(toVariant).filter(n => n.kind === 'enum_member');
+
+      const handlerNames = parseHandlerNames(handlerArg);
+      for (const hName of handlerNames) {
+        const handlerNode = resolveNode(hName, file, ctx);
+        if (!handlerNode) continue;
+
+        // registers_system edge: plugin → handler
+        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleArg}`;
+        if (!seen.has(rsKey)) {
+          seen.add(rsKey);
+          const rsLine = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+          edges.push({
+            source: pluginNode.id,
+            target: handlerNode.id,
+            kind: 'registers_system',
+            line: rsLine,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'bevy-dsl', schedule: scheduleArg.replace(/\s+/g, '') },
+          });
+        }
+
+        // on_transition edges: handler → from_state_variant + handler → to_state_variant
+        for (const sn of effectiveFromNodes) {
+          const key = `${handlerNode.id}>${sn.id}>on_transition>from`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+          edges.push({
+            source: handlerNode.id,
+            target: sn.id,
+            kind: 'on_transition',
+            line,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'bevy-dsl', plugin: pluginNode.name, transitionFrom: fromStateFull, transitionTo: toStateFull },
+          });
+        }
+        for (const sn of effectiveToNodes) {
+          const key = `${handlerNode.id}>${sn.id}>on_transition>to`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+          edges.push({
+            source: handlerNode.id,
+            target: sn.id,
+            kind: 'on_transition',
+            line,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'bevy-dsl', plugin: pluginNode.name, transitionFrom: fromStateFull, transitionTo: toStateFull },
           });
         }
       }

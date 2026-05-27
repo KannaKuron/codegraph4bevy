@@ -790,8 +790,8 @@ export class CodeGraph {
   /**
    * Get outgoing edges from a node
    */
-  getOutgoingEdges(nodeId: string): Edge[] {
-    return this.queries.getOutgoingEdges(nodeId);
+  getOutgoingEdges(nodeId: string, kinds?: EdgeKind[]): Edge[] {
+    return this.queries.getOutgoingEdges(nodeId, kinds);
   }
 
   /**
@@ -977,6 +977,33 @@ export class CodeGraph {
   }
 
   /**
+   * Extract the base type name from a Rust parameter signature.
+   * Handles: "&mut Commands" → "Commands", "&mut ActionSpawnerCommands<Foo>" → "ActionSpawnerCommands",
+   * "Option<&mut Commands>" → "Commands", "Commands" → "Commands".
+   */
+  private extractBaseTypeFromSignature(sig: string): string | undefined {
+    let s = sig.trim();
+    // Strip leading reference + mut: &mut, &
+    s = s.replace(/^&(?:mut\s+)?/, '');
+    // Unwrap Option<...>
+    while (s.startsWith('Option<') && s.endsWith('>')) {
+      s = s.slice(7, -1).trim();
+      s = s.replace(/^&(?:mut\s+)?/, '');
+    }
+    // Strip trailing generic args: ActionSpawnerCommands<Foo, Bar> → ActionSpawnerCommands
+    const angleIdx = s.indexOf('<');
+    if (angleIdx > 0) {
+      s = s.slice(0, angleIdx);
+    }
+    s = s.trim();
+    // Only return if it looks like a type name (starts with uppercase or is a known pattern)
+    if (s && /^[A-Z\p{Lu}]/u.test(s)) {
+      return s;
+    }
+    return undefined;
+  }
+
+  /**
    * Resolve the declared type name for a variable by following type_of edges.
    * Three-tier resolution:
    *
@@ -992,16 +1019,62 @@ export class CodeGraph {
    *         Covers: `with_children` → `ChildBuilder` (safety net when crate index unavailable).
    */
   private resolveReceiverType(fromNodeId: string, varName: string, methodName?: string): string | undefined {
-    // ── Tier 1: Recursive parameter search with type_of edges ─────
+    // ── Tier 1: Recursive parameter search with type_of / references edges ─────
     const descendants = this.traverser.getDescendantsRecursive(fromNodeId);
     for (const child of descendants) {
       if (child.kind === 'parameter' && child.name === varName) {
-        const typeEdges = this.queries.getOutgoingEdges(child.id, ['type_of']);
+        // Parameter types may be stored as type_of (generic/turbofish context)
+        // or references (direct type annotations). Check both.
+        let typeEdges = this.queries.getOutgoingEdges(child.id, ['type_of']);
+        if (typeEdges.length === 0) {
+          typeEdges = this.queries.getOutgoingEdges(child.id, ['references']);
+        }
         if (typeEdges.length > 0) {
           const typeNode = this.queries.getNodeById(typeEdges[0]!.target);
           if (typeNode) return typeNode.name;
         }
-        // Parameter found but no type_of edge → continue searching other descendants
+        // No resolved type edge (external type like ActionSpawnerCommands).
+        // Parse type name from the parameter's stored signature.
+        const sig = child.signature;
+        if (sig) {
+          const extractedType = this.extractBaseTypeFromSignature(sig);
+          if (extractedType) return extractedType;
+          // Tier 1.5: Closure parameter type inference from external_symbols.
+          // When a closure parameter has no type annotation, its signature holds the
+          // method name (stored by extractVariables in rust.ts). Look up the method
+          // to find which types have it, then extract the inner param type from
+          // the method's signature (e.g. impl FnOnce(&mut ChildBuilder) → ChildBuilder).
+          if (sig.length > 0 && !/[<: ]/u.test(sig)) {
+            const types = this.queries.findTypesByMethod(sig);
+            let bestName: string | undefined;
+            for (const t of types) {
+              if (t.paramTypes) {
+                try {
+                  const paramTypes: string[] = JSON.parse(t.paramTypes);
+                  for (const pt of paramTypes) {
+                    let p = pt.trim();
+                    if (/^&?(?:mut\s+)?self$/i.test(p)) continue;
+                    p = p.replace(/^impl\s+/, '');
+                    const fnMatch = p.match(/^(FnOnce|FnMut|Fn)\s*\(\s*(.+)\s*\)$/);
+                    if (fnMatch) {
+                      const inner = fnMatch[2]!.split(',')[0]!.trim();
+                      const innerType = this.extractBaseTypeFromSignature(inner);
+                      if (innerType) return innerType;
+                      continue;
+                    }
+                    const directType = this.extractBaseTypeFromSignature(p);
+                    if (directType) return directType;
+                  }
+                } catch (e) {
+                  logWarn(`[resolveReceiverType] Failed to parse param_types for type "${t.symbolName}" with method "${sig}": ${(e as Error).message}`);
+                }
+              }
+              // Remember the first type name as fallback, but keep checking others
+              if (!bestName) bestName = t.symbolName;
+            }
+            if (bestName) return bestName;
+          }
+        }
         continue;
       }
     }
@@ -1018,34 +1091,40 @@ export class CodeGraph {
       }
     }
 
-    // ── Tier 2: External symbol lookup for closure parameters ────
+    // ── Tier 2: Generalized external symbol lookup by method name ────
     if (methodName) {
-      // For closure parameters without type annotations, look up the method
-      // in external_symbols to infer the receiver type.
-      // Common Bevy types that have methods called in closure context:
-      const candidateTypes = ['Commands', 'ChildBuilder', 'EntityCommands', 'Query', 'Res', 'ResMut', 'World'];
-      for (const typeName of candidateTypes) {
-        const extSig = this.queries.getExternalMethodSignature(typeName, methodName);
-        if (extSig) return typeName;
-      }
-
-      // Generic external symbol search: find any type with this method
-      // Future: add a reverse index for efficient method→type lookup
+      const types = this.queries.findTypesByMethod(methodName);
+      if (types.length > 0) return types[0]!.symbolName;
     }
 
     // ── Tier 3: Hardcoded fallback for well-known Bevy patterns ──
+    // (safety net when external_symbols is empty — CI, no Cargo.lock, etc.)
     if (methodName) {
-      // with_children is always on ChildBuilder
       if (methodName === 'with_children' || methodName === 'spawn_children') {
         return 'ChildBuilder';
       }
-      // spawn, insert, remove, despawn are on EntityCommands (which Deref to Commands)
+      if (methodName === 'with_related_entities') {
+        return 'EntityCommands';
+      }
       if (methodName === 'spawn' || methodName === 'insert' || methodName === 'remove' || methodName === 'despawn') {
         return 'EntityCommands';
       }
-      // Single, Query, etc. are Query/Res method wrappers
+      if (methodName === 'entity' || methodName === 'commands' || methodName === 'id'
+        || methodName === 'entry' || methodName === 'with_child'
+        || methodName === 'spawn_empty' || methodName === 'spawn_batch') {
+        return 'EntityCommands';
+      }
       if (methodName === 'single' || methodName === 'get' || methodName === 'iter') {
         return 'Query';
+      }
+      if (methodName === 'iter_mut' || methodName === 'get_single' || methodName === 'query') {
+        return 'Query';
+      }
+      if (methodName === 'send' || methodName === 'send_batch' || methodName === 'trigger') {
+        return 'EventWriter';
+      }
+      if (methodName === 'set') {
+        return 'NextState';
       }
     }
 
