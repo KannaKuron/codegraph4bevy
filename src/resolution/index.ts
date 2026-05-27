@@ -24,11 +24,12 @@ const CALLABLE_NODE_KINDS = new Set<NodeKind>([
   'function', 'method', 'class', 'struct', 'trait', 'interface',
 ]);
 import { matchReference } from './name-matcher';
-import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { RUST_STD_MACROS } from './frameworks/rust';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
+import { loadGoModule, type GoModule } from './go-module';
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
@@ -138,6 +139,49 @@ const PASCAL_BUILT_INS = new Set([
   'IInterface', 'IUnknown',
 ]);
 
+const C_BUILT_INS = new Set([
+  // Standard C library functions
+  'printf', 'fprintf', 'sprintf', 'snprintf', 'scanf', 'fscanf', 'sscanf',
+  'malloc', 'calloc', 'realloc', 'free',
+  'memcpy', 'memmove', 'memset', 'memcmp', 'memchr',
+  'strlen', 'strcpy', 'strncpy', 'strcat', 'strncat', 'strcmp', 'strncmp',
+  'strstr', 'strchr', 'strrchr', 'strtok', 'strdup',
+  'fopen', 'fclose', 'fread', 'fwrite', 'fgets', 'fputs', 'fputc', 'fgetc',
+  'feof', 'ferror', 'fflush', 'fseek', 'ftell', 'rewind',
+  'exit', 'abort', 'atexit', 'atoi', 'atol', 'atof', 'strtol', 'strtoul', 'strtod',
+  'qsort', 'bsearch',
+  'abs', 'labs', 'rand', 'srand',
+  'sin', 'cos', 'tan', 'sqrt', 'pow', 'log', 'log10', 'exp', 'ceil', 'floor', 'fabs',
+  'time', 'clock', 'difftime', 'mktime', 'localtime', 'gmtime', 'strftime', 'asctime',
+  'assert', 'errno',
+  'perror', 'remove', 'rename', 'tmpfile', 'tmpnam',
+  'getenv', 'system',
+  'signal', 'raise',
+  'setjmp', 'longjmp',
+  'va_start', 'va_end', 'va_arg', 'va_copy',
+  'NULL', 'EOF', 'BUFSIZ', 'FILENAME_MAX', 'RAND_MAX', 'EXIT_SUCCESS', 'EXIT_FAILURE',
+  'size_t', 'ptrdiff_t', 'wchar_t', 'intptr_t', 'uintptr_t',
+  'int8_t', 'int16_t', 'int32_t', 'int64_t',
+  'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+  'FILE',
+  // POSIX additions commonly seen
+  'stat', 'lstat', 'fstat', 'open', 'close', 'read', 'write', 'pipe',
+  'fork', 'exec', 'waitpid', 'getpid', 'getppid', 'kill', 'sleep', 'usleep',
+  'pthread_create', 'pthread_join', 'pthread_mutex_lock', 'pthread_mutex_unlock',
+  'dlopen', 'dlsym', 'dlclose',
+]);
+
+const CPP_BUILT_INS = new Set([
+  // iostream objects (often used without std:: prefix via using)
+  'cout', 'cin', 'cerr', 'clog', 'endl', 'flush', 'ws',
+  'std', // the namespace itself when used as std::something
+  // Common C++ keywords that leak as references
+  'nullptr', 'true', 'false', 'this', 'sizeof', 'alignof', 'typeid',
+  'static_cast', 'dynamic_cast', 'reinterpret_cast', 'const_cast',
+  'make_unique', 'make_shared', 'make_pair',
+  'move', 'forward', 'swap',
+]);
+
 /**
  * Reference Resolver
  *
@@ -165,6 +209,8 @@ export class ReferenceResolver {
   // `null` = computed and absent. Treated as immutable for the
   // resolver's lifetime; callers re-create the resolver if config changes.
   private projectAliases: AliasMap | null | undefined = undefined;
+  // go.mod module path. Same lazy/immutable convention as projectAliases.
+  private goModule: GoModule | null | undefined = undefined;
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -378,6 +424,13 @@ export class ReferenceResolver {
         return this.projectAliases;
       },
 
+      getGoModule: () => {
+        if (this.goModule === undefined) {
+          this.goModule = loadGoModule(this.projectRoot);
+        }
+        return this.goModule;
+      },
+
       getReExports: (filePath: string, language) => {
         const cached = this.reExportCache.get(filePath);
         if (cached) return cached;
@@ -389,6 +442,10 @@ export class ReferenceResolver {
         const reExports = extractReExports(content, language);
         this.reExportCache.set(filePath, reExports);
         return reExports;
+      },
+
+      getCppIncludeDirs: () => {
+        return loadCppIncludeDirs(this.projectRoot);
       },
     };
   }
@@ -479,6 +536,14 @@ export class ReferenceResolver {
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
       if (this.knownNames.has(capitalized)) return true;
+      // JVM FQN: `com.example.foo.Bar` — the only useful segment is the
+      // last one (`Bar`); the earlier check finds `example.foo.Bar` which
+      // never matches a node name.
+      const lastDot = name.lastIndexOf('.');
+      if (lastDot > dotIdx) {
+        const tail = name.substring(lastDot + 1);
+        if (tail && this.knownNames.has(tail)) return true;
+      }
     }
     const colonIdx = name.indexOf('::');
     if (colonIdx > 0) {
@@ -541,6 +606,12 @@ export class ReferenceResolver {
     ) {
       return null;
     }
+
+    // JVM FQN imports skip framework/name-matcher: `import com.example.Bar`
+    // resolves directly through the qualifiedName index, which is unambiguous
+    // even when several `Bar` classes exist in different packages.
+    const jvmImport = resolveJvmImport(ref, this.context);
+    if (jvmImport) return jvmImport;
 
     const candidates: ResolvedRef[] = [];
 
@@ -866,6 +937,24 @@ export class ReferenceResolver {
     // Rust standard library macros — only suppress if no project symbol has this name
     if (ref.language === 'rust' && RUST_STD_MACROS.has(name) && !this.knownNames?.has(name)) {
       return true;
+    }
+
+    // C/C++ standard library symbols (printf, malloc, std::vector, etc.).
+    // Names that collide with user-defined symbols are NOT filtered —
+    // C and C++ projects routinely shadow stdlib names (custom allocators
+    // define `malloc`/`free`, stream wrappers define `read`/`write`/`open`,
+    // containers define `move`/`swap`, logging libs wrap `printf`). Killing
+    // those resolutions makes the graph wrong, not cleaner. We only filter
+    // when there's no user node with this name — then name-matching would
+    // produce zero edges anyway and the filter just short-circuits work.
+    if (ref.language === 'c' || ref.language === 'cpp') {
+      // C++ std:: namespace prefix — safe to filter unconditionally,
+      // since `std::foo` is never a user-defined qualified name in
+      // tree-sitter output.
+      if (name.startsWith('std::')) return true;
+      if (C_BUILT_INS.has(name) || CPP_BUILT_INS.has(name)) {
+        return !this.hasAnyPossibleMatch(name);
+      }
     }
 
     return false;

@@ -25,6 +25,22 @@ import type { Edge, Node } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 
+// =============================================================================
+// Synthesizer Registry — fork extensions register here
+// =============================================================================
+
+type SynthesizerFn = (queries: QueryBuilder, ctx: ResolutionContext) => Edge[];
+
+const synthesizerRegistry: SynthesizerFn[] = [];
+
+/**
+ * Register a custom synthesizer function. Fork extensions call this to
+ * add domain-specific edge synthesis without modifying shared code.
+ */
+export function registerSynthesizer(fn: SynthesizerFn): void {
+  synthesizerRegistry.push(fn);
+}
+
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
 const MAX_CALLBACKS_PER_CHANNEL = 40;
@@ -526,976 +542,157 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
  * Never throws into indexing — callers wrap in try/catch.
  */
 
-// Bevy ECS dataflow: insert_resource(T) → resource_exists<T> signals.
-// When fn A calls commands.insert_resource(X) and fn B is registered with
-// .run_if(resource_exists::<X>()), synthesize a calls edge A→B so trace
-// can follow the dataflow through the ECS command queue.
-// Group 1 = turbofish type (commands.insert_resource::<Type>(...)),
-// group 2 = constructor arg (base type, stops before ::Variant).
-// Uses Unicode-aware [\p{L}\p{N}_] so CJK type names (e.g. 设置界面_确认保存_触发信号_资源) match.
-const INSERT_RESOURCE_RE = /[\p{L}\p{N}_]+\s*\.\s*insert_resource\s*(?:::\s*<([\p{L}\p{N}_<>,: >]+)>\s*)?\(\s*([\p{L}\p{N}_]+)(?:::[\p{L}\p{N}_]+(?:\([^)]*\))?)*\s*[;{)]/gu;
-const RESOURCE_EXISTS_RE = /run_if\s*\(\s*resource_exists\s*::\s*<\s*([\p{L}\p{N}_<>,: >]+)\s*>\s*\)/gu;
+const RN_OBJC_SEND_RE = /\bsendEventWithName\s*:\s*@"([^"]+)"/g;
+// Swift's `sendEvent(withName: "X", body: ...)` shape — same RCTEventEmitter
+// method, different call syntax. Both Objective-C and Swift subclass
+// RCTEventEmitter so this catches the Swift-side equivalent emission sites
+// (e.g. RNFusedLocation.swift's `sendEvent(withName: "geolocationDidChange",
+// body: locationData)`).
+const RN_SWIFT_SEND_RE = /\bsendEvent\s*\(\s*withName\s*:\s*"([^"]+)"/g;
+// JVM-side emitter calls: `emitter.emit("X", body)`. Matches both Java
+// and Kotlin syntax because the call form is identical. Restricted to
+// JVM source files in the consumer so we don't re-process JS emits
+// (which `eventEmitterEdges` already handles).
+const RN_JVM_EMIT_RE = /\.emit\s*\(\s*"([^"]+)"\s*,/g;
 
-const NEXT_STATE_PENDING_RE = /NextState\s*::\s*Pending\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
-const NEXT_STATE_SET_RE = /[\p{L}\p{N}_]+\s*\.\s*set\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
-const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
-// ComputedStates: extract impl blocks via brace-depth (regex [^}]*? breaks on
-// nested fn bodies). Keyed by short name (last ::-segment) so that
-// crate::IntroState matches IntroState::Done via startsWith('IntroState::').
-const IMPL_HEADER_RE = /impl\s+ComputedStates\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)(?:\s+where\s+[^{]+)?\s*\{/gu;
-const ADD_SYSTEMS_ONENTEREXIT_RE = /\.add_systems\s*\(\s*(OnEnter|OnExit)\s*\(/g;
-// OnTransition uses turbofish: OnTransition::<FromState, ToState>
-const ADD_SYSTEMS_ONTRANSITION_RE = /\.add_systems\s*\(\s*OnTransition\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
-
-// SubStates: #[source(ParentType = ParentType::Variant)] pub enum Name {
-const SUBSTATES_SOURCE_RE = /#\[\s*source\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*=\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?enum\s+([\p{L}\p{N}_]+)\s*\{/gu;
-const DEFAULT_VARIANT_RE = /#\[\s*default\s*\]\s*([\p{L}\p{N}_]+)/gu;
-
-/** Angle-bracket-aware comma splitter for tuple SourceTypes. */
-function splitTypeList(spec: string): string[] {
-  const results: string[] = [];
-  let depth = 0;
-  let start = 0;
-  for (let i = 0; i < spec.length; i++) {
-    const ch = spec[i]!;
-    if (ch === '<') depth++;
-    else if (ch === '>') depth = Math.max(0, depth - 1);
-    else if (ch === ',' && depth === 0) {
-      const part = spec.slice(start, i).trim();
-      if (part) results.push(part);
-      start = i + 1;
-    }
-  }
-  const last = spec.slice(start).trim();
-  if (last) results.push(last);
-  return results;
-}
-
-/** Extract ComputedStates impl→SourceStates mapping from stripped Rust source. */
-function extractComputedStatesSources(content: string): Map<string, string[]> {
-  const result = new Map<string, string[]>();
-  IMPL_HEADER_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = IMPL_HEADER_RE.exec(content))) {
-    const computedNameRaw = m[1]!.replace(/\s+/g, '');
-    const computedParts = computedNameRaw.split('::').filter(p => p.length > 0);
-    const computedName = computedParts[computedParts.length - 1] ?? computedNameRaw;
-    // Extract body by counting brace depth (content is already stripped of strings/comments)
-    const bodyStart = m.index + m[0].length;
-    let depth = 1;
-    let i = bodyStart;
-    while (i < content.length && depth > 0) {
-      if (content[i] === '{') depth++;
-      else if (content[i] === '}') depth--;
-      i++;
-    }
-    IMPL_HEADER_RE.lastIndex = i;
-    const body = content.slice(bodyStart, i - 1);
-    const sourceMatch = body.match(/type\s+SourceStates\s*=\s*([^;]+);/);
-    if (!sourceMatch) continue;
-    const sourceSpec = sourceMatch[1]!.trim();
-    const sourceTypes = sourceSpec.startsWith('(')
-      ? splitTypeList(sourceSpec.slice(1, -1))
-      : [sourceSpec];
-    for (const src of sourceTypes) {
-      const srcRaw = src.replace(/\s+/g, '');
-      const srcParts = srcRaw.split('::').filter(p => p.length > 0);
-      const srcShort = srcParts[srcParts.length - 1] ?? srcRaw;
-      let arr = result.get(srcShort);
-      if (!arr) { arr = []; result.set(srcShort, arr); }
-      if (!arr.includes(computedName)) arr.push(computedName);
-    }
-  }
-  return result;
-}
-
-interface SubStatesMapping {
-  subStateName: string;
-  parentVariantFull: string;
-  defaultVariant: string;
-}
-
-/** Extract SubStates #[source(...)] + #[default] variant from stripped Rust source. */
-function extractSubStatesSources(content: string): SubStatesMapping[] {
-  const results: SubStatesMapping[] = [];
-  SUBSTATES_SOURCE_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = SUBSTATES_SOURCE_RE.exec(content))) {
-    const parentTypeRaw = m[1]!.replace(/\s+/g, '');
-    const parentVariantRaw = m[2]!.replace(/\s+/g, '');
-    const subStateName = m[3]!;
-    const parentTypeShort = parentTypeRaw.split('::').filter(p => p.length > 0).pop() ?? parentTypeRaw;
-    const parentVariantParts = parentVariantRaw.split('::').filter(p => p.length > 0);
-    // Determine the parent variant: use last segment, but if it matches the type name,
-    // use the segment before it (e.g. 游戏流程_状态::开场 → 开场, but Parent::V → V)
-    let qualifyingVariant: string;
-    if (parentVariantParts.length >= 2) {
-      qualifyingVariant = parentVariantParts[parentVariantParts.length - 1]!;
-    } else {
-      qualifyingVariant = parentVariantParts[0]!;
-    }
-    const parentVariantFull = parentTypeShort + '::' + qualifyingVariant;
-
-    // Extract enum body by brace-depth counting
-    const bodyStart = m.index + m[0].length;
-    let depth = 1;
-    let i = bodyStart;
-    while (i < content.length && depth > 0) {
-      if (content[i] === '{') depth++;
-      else if (content[i] === '}') depth--;
-      i++;
-    }
-    SUBSTATES_SOURCE_RE.lastIndex = i;
-    const body = content.slice(bodyStart, i - 1);
-
-    // Find #[default] variant in the body
-    DEFAULT_VARIANT_RE.lastIndex = 0;
-    let dm: RegExpExecArray | null;
-    while ((dm = DEFAULT_VARIANT_RE.exec(body))) {
-      results.push({
-        subStateName,
-        parentVariantFull,
-        defaultVariant: dm[1]!,
-      });
-      break; // Only need the first #[default]
-    }
-  }
-  return results;
-}
-
-// Strip Rust line (//) and block (/* */) comments, strings, char literals,
-// and raw/byte strings to avoid false matches in dead text.
-function stripRustComments(src: string): string {
-  let result = '';
-  let i = 0;
-  while (i < src.length) {
-    if (src[i] === '/' && src[i + 1] === '/') {
-      // Line comment — skip to end of line
-      const nl = src.indexOf('\n', i);
-      if (nl < 0) break;
-      result += '\n'.repeat(src.substring(i, nl).split('\n').length - 1) + '\n';
-      i = nl + 1;
-    } else if (src[i] === '/' && src[i + 1] === '*') {
-      // Nested block comment — track /* */ depth
-      let depth = 1;
-      let j = i + 2;
-      while (j < src.length - 1 && depth > 0) {
-        if (src[j] === '/' && src[j + 1] === '*') { depth++; j += 2; }
-        else if (src[j] === '*' && src[j + 1] === '/') { depth--; j += 2; }
-        else { result += src[j] === '\n' ? '\n' : ' '; j++; }
-      }
-      // Unclosed block comment: preserve rest as spaces (keep newlines for line numbers)
-      if (depth > 0) {
-        while (j < src.length) { result += src[j] === '\n' ? '\n' : ' '; j++; }
-      }
-      result += '  '; // closing */
-      i = j;
-    } else if (src[i] === "'") {
-      // Char literal: 'a', '\n', '\u{7b}' — replace with spaces to prevent
-      // '{'/'}' inside char literals from corrupting brace-depth counting.
-      result += ' ';
-      i++;
-      if (i < src.length && src[i] === '\\') {
-        result += ' '; i++;
-        if (i < src.length && src[i] === 'x') {
-          result += ' '; i++;
-          while (i < src.length && src[i] !== "'") { result += ' '; i++; }
-        } else if (i < src.length && src[i] === 'u' && i + 1 < src.length && src[i + 1] === '{') {
-          while (i < src.length && src[i] !== "'") { result += ' '; i++; }
-        } else {
-          if (i < src.length) { result += ' '; i++; }
-        }
-      } else {
-        if (i < src.length) { result += ' '; i++; }
-      }
-      if (i < src.length && src[i] === "'") { result += ' '; i++; }
-    } else if (src[i] === 'b' && i + 1 < src.length && src[i + 1] === '"') {
-      // Regular byte string b"..." — must be checked before the raw string
-      // branch, otherwise b"..." falls into the raw-string path which doesn't
-      // handle escape sequences (e.g. b"he\"llo" would stop at the wrong ").
-      let j = i + 2;
-      result += '  ';
-      while (j < src.length && src[j] !== '"') {
-        if (src[j] === '\\' && j + 1 < src.length) { result += ' '; j += 2; continue; }
-        if (src[j] === '\n') result += '\n'; else result += ' ';
-        j++;
-      }
-      if (j < src.length) { result += ' '; j++; }
-      i = j;
-    } else if ((src[i] === 'r' || src[i] === 'b') && i + 1 < src.length) {
-      // Raw / raw-byte string: r"...", r#"..."#, br"...", br#"..."#
-      let j = i + 1;
-      if (src[j] === 'r') j++;
-      let hashes = 0;
-      while (j < src.length && src[j] === '#') { hashes++; j++; }
-      if (j < src.length && src[j] === '"') {
-        j++;
-        const close = '"' + '#'.repeat(hashes);
-        const end = src.indexOf(close, j);
-        if (end < 0) {
-          // Unclosed raw string — replace remainder with spaces (preserve newlines)
-          while (i < src.length) {
-            result += src[i] === '\n' ? '\n' : ' ';
-            i++;
-          }
-          break;
-        }
-        for (let k = i; k < end + close.length; k++) {
-          result += src[k] === '\n' ? '\n' : ' ';
-        }
-        i = end + close.length;
-      } else {
-        result += src[i]; i++;
-      }
-    } else if (src[i] === '"') {
-      // Regular string literal — skip contents (preserve newlines)
-      result += ' ';
-      i++;
-      while (i < src.length && src[i] !== '"') {
-        if (src[i] === '\\' && i + 1 < src.length) {
-          if (src[i + 1] === '\n') { result += '\n'; i += 2; continue; }
-          result += ' '; i += 2; continue;
-        }
-        if (src[i] === '\n') result += '\n'; else result += ' ';
-        i++;
-      }
-      if (i < src.length) { result += ' '; i++; }
-    } else {
-      result += src[i];
-      i++;
-    }
-  }
-  return result;
-}
-
-function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
-  const edges: Edge[] = [];
-  const resources = new Map<string, { inserters: Set<string>; checkers: Set<string> }>();
-  const fnLines = new Map<string, number>();
-
-  function ensure(r: string) {
-    if (!resources.has(r)) resources.set(r, { inserters: new Set(), checkers: new Set() });
-    return resources.get(r)!;
-  }
+function rnEventEdges(ctx: ResolutionContext): Edge[] {
+  // Native dispatchers (source = the native method whose body sends the
+  // event) and JS handlers (target = the function/method registered as
+  // the listener) keyed by event name.
+  const nativeDispatchersByEvent = new Map<string, Set<string>>();
+  const jsHandlersByEvent = new Map<string, Map<string, string>>();
 
   for (const file of ctx.getAllFiles()) {
-    if (!file.endsWith('.rs')) continue;
-    const raw = ctx.readFile(file);
-    if (!raw) continue;
-    const content = stripRustComments(raw);
+    const content = ctx.readFile(file);
+    if (!content) continue;
 
-    const fileNodes = ctx.getNodesInFile(file);
-    const fns = fileNodes.filter((n: { kind: string }) => n.kind === 'function' || n.kind === 'method');
+    const nodesInFile = ctx.getNodesInFile(file);
+    const lineOf = (idx: number) => content.slice(0, idx).split('\n').length;
+    const addDispatcher = (event: string, line: number) => {
+      const disp = enclosingFn(nodesInFile, line);
+      if (!disp) return;
+      const set = nativeDispatchersByEvent.get(event) ?? new Set<string>();
+      set.add(disp.id);
+      nativeDispatchersByEvent.set(event, set);
+    };
 
-    INSERT_RESOURCE_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = INSERT_RESOURCE_RE.exec(content))) {
-      // Prefer turbofish type (group 1), fall back to constructor arg (group 2)
-      const typeName = (m[1] || m[2])!.trim();
-      const line = content.substring(0, m.index).split('\n').length;
-      for (const fn of fns) {
-        if (fn.startLine <= line && fn.endLine >= line) {
-          ensure(typeName).inserters.add(fn.id);
-          fnLines.set(fn.id, line);
-          break;
-        }
+    // ObjC side: `sendEventWithName:@"X"` only fires inside `.m`/`.mm`
+    // files (RCTEventEmitter subclasses).
+    if (file.endsWith('.m') || file.endsWith('.mm')) {
+      RN_OBJC_SEND_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = RN_OBJC_SEND_RE.exec(content))) {
+        if (m[1]) addDispatcher(m[1], lineOf(m.index));
       }
     }
 
-    RESOURCE_EXISTS_RE.lastIndex = 0;
-    while ((m = RESOURCE_EXISTS_RE.exec(content))) {
-      const typeName = m[1]!.trim();
-      const line = content.substring(0, m.index).split('\n').length;
-      for (const fn of fns) {
-        if (fn.startLine <= line && fn.endLine >= line) {
-          ensure(typeName).checkers.add(fn.id);
-          fnLines.set(fn.id, line);
-          break;
+    // Swift side: same RCTEventEmitter method, parens/named-args syntax.
+    if (file.endsWith('.swift')) {
+      RN_SWIFT_SEND_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = RN_SWIFT_SEND_RE.exec(content))) {
+        if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
+    }
+
+    // JVM side: `.emit("X", …)` in Java/Kotlin. (We pattern-match
+    // anywhere in the file; the JS in-language path uses a separate
+    // emitter object pattern and is already handled by eventEmitterEdges.)
+    if (file.endsWith('.java') || file.endsWith('.kt')) {
+      RN_JVM_EMIT_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = RN_JVM_EMIT_RE.exec(content))) {
+        if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
+    }
+
+    // JS subscribers (.addListener("X", handler)). Restrict to JS-family
+    // files so a native file's `addListener:` (the ObjC method) doesn't
+    // get mistaken for a JS subscription — they're entirely different
+    // things despite sharing a name.
+    if (
+      file.endsWith('.js') ||
+      file.endsWith('.jsx') ||
+      file.endsWith('.ts') ||
+      file.endsWith('.tsx') ||
+      file.endsWith('.mjs') ||
+      file.endsWith('.cjs')
+    ) {
+      // Match BOTH the named-handler form (`.addListener('x', fn)`) and
+      // an unnamed-handler form (`.addListener('x', listener)` where
+      // `listener` is a parameter — common in RN wrapper APIs like
+      // RNFirebase's `messaging().onMessageReceived(listener)`). For the
+      // unnamed case we attribute the subscription to the ENCLOSING JS
+      // function (the abstraction layer), giving a reachability-correct
+      // hop even when the actual user-side handler lives one call up.
+      const ADDLISTENER_ANY = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*([A-Za-z_][\w.]*)/g;
+      ADDLISTENER_ANY.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = ADDLISTENER_ANY.exec(content))) {
+        const event = m[1];
+        const arg = m[2];
+        if (!event || !arg) continue;
+        const bareName = arg.includes('.') ? arg.slice(arg.lastIndexOf('.') + 1) : arg;
+        // Try a named-symbol match first (matches the in-language semantic).
+        const namedHandler = ctx
+          .getNodesByName(bareName)
+          .find((n) => n.kind === 'function' || n.kind === 'method');
+        let targetId: string | null = namedHandler?.id ?? null;
+        if (!targetId) {
+          // Fall back to the enclosing function — the subscribe-wrapper
+          // pattern means the event fires THROUGH this function on its
+          // way to user code. Reachability-correct attribution.
+          const enclosing = enclosingFn(nodesInFile, lineOf(m.index));
+          targetId = enclosing?.id ?? null;
         }
+        if (!targetId) {
+          // Broader fallback for JS object-literal API shape
+          // (`const Foo = { watchX(...) { … addListener(...) … } }`):
+          // method shorthand inside an object literal isn't extracted
+          // as a method node, so enclosingFn returns null. Attribute to
+          // the smallest enclosing `constant` / `variable` node — that's
+          // the API surface a downstream caller would `import` and
+          // invoke. Reachability-correct.
+          const line = lineOf(m.index);
+          let smallest: typeof nodesInFile[number] | null = null;
+          for (const n of nodesInFile) {
+            if (n.kind !== 'constant' && n.kind !== 'variable') continue;
+            const end = n.endLine ?? n.startLine;
+            if (n.startLine <= line && end >= line) {
+              if (!smallest || n.startLine >= smallest.startLine) smallest = n;
+            }
+          }
+          targetId = smallest?.id ?? null;
+        }
+        if (!targetId) continue;
+        const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
+        map.set(targetId, `${file}:${lineOf(m.index)}`);
+        jsHandlersByEvent.set(event, map);
       }
     }
   }
 
-  for (const [, data] of resources) {
-    if (data.inserters.size === 0 || data.checkers.size === 0) continue;
-    for (const inserterId of data.inserters) {
-      for (const checkerId of data.checkers) {
-        edges.push({
-          source: inserterId,
-          target: checkerId,
-          kind: 'calls',
-          line: fnLines.get(inserterId),
-          provenance: 'heuristic',
-          metadata: { synthesizedBy: 'bevy-ecs-resource' },
-        });
-      }
-    }
-  }
-
-  return edges;
-}
-
-function bevyStateEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  const states = new Map<string, { producers: Map<string, { line: number; full: string }>; consumers: Map<string, { line: number; full: string }> }>();
-
-  function ensure(s: string) {
-    if (!states.has(s)) states.set(s, { producers: new Map(), consumers: new Map() });
-    return states.get(s)!;
-  }
-
-  // Normalize state name to last ::-segment so `GameState::Playing` and `Playing`
-  // (after `use GameState::*`) map to the same key.
-  function normalizeStateName(name: string): { full: string; variant: string } {
-    const parts = name.split('::').filter(p => p.length > 0);
-    const variant = parts[parts.length - 1] ?? name;
-    const full = parts.length >= 2
-      ? parts[parts.length - 2]! + '::' + variant
-      : variant;
-    return { full, variant };
-  }
-
-  // Cache stripped content to avoid re-reading/re-stripping.
-  const strippedByFile = new Map<string, string>();
-
-  // Pre-scan: build computedFromSource mapping from ComputedStates impls.
-  // Maps source state type name → computed state names that derive from it.
-  const computedFromSource = new Map<string, string[]>();
-  for (const file of ctx.getAllFiles()) {
-    if (!file.endsWith('.rs')) continue;
-    const raw = ctx.readFile(file);
-    if (!raw) continue;
-    const content = stripRustComments(raw);
-    strippedByFile.set(file, content);
-    for (const [src, names] of extractComputedStatesSources(content)) {
-      const arr = computedFromSource.get(src);
-      if (arr) {
-        for (const n of names) { if (!arr.includes(n)) arr.push(n); }
-      } else {
-        computedFromSource.set(src, [...names]);
-      }
-    }
-  }
-
-  // Pre-scan: extract SubStates #[source(...)] mappings.
-  const subStatesMappings: SubStatesMapping[] = [];
-  for (const [, content] of strippedByFile) {
-    subStatesMappings.push(...extractSubStatesSources(content));
-  }
-
-  // Main scan: find producers and consumers using cached stripped content.
-  for (const [file, content] of strippedByFile) {
-    const fileNodes = ctx.getNodesInFile(file);
-    const fns = fileNodes.filter((n: { kind: string }) => n.kind === 'function' || n.kind === 'method');
-
-    function findEnclosingFn(line: number): string | null {
-      for (const fn of fns) {
-        if (fn.startLine <= line && fn.endLine >= line) return fn.id;
-      }
-      return null;
-    }
-
-    // Producers: NextState::Pending(X) — typically in OnEnter or transition systems
-    NEXT_STATE_PENDING_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = NEXT_STATE_PENDING_RE.exec(content))) {
-      const { full, variant } = normalizeStateName(m[1]!.trim());
-      const line = content.substring(0, m.index).split('\n').length;
-      const fnId = findEnclosingFn(line);
-      if (fnId) {
-        const entry = ensure(variant);
-        entry.producers.set(fnId + '\0' + full, { line, full });
-      }
-    }
-
-    // Producers: .set(X) — Bevy 0.15+ ResMut<NextState<X>>.set().
-    // Guarded by NextState file-level check to avoid matching non-state .set() calls.
-    if (content.includes('NextState')) {
-      NEXT_STATE_SET_RE.lastIndex = 0;
-      while ((m = NEXT_STATE_SET_RE.exec(content))) {
-        const { full, variant } = normalizeStateName(m[1]!.trim());
-        const line = content.substring(0, m.index).split('\n').length;
-        const fnId = findEnclosingFn(line);
-        if (fnId) {
-          const entry = ensure(variant);
-          entry.producers.set(fnId + '\0' + full, { line, full });
-        }
-      }
-    }
-
-    // Consumers: in_state(X) — typically in OnEnter or condition systems
-    IN_STATE_RE.lastIndex = 0;
-    while ((m = IN_STATE_RE.exec(content))) {
-      const { full, variant } = normalizeStateName(m[1]!.trim());
-      const line = content.substring(0, m.index).split('\n').length;
-      const fnId = findEnclosingFn(line);
-      if (fnId) {
-        const entry = ensure(variant);
-        entry.consumers.set(fnId + '\0' + full, { line, full });
-      }
-    }
-  }
-
-  // Phase 2b: OnEnter/OnExit consumer detection — app.add_systems(OnEnter(X), handlers)
-  // Reuses parseHandlerNames() for robust tuple/method-chain support (CR2).
-  for (const [file, content] of strippedByFile) {
-    const fileNodes = ctx.getNodesInFile(file);
-    const fnByName = new Map<string, Node>();
-    for (const n of fileNodes) {
-      if ((n.kind === 'function' || n.kind === 'method') && n.name) {
-        if (!fnByName.has(n.name)) fnByName.set(n.name, n);
-      }
-    }
-    ADD_SYSTEMS_ONENTEREXIT_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = ADD_SYSTEMS_ONENTEREXIT_RE.exec(content))) {
-      // m.index points to start of ".add_systems(OnEnter(" or ".add_systems(OnExit("
-      const onOpen = m.index + m[0].length; // position after "OnEnter(" or "OnExit("
-      // Find matching ")" for the OnEnter/OnExit call
-      let onDepth = 0;
-      let onClose = -1;
-      for (let i = onOpen; i < content.length; i++) {
-        if (content[i] === '(') onDepth++;
-        else if (content[i] === ')') {
-          if (onDepth === 0) { onClose = i; break; }
-          onDepth--;
-        }
-      }
-      if (onClose < 0) continue;
-      const stateRaw = content.slice(onOpen, onClose).trim();
-      const { full, variant } = normalizeStateName(stateRaw);
-      // Find the comma after the OnEnter/OnExit call → start of handler args
-      let comma = -1;
-      for (let i = onClose + 1; i < content.length; i++) {
-        if (content[i] === ',') { comma = i; break; }
-        if (content[i] !== ' ' && content[i] !== '\t' && content[i] !== '\n') break;
-      }
-      if (comma < 0) continue;
-      // Find matching ")" for the add_systems call — start from the opening paren
-      const addSysOpen = content.indexOf('(', m.index);
-      if (addSysOpen < 0) continue;
-      let addSysDepth = 0;
-      let addSysClose = -1;
-      for (let i = addSysOpen; i < content.length; i++) {
-        if (content[i] === '(') addSysDepth++;
-        else if (content[i] === ')') { addSysDepth--; if (addSysDepth === 0) { addSysClose = i; break; } }
-      }
-      if (addSysClose < 0) continue;
-      const handlerArg = content.slice(comma + 1, addSysClose);
-      const handlerNames = parseHandlerNames(handlerArg);
-      const lineBase = content.substring(0, m.index).split('\n').length;
-      for (const hName of handlerNames) {
-        let handlerNode = fnByName.get(hName);
-        if (!handlerNode) {
-          const globalNodes = ctx.getNodesByName(hName);
-          handlerNode = globalNodes.length > 0 ? globalNodes[0] : undefined;
-        }
-        if (!handlerNode) continue;
-        const entry = ensure(variant);
-        entry.consumers.set(handlerNode.id + '\0' + full, { line: lineBase, full });
-      }
-    }
-  }
-
-  // Phase 2b OnTransition: app.add_systems(OnTransition::<From, To>, handlers)
-  // Detects consumers registered via OnTransition turbofish and registers them
-  // as consumers of the To (target) state.
-  for (const [file, content] of strippedByFile) {
-    const fileNodes = ctx.getNodesInFile(file);
-    const fnByName = new Map<string, Node>();
-    for (const n of fileNodes) {
-      if ((n.kind === 'function' || n.kind === 'method') && n.name) {
-        if (!fnByName.has(n.name)) fnByName.set(n.name, n);
-      }
-    }
-    ADD_SYSTEMS_ONTRANSITION_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = ADD_SYSTEMS_ONTRANSITION_RE.exec(content))) {
-      const toStateFull = m[2]!.replace(/\s+/g, '');
-      const { full, variant } = normalizeStateName(toStateFull);
-      // Find the comma after the OnTransition turbofish → start of handler args
-      const angleClose = content.indexOf('>', m.index + m[0].length - 1);
-      if (angleClose < 0) continue;
-      let comma = -1;
-      for (let i = angleClose + 1; i < content.length; i++) {
-        if (content[i] === ',') { comma = i; break; }
-        if (content[i] !== ' ' && content[i] !== '\t' && content[i] !== '\n') break;
-      }
-      if (comma < 0) continue;
-      // Find matching ")" for the add_systems call
-      const addSysOpen = content.indexOf('(', m.index);
-      if (addSysOpen < 0) continue;
-      let addSysDepth = 0;
-      let addSysClose = -1;
-      for (let i = addSysOpen; i < content.length; i++) {
-        if (content[i] === '(') addSysDepth++;
-        else if (content[i] === ')') { addSysDepth--; if (addSysDepth === 0) { addSysClose = i; break; } }
-      }
-      if (addSysClose < 0) continue;
-      const handlerArg = content.slice(comma + 1, addSysClose);
-      const handlerNames = parseHandlerNames(handlerArg);
-      const lineBase = content.substring(0, m.index).split('\n').length;
-      for (const hName of handlerNames) {
-        let handlerNode = fnByName.get(hName);
-        if (!handlerNode) {
-          const globalNodes = ctx.getNodesByName(hName);
-          handlerNode = globalNodes.length > 0 ? globalNodes[0] : undefined;
-        }
-        if (!handlerNode) continue;
-        const entry = ensure(variant);
-        entry.consumers.set(handlerNode.id + '\0' + full, { line: lineBase, full });
-      }
-    }
-  }
-
-  // Phase 2c: SubStates virtual producers — when a producer sets ParentState::QualifyingVariant,
-  // register it as a virtual producer of SubState::DefaultVariant so Phase 3 connects it to
-  // SubState's OnEnter/OnExit consumers.
-  for (const mapping of subStatesMappings) {
-    const { parentVariantFull, subStateName, defaultVariant } = mapping;
-    const { full: normalizedParentFull, variant: parentVar } = normalizeStateName(parentVariantFull);
-    const parentEntry = states.get(parentVar);
-    if (!parentEntry) continue;
-    for (const [producerKey, pInfo] of parentEntry.producers) {
-      if (pInfo.full !== normalizedParentFull && pInfo.full !== parentVar) continue;
-      const virtualFull = subStateName + '::' + defaultVariant;
-      const subEntry = ensure(defaultVariant);
-      const virtualKey = producerKey.split('\0')[0]! + '\0' + virtualFull;
-      if (!subEntry.producers.has(virtualKey)) {
-        subEntry.producers.set(virtualKey, { line: pInfo.line, full: virtualFull });
-      }
-    }
-  }
-
-  // Direct (non-transitive) state edges — processed BEFORE transitive so direct
-  // edges (with exact stateName) claim dedup keys first; transitive edges fill gaps.
-  for (const [stateKey, data] of states) {
-    if (data.producers.size === 0 || data.consumers.size === 0) continue;
-    for (const [producerKey, pInfo] of data.producers) {
-      const producerId = producerKey.split('\0')[0]!;
-      for (const [consumerKey, cInfo] of data.consumers) {
-        const consumerId = consumerKey.split('\0')[0]!;
-        if (producerId === consumerId) continue;
-        // Cross-enum guard: if both sides are qualified (EnumType::Variant) and the
-        // enum type differs, skip — GameState::Playing ≠ UiState::Playing.
-        if (pInfo.full !== stateKey && cInfo.full !== stateKey && pInfo.full !== cInfo.full) continue;
-        const dedupKey = `${producerId}>${consumerId}`;
-        if (seen.has(dedupKey)) continue;
-        seen.add(dedupKey);
-        edges.push({
-          source: producerId,
-          target: consumerId,
-          kind: 'calls',
-          line: pInfo.line,
-          provenance: 'heuristic',
-          metadata: { synthesizedBy: 'bevy-ecs-state', stateName: stateKey },
-        });
-      }
-    }
-  }
-
-  // CR7: producer→state_variant (enum_member) reference edges — separate loop
-  // because variant edges must be created even when no consumers are registered
-  // (e.g. bare variant names via `use Enum::*` glob imports have no consumers).
-  for (const [stateKey, data] of states) {
-    if (data.producers.size === 0) continue;
-    for (const [producerKey, pInfo] of data.producers) {
-      const producerId = producerKey.split('\0')[0]!;
-      const variantNodes = ctx.getNodesByName(stateKey);
-      for (const vn of variantNodes) {
-        if (vn.kind !== 'enum_member') continue;
-        const refDedupKey = `${producerId}>${vn.id}:ref`;
-        if (seen.has(refDedupKey)) continue;
-        seen.add(refDedupKey);
-        edges.push({
-          source: producerId,
-          target: vn.id,
-          kind: 'references',
-          line: pInfo.line,
-          provenance: 'heuristic',
-          metadata: { synthesizedBy: 'bevy-ecs-state', stateName: stateKey },
-        });
-      }
-    }
-  }
-
-  // ComputedStates intermediate-node edges: source producer → computed state struct/enum
-  // node → consumer.  Edges pass through the computed state node so trace, callers,
-  // callees, and impact all show it as a meaningful intermediate hop — instead of
-  // bypassing it with a direct function→function transitive edge.
-  const MAX_COMPUTED_PER_SOURCE = 200;
-  const GLOBAL_COMPUTED_CAP = 600;
-  let globalComputedCount = 0;
-
-  for (const [sourceTypeName, computedNames] of computedFromSource) {
-    if (globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
-
-    // Collect all producers of the source state type
-    const sourceProducers = new Map<string, { line: number; full: string }>();
-    for (const [, data] of states) {
-      for (const [producerKey, pInfo] of data.producers) {
-        if (pInfo.full === sourceTypeName || pInfo.full.startsWith(sourceTypeName + '::')) {
-          sourceProducers.set(producerKey, pInfo);
-        }
-      }
-    }
-    if (sourceProducers.size === 0) continue;
-
-    let perSourceCount = 0;
-    for (const computedName of computedNames) {
-      if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
-
-      // Find the computed state struct/enum node
-      const computedNodes = ctx.getNodesByName(computedName);
-      const computedNode = computedNodes.find((n) => n.kind === 'struct' || n.kind === 'enum');
-      if (!computedNode) continue;
-
-      // Edge: source producer → computed state node
-      for (const [producerKey, pInfo] of sourceProducers) {
-        if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
-        const producerId = producerKey.split('\0')[0]!;
-        const dedupKey = `${producerId}>${computedNode.id}`;
-        if (seen.has(dedupKey)) continue;
-        seen.add(dedupKey);
-        edges.push({
-          source: producerId,
-          target: computedNode.id,
-          kind: 'calls',
-          line: pInfo.line,
-          provenance: 'heuristic',
-          metadata: {
-            synthesizedBy: 'bevy-ecs-state',
-            computedState: computedName,
-            transitiveVia: sourceTypeName,
-          },
-        });
-        perSourceCount++;
-        globalComputedCount++;
-      }
-
-      // Edge: computed state node → consumer
-      for (const [, data] of states) {
-        if (data.consumers.size === 0) continue;
-        for (const [consumerKey, cInfo] of data.consumers) {
-          if (cInfo.full !== computedName && !cInfo.full.startsWith(computedName + '::')) continue;
-          if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
-          const consumerId = consumerKey.split('\0')[0]!;
-          const dedupKey = `${computedNode.id}>${consumerId}`;
-          if (seen.has(dedupKey)) continue;
-          seen.add(dedupKey);
-          edges.push({
-            source: computedNode.id,
-            target: consumerId,
-            kind: 'calls',
-            line: cInfo.line,
-            provenance: 'heuristic',
-            metadata: {
-              synthesizedBy: 'bevy-ecs-state',
-              computedState: computedName,
-            },
-          });
-          perSourceCount++;
-          globalComputedCount++;
-        }
-        if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
-      }
-    }
-  }
-
-  return edges;
-}
-
-// ===========================================================================
-// Bevy DSL Semantic Edges (N12)
-// ===========================================================================
-
-const WELL_KNOWN_SCHEDULES = new Set([
-  'Update', 'FixedUpdate', 'PreUpdate', 'PostUpdate',
-  'Startup', 'PostStartup', 'First', 'Last',
-  'PreStartup', 'FixedPreUpdate', 'FixedPostUpdate',
-  'FixedFirst', 'FixedLast', 'RunOnce',
-]);
-
-/** Extract a bracket-delimited block starting at position `open` in `src`. */
-function extractBlock(src: string, open: number): string | null {
-  const openChar = src[open];
-  if (openChar !== '{' && openChar !== '(') return null;
-  const closer = openChar === '{' ? '}' : ')';
-  let depth = 1;
-  let i = open + 1;
-  while (i < src.length && depth > 0) {
-    if (src[i] === openChar) depth++;
-    else if (src[i] === closer) depth--;
-    i++;
-  }
-  return depth === 0 ? src.slice(open + 1, i - 1) : null;
-}
-
-/** Find the first node named `name` in `file`, then fall back to global search. */
-function resolveNode(name: string, file: string, ctx: ResolutionContext): Node | null {
-  const fileNodes = ctx.getNodesInFile(file);
-  const match = fileNodes.find(n => n.name === name);
-  if (match) return match;
-  const global = ctx.getNodesByName(name);
-  return global.find(n => n.kind === 'struct' || n.kind === 'class') ?? global[0] ?? null;
-}
-
-/**
- * Parse system function names from add_systems handler arguments.
- * Handles: single fn, scoped fn (a::b), tuples (a, b), and simple
- * method chains (fn.run_if(…).after(…)).
- */
-function parseHandlerNames(handlerExpr: string): string[] {
-  const names: string[] = [];
-  const trimmed = handlerExpr.trim();
-  if (!trimmed) return names;
-
-  // Tuple: (handler1, handler2, ...)
-  if (trimmed.startsWith('(')) {
-    const inner = extractBlock('(' + trimmed.slice(1), 0);
-    if (inner) {
-      const parts = splitTopLevelCommas(inner);
-      for (const p of parts) names.push(...parseHandlerNames(p));
-    }
-    return names;
-  }
-
-  // Method chain or bare identifier — take the first identifier as the fn name.
-  const firstId = /^([\p{L}\p{N}_]+(?:::\s*[\p{L}\p{N}_]+)*)/u.exec(trimmed);
-  if (firstId) names.push(firstId[1]!.replace(/\s+/g, ''));
-  return names;
-}
-
-/** Split by commas at brace-depth 0. */
-function splitTopLevelCommas(s: string): string[] {
-  const parts: string[] = [];
-  let depth = 0;
-  let start = 0;
-  for (let i = 0; i < s.length; i++) {
-    if (s[i] === '(' || s[i] === '<') depth++;
-    else if (s[i] === ')' || s[i] === '>') depth--;
-    else if (s[i] === ',' && depth === 0) {
-      parts.push(s.slice(start, i));
-      start = i + 1;
-    }
-  }
-  parts.push(s.slice(start));
-  return parts;
-}
-
-/**
- * Parse `app.add_systems(…)` calls in `buildBody` and create
- * on_enter / on_exit / runs_in edges.
- */
-function parseAddSystems(
-  buildBody: string,
-  pluginNode: Node,
-  file: string,
-  lineOffset: number,
-  ctx: ResolutionContext,
-  seen: Set<string>,
-  queries: QueryBuilder,
-): Edge[] {
-  const edges: Edge[] = [];
-  const re = /\.add_systems\s*\(/g;
-  let m: RegExpExecArray | null;
-
-  while ((m = re.exec(buildBody))) {
-    const open = m.index + m[0].length;
-    // Find the matching closing paren for add_systems(...)
-    let depth = 0;
-    let close = -1;
-    for (let i = open - 1; i < buildBody.length; i++) {
-      if (buildBody[i] === '(') depth++;
-      else if (buildBody[i] === ')') { depth--; if (depth === 0) { close = i; break; } }
-    }
-    if (close < 0) continue;
-    const argsStr = buildBody.slice(open, close);
-    const args = splitTopLevelCommas(argsStr);
-    if (args.length < 2) continue;
-
-    const scheduleArg = args[0]!.trim();
-    const handlerArg = args.slice(1).join(',');
-
-    // Determine edge kind from schedule expression
-    let scheduleName: string | null = null;
-    const onEnterMatch = /^OnEnter\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
-    const onExitMatch = /^OnExit\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
-    const onTransitionMatch = /^OnTransition\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>$/u.exec(scheduleArg);
-
-    if (onEnterMatch || onExitMatch) {
-      const stateName = (onEnterMatch ?? onExitMatch)![1]!.replace(/\s+/g, '');
-      const edgeKind: 'on_enter' | 'on_exit' = onEnterMatch ? 'on_enter' : 'on_exit';
-      // Enum variants are stored with `name` = the variant segment (e.g. "主菜单"),
-      // and `qualified_name` = the full path (e.g. "游戏流程_状态::主菜单").
-      // Search by the variant name, then verify qualified_name matches.
-      const variantName = stateName.split('::').pop() ?? stateName;
-      const allVariantNodes = ctx.getNodesByName(variantName);
-      const stateNodes = allVariantNodes.filter(n =>
-        n.kind === 'enum_member' && n.qualifiedName === stateName,
-      );
-      // Fallback: if qualified name doesn't match, accept any enum_member with the variant name
-      const effectiveStateNodes = stateNodes.length > 0
-        ? stateNodes
-        : allVariantNodes.filter(n => n.kind === 'enum_member');
-
-      // Resolve handler function names
-      const handlerNames = parseHandlerNames(handlerArg);
-      for (const hName of handlerNames) {
-        const handlerNode = resolveNode(hName, file, ctx);
-        if (!handlerNode) continue;
-
-        // registers_system edge: plugin → handler
-        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleArg}`;
-        if (!seen.has(rsKey)) {
-          seen.add(rsKey);
-          const rsLine = lineOffset + buildBody.slice(0, m.index).split('\n').length;
-          edges.push({
-            source: pluginNode.id,
-            target: handlerNode.id,
-            kind: 'registers_system',
-            line: rsLine,
-            provenance: 'heuristic',
-            metadata: { synthesizedBy: 'bevy-dsl', schedule: scheduleArg.replace(/\s+/g, '') },
-          });
-        }
-
-        // on_enter / on_exit edge: handler → state variant
-        for (const sn of effectiveStateNodes) {
-          const key = `${handlerNode.id}>${sn.id}>${edgeKind}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
-          edges.push({
-            source: handlerNode.id,
-            target: sn.id,
-            kind: edgeKind,
-            line,
-            provenance: 'heuristic',
-            metadata: { synthesizedBy: 'bevy-dsl', plugin: pluginNode.name },
-          });
-        }
-      }
-    } else if (onTransitionMatch) {
-      const fromStateFull = onTransitionMatch[1]!.replace(/\s+/g, '');
-      const toStateFull = onTransitionMatch[2]!.replace(/\s+/g, '');
-      const fromVariant = fromStateFull.split('::').pop() ?? fromStateFull;
-      const toVariant = toStateFull.split('::').pop() ?? toStateFull;
-
-      // Resolve both state variant nodes
-      const fromStateNodes = ctx.getNodesByName(fromVariant).filter(n =>
-        n.kind === 'enum_member' && (n.qualifiedName === fromStateFull || n.qualifiedName.endsWith('::' + fromVariant)),
-      );
-      const toStateNodes = ctx.getNodesByName(toVariant).filter(n =>
-        n.kind === 'enum_member' && (n.qualifiedName === toStateFull || n.qualifiedName.endsWith('::' + toVariant)),
-      );
-      const effectiveFromNodes = fromStateNodes.length > 0 ? fromStateNodes : ctx.getNodesByName(fromVariant).filter(n => n.kind === 'enum_member');
-      const effectiveToNodes = toStateNodes.length > 0 ? toStateNodes : ctx.getNodesByName(toVariant).filter(n => n.kind === 'enum_member');
-
-      const handlerNames = parseHandlerNames(handlerArg);
-      for (const hName of handlerNames) {
-        const handlerNode = resolveNode(hName, file, ctx);
-        if (!handlerNode) continue;
-
-        // registers_system edge: plugin → handler
-        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleArg}`;
-        if (!seen.has(rsKey)) {
-          seen.add(rsKey);
-          const rsLine = lineOffset + buildBody.slice(0, m.index).split('\n').length;
-          edges.push({
-            source: pluginNode.id,
-            target: handlerNode.id,
-            kind: 'registers_system',
-            line: rsLine,
-            provenance: 'heuristic',
-            metadata: { synthesizedBy: 'bevy-dsl', schedule: scheduleArg.replace(/\s+/g, '') },
-          });
-        }
-
-        // on_transition edges: handler → from_state_variant + handler → to_state_variant
-        for (const sn of effectiveFromNodes) {
-          const key = `${handlerNode.id}>${sn.id}>on_transition>from`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
-          edges.push({
-            source: handlerNode.id,
-            target: sn.id,
-            kind: 'on_transition',
-            line,
-            provenance: 'heuristic',
-            metadata: { synthesizedBy: 'bevy-dsl', plugin: pluginNode.name, transitionFrom: fromStateFull, transitionTo: toStateFull },
-          });
-        }
-        for (const sn of effectiveToNodes) {
-          const key = `${handlerNode.id}>${sn.id}>on_transition>to`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
-          edges.push({
-            source: handlerNode.id,
-            target: sn.id,
-            kind: 'on_transition',
-            line,
-            provenance: 'heuristic',
-            metadata: { synthesizedBy: 'bevy-dsl', plugin: pluginNode.name, transitionFrom: fromStateFull, transitionTo: toStateFull },
-          });
-        }
-      }
-    } else {
-      // Named schedule or other expression
-      const sched = scheduleArg.split('::').pop()!;
-      scheduleName = WELL_KNOWN_SCHEDULES.has(sched) ? sched : scheduleArg;
-
-      // Create virtual schedule node
-      const schedNodeId = `bevy-schedule-${scheduleName}`;
-      try {
-        queries.insertNodes([{
-          id: schedNodeId,
-          name: scheduleName,
-          kind: 'variable',
-          qualifiedName: scheduleName,
-          filePath: pluginNode.filePath,
-          language: 'rust',
-          startLine: 0, endLine: 0,
-          startColumn: 0, endColumn: 0,
-          updatedAt: Date.now(),
-        }]);
-      } catch { /* node already exists or insert failed — safe to ignore */ }
-
-      const handlerNames = parseHandlerNames(handlerArg);
-      for (const hName of handlerNames) {
-        const handlerNode = resolveNode(hName, file, ctx);
-        if (!handlerNode) continue;
-
-        // registers_system edge: plugin → handler
-        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleName}`;
-        if (!seen.has(rsKey)) {
-          seen.add(rsKey);
-          const rsLine = lineOffset + buildBody.slice(0, m.index).split('\n').length;
-          edges.push({
-            source: pluginNode.id,
-            target: handlerNode.id,
-            kind: 'registers_system',
-            line: rsLine,
-            provenance: 'heuristic',
-            metadata: { synthesizedBy: 'bevy-dsl', schedule: scheduleName },
-          });
-        }
-
-        // runs_in edge: handler → schedule node
-        const key = `${handlerNode.id}>${schedNodeId}>runs_in`;
+  for (const [event, dispatchers] of nativeDispatchersByEvent) {
+    const handlers = jsHandlersByEvent.get(event);
+    if (!handlers) continue;
+    // Same fan-out guard as the in-language channel: generic event names
+    // (e.g. 'change', 'error', 'data') with many handlers/dispatchers
+    // can't be matched precisely without receiver-type info.
+    if (dispatchers.size > EVENT_FANOUT_CAP || handlers.size > EVENT_FANOUT_CAP) continue;
+    for (const d of dispatchers) {
+      for (const [h, registeredAt] of handlers) {
+        if (d === h) continue;
+        const key = `${d}>${h}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
         edges.push({
-          source: handlerNode.id,
-          target: schedNodeId,
-          kind: 'runs_in',
-          line,
+          source: d,
+          target: h,
+          kind: 'calls',
           provenance: 'heuristic',
-          metadata: { synthesizedBy: 'bevy-dsl', plugin: pluginNode.name },
+          metadata: { synthesizedBy: 'rn-event-channel', event, registeredAt },
         });
       }
     }
@@ -1503,181 +700,136 @@ function parseAddSystems(
   return edges;
 }
 
-/** Parse `app.init_resource::<T>()` → registers_resource edges. */
-function parseInitResource(
-  buildBody: string,
-  pluginNode: Node,
-  ctx: ResolutionContext,
-  seen: Set<string>,
-  lineOffset: number,
-): Edge[] {
-  const edges: Edge[] = [];
-  const re = /\.init_resource\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
-  let m: RegExpExecArray | null;
+/**
+ * Phase 6 — React Native Fabric/Codegen view component bridge.
+ *
+ * The Fabric framework extractor (`frameworks/fabric.ts`) emits
+ * `component` nodes named after the JS-visible component (e.g.
+ * `RNSScreenStack`) from each `codegenNativeComponent<Props>('Name')`
+ * spec declaration. The native implementation lives in an ObjC++/.mm or
+ * Kotlin/Java class whose name follows one of RN's conventions:
+ *
+ *   - Exact: `RNSScreenStack`
+ *   - With suffix: `RNSScreenStackView`, `RNSScreenStackViewManager`,
+ *     `RNSScreenStackComponentView`, `RNSScreenStackManager`
+ *
+ * This synthesizer walks every Fabric component node and looks for a
+ * native class matching one of those names; when found, emits a
+ * `calls` edge `component → native class` (provenance `'heuristic'`,
+ * `synthesizedBy:'fabric-native-impl'`) so trace from JSX usage of the
+ * component continues into native.
+ *
+ * The convention-based suffix lookup is precise: there's no name
+ * collision in RN view-manager codebases by design (Codegen output would
+ * conflict otherwise).
+ */
+const FABRIC_NATIVE_SUFFIXES = ['', 'View', 'ViewManager', 'ComponentView', 'Manager'];
 
-  while ((m = re.exec(buildBody))) {
-    const typeName = m[1]!.replace(/\s+/g, '');
-    const resNodes = ctx.getNodesByName(typeName);
-    for (const rn of resNodes) {
-      if (rn.kind !== 'struct' && rn.kind !== 'enum') continue;
-      const key = `${pluginNode.id}>${rn.id}>registers_resource`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
-      edges.push({
-        source: pluginNode.id,
-        target: rn.id,
-        kind: 'registers_resource',
-        line,
-        provenance: 'heuristic',
-        metadata: { synthesizedBy: 'bevy-dsl' },
-      });
-    }
+function fabricNativeImplEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  // The Fabric extractor IDs are prefixed `fabric-component:` so we can
+  // filter to just those without iterating all `component` nodes.
+  const components = ctx.getNodesByKind('component').filter((n) => n.id.startsWith('fabric-component:'));
+  if (components.length === 0) return edges;
+
+  // Pre-index native classes by name for O(1) lookup.
+  const nativeClassesByName = new Map<string, Node[]>();
+  for (const n of ctx.getNodesByKind('class')) {
+    if (n.language !== 'objc' && n.language !== 'kotlin' && n.language !== 'java' && n.language !== 'cpp') continue;
+    const arr = nativeClassesByName.get(n.name);
+    if (arr) arr.push(n);
+    else nativeClassesByName.set(n.name, [n]);
   }
-  return edges;
-}
 
-/** Parse `app.add_message::<T>()` → registers_message edges. */
-function parseAddMessage(
-  buildBody: string,
-  pluginNode: Node,
-  ctx: ResolutionContext,
-  seen: Set<string>,
-  lineOffset: number,
-): Edge[] {
-  const edges: Edge[] = [];
-  const re = /\.add_message\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
-  let m: RegExpExecArray | null;
-
-  while ((m = re.exec(buildBody))) {
-    const typeName = m[1]!.replace(/\s+/g, '');
-    const msgNodes = ctx.getNodesByName(typeName);
-    for (const mn of msgNodes) {
-      if (mn.kind !== 'struct' && mn.kind !== 'enum') continue;
-      const key = `${pluginNode.id}>${mn.id}>registers_message`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
-      edges.push({
-        source: pluginNode.id,
-        target: mn.id,
-        kind: 'registers_message',
-        line,
-        provenance: 'heuristic',
-        metadata: { synthesizedBy: 'bevy-dsl' },
-      });
-    }
-  }
-  return edges;
-}
-
-/** Parse PluginGroup::build() → `.add(PluginType)` → contains_plugin edges. */
-function parsePluginGroupBuild(
-  buildBody: string,
-  groupNode: Node,
-  ctx: ResolutionContext,
-  seen: Set<string>,
-  lineOffset: number,
-): Edge[] {
-  const edges: Edge[] = [];
-  const re = /\.add\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
-  let m: RegExpExecArray | null;
-
-  while ((m = re.exec(buildBody))) {
-    const typeName = m[1]!.replace(/\s+/g, '');
-    // Scoped names like "module::Struct" — try full name first, then last segment
-    let pluginNodes = ctx.getNodesByName(typeName).filter(n => n.kind === 'struct');
-    if (pluginNodes.length === 0) {
-      const lastSeg = typeName.split('::').pop() ?? typeName;
-      if (lastSeg !== typeName) {
-        pluginNodes = ctx.getNodesByName(lastSeg).filter(n => n.kind === 'struct');
+  for (const component of components) {
+    for (const suffix of FABRIC_NATIVE_SUFFIXES) {
+      const candidate = component.name + suffix;
+      const matches = nativeClassesByName.get(candidate);
+      if (!matches || matches.length === 0) continue;
+      // Link the component node to every matching native class (iOS +
+      // Android each have one).
+      for (const native of matches) {
+        const key = `${component.id}>${native.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: component.id,
+          target: native.id,
+          kind: 'calls',
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'fabric-native-impl',
+            viaSuffix: suffix || '(exact)',
+            componentName: component.name,
+          },
+        });
       }
     }
-    for (const pn of pluginNodes) {
-      const key = `${groupNode.id}>${pn.id}>contains_plugin`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
-      edges.push({
-        source: groupNode.id,
-        target: pn.id,
-        kind: 'contains_plugin',
-        line,
-        provenance: 'heuristic',
-        metadata: { synthesizedBy: 'bevy-dsl' },
-      });
-    }
+  }
+
+  return edges;
+}
+
+function mybatisJavaXmlEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  // Index Java methods by `<ClassName>::<methodName>` for O(1) lookup.
+  const javaIndex = new Map<string, Node[]>();
+  for (const m of queries.getNodesByKind('method')) {
+    if (m.language !== 'java' && m.language !== 'kotlin') continue;
+    const parts = m.qualifiedName.split('::');
+    const last = parts[parts.length - 1];
+    const cls = parts[parts.length - 2];
+    if (!last || !cls) continue;
+    const key = `${cls}::${last}`;
+    const arr = javaIndex.get(key);
+    if (arr) arr.push(m); else javaIndex.set(key, [m]);
+  }
+
+  for (const xml of queries.getNodesByKind('method')) {
+    if (xml.language !== 'xml') continue;
+    // Qualified name: `<namespace>::<id>`. Extract the simple class name.
+    const colonIdx = xml.qualifiedName.lastIndexOf('::');
+    if (colonIdx < 0) continue;
+    const namespace = xml.qualifiedName.slice(0, colonIdx);
+    const id = xml.qualifiedName.slice(colonIdx + 2);
+    if (!namespace || !id) continue;
+    const dotIdx = namespace.lastIndexOf('.');
+    const className = dotIdx >= 0 ? namespace.slice(dotIdx + 1) : namespace;
+    const candidates = javaIndex.get(`${className}::${id}`);
+    if (!candidates || candidates.length === 0) continue;
+    // Drop ambiguous matches (multiple same-name classes); the user can
+    // disambiguate by adding the package-suffix match in a future enhancement.
+    if (candidates.length > 1) continue;
+    const java = candidates[0]!;
+    const key = `${java.id}>${xml.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push({
+      source: java.id,
+      target: xml.id,
+      kind: 'calls',
+      line: java.startLine,
+      provenance: 'heuristic',
+      metadata: {
+        synthesizedBy: 'mybatis-java-xml',
+        via: `${className}.${id}`,
+        registeredAt: `${xml.filePath}:${xml.startLine}`,
+      },
+    });
   }
   return edges;
 }
 
 /**
- * Synthesize Bevy DSL semantic edges (N12).
- *
- * Scans Plugin/PluginGroup `build()` method bodies for
- * add_systems, init_resource, add_message, and PluginGroup::build
- * patterns, creating structured edges (on_enter, on_exit, runs_in,
- * registers_resource, registers_message, contains_plugin) that
- * static tree-sitter extraction treats as opaque calls.
+ * Synthesize dispatcher→callback edges (field observers + EventEmitters +
+ * React re-render + JSX children + Vue templates + RN event channel +
+ * Fabric native-impl + MyBatis Java↔XML + registered fork synthesizers).
+ * Returns the count added. Never throws into indexing — callers wrap in
+ * try/catch.
  */
-function bevyDslEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
-  const edges: Edge[] = [];
-  const seen = new Set<string>();
-
-  const IMPL_RE = /impl\s+(Plugin(?:Group)?)\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)/gu;
-
-  for (const file of ctx.getAllFiles()) {
-    if (!file.endsWith('.rs')) continue;
-    const raw = ctx.readFile(file);
-    if (!raw) continue;
-    const content = stripRustComments(raw);
-
-    IMPL_RE.lastIndex = 0;
-    let implMatch: RegExpExecArray | null;
-    while ((implMatch = IMPL_RE.exec(content))) {
-      const traitName = implMatch[1]!;   // "Plugin" or "PluginGroup"
-      const structName = implMatch[2]!;
-      const structNode = resolveNode(structName, file, ctx);
-      if (!structNode) continue;
-
-      // Extract impl block body
-      const implOpen = content.indexOf('{', implMatch.index);
-      if (implOpen < 0) continue;
-      const implBody = extractBlock(content, implOpen);
-      if (!implBody) continue;
-
-      // Find fn build(…) inside the impl body
-      const buildRe = /fn\s+build\s*\([^)]*\)\s*(?:->\s*[^{]+)?\s*\{/g;
-      buildRe.lastIndex = 0;
-      let buildMatch: RegExpExecArray | null;
-      while ((buildMatch = buildRe.exec(implBody))) {
-        const buildOpen = implBody.indexOf('{', buildMatch.index);
-        if (buildOpen < 0) continue;
-        const buildBody = extractBlock(implBody, buildOpen);
-        if (!buildBody) continue;
-
-        // Line offset: impl body start line + build body start line
-        const implStartLine = content.slice(0, implOpen).split('\n').length;
-        const buildStartLine = implBody.slice(0, buildOpen).split('\n').length;
-        const lineOffset = implStartLine + buildStartLine - 1;
-
-        if (traitName === 'Plugin') {
-          edges.push(...parseAddSystems(buildBody, structNode, file, lineOffset, ctx, seen, queries));
-          edges.push(...parseInitResource(buildBody, structNode, ctx, seen, lineOffset));
-          edges.push(...parseAddMessage(buildBody, structNode, ctx, seen, lineOffset));
-        } else {
-          // PluginGroup
-          edges.push(...parsePluginGroupBuild(buildBody, structNode, ctx, seen, lineOffset));
-        }
-      }
-    }
-  }
-
-  return edges;
-}
-
-// ===========================================================================
-
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
   const fieldEdges = fieldChannelEdges(queries, ctx);
   const emitterEdges = eventEmitterEdges(ctx);
@@ -1687,14 +839,30 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
+  const rnEventEdgesList = rnEventEdges(ctx);
+  const fabricNativeEdges = fabricNativeImplEdges(ctx);
+  const mybatisEdges = mybatisJavaXmlEdges(queries);
+
+  // Registered synthesizers (fork extensions)
+  const registeredEdges = synthesizerRegistry.flatMap(fn => fn(queries, ctx));
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  const bevyEdges = bevyEcsEdges(ctx);
-  const stateEdges = bevyStateEdges(ctx);
-  const dslEdges = bevyDslEdges(queries, ctx);
-  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges, ...bevyEdges, ...stateEdges, ...dslEdges]) {
-    const key = `${e.source}>${e.target}>${(e.metadata as Record<string, unknown>)?.synthesizedBy ?? ''}`;
+  for (const e of [
+    ...fieldEdges,
+    ...emitterEdges,
+    ...renderEdges,
+    ...jsxEdges,
+    ...vueEdges,
+    ...flutterEdges,
+    ...cppEdges,
+    ...ifaceEdges,
+    ...rnEventEdgesList,
+    ...fabricNativeEdges,
+    ...mybatisEdges,
+    ...registeredEdges,
+  ]) {
+    const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(e);

@@ -43,7 +43,8 @@ export const NODE_KINDS = [
 export type NodeKind = (typeof NODE_KINDS)[number];
 
 /**
- * Types of edges (relationships) between nodes
+ * Types of edges (relationships) between nodes.
+ * Core (upstream) edge kinds — fork extensions add more via `string` union.
  */
 export type EdgeKind =
   | 'contains'        // Parent contains child (file→class, class→method)
@@ -101,6 +102,8 @@ export const LANGUAGES = [
   'objc',
   'yaml',
   'twig',
+  'xml',
+  'properties',
   'unknown',
 ] as const;
 

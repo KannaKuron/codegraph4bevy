@@ -13,6 +13,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, EdgeKind, UnresolvedReference } from '../types';
+import { bevySynthEdgeNote, formatSchedule, classifyMutability, classifyBevyEdgeRisk } from './bevy-formatters';
 import { createHash } from 'crypto';
 import {
   constants as fsConstants,
@@ -2313,23 +2314,8 @@ export class ToolHandler {
         registeredAt,
       };
     }
-    if (m?.synthesizedBy === 'bevy-ecs-state') {
-      const via = m.transitiveVia
-        ? ` (derived via ComputedStates from \`${String(m.transitiveVia)}\`)`
-        : '';
-      return {
-        label: `Bevy state transition — producer triggers consumer via state change${via} (dynamic dispatch)`,
-        compact: `dynamic: Bevy state transition${via ? ` [computed]` : ''}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'bevy-ecs-resource') {
-      return {
-        label: `Bevy ECS resource — insert triggers resource check (dynamic dispatch)`,
-        compact: `dynamic: Bevy ECS resource${at}`,
-        registeredAt,
-      };
-    }
+    const bevy = bevySynthEdgeNote(edge);
+    if (bevy) return bevy;
     return null;
   }
 
@@ -3261,20 +3247,7 @@ export class ToolHandler {
    * Queries runs_in edges to tell which schedule a system runs in.
    */
   private formatSchedule(cg: CodeGraph, node: Node): string {
-    if (node.kind !== 'function' && node.kind !== 'method') return '';
-    const runsInEdges = cg.getOutgoingEdges(node.id, ['runs_in']);
-    if (runsInEdges.length === 0) return '';
-    const lines: string[] = [];
-    for (const edge of runsInEdges) {
-      const schedNode = cg.getNode(edge.target);
-      const schedName = schedNode?.name ?? 'unknown';
-      const loc = edge.line ? `:${edge.line}` : '';
-      const pluginMeta = (edge.metadata as Record<string, unknown> | undefined);
-      const plugin = pluginMeta?.plugin as string | undefined;
-      const by = plugin ? ` by ${plugin}` : '';
-      lines.push(`- **Schedule:** ${schedName}${by}${loc ? ` (line ${edge.line})` : ''}`);
-    }
-    return lines.length > 0 ? `\n${lines.join('\n')}` : '';
+    return formatSchedule(cg, node);
   }
 
   /**
@@ -3369,9 +3342,20 @@ export class ToolHandler {
       return this.textResult('No files indexed. Run `codegraph index` first.');
     }
 
-    // Filter by path prefix
-    let files = pathFilter
-      ? allFiles.filter(f => f.path.startsWith(pathFilter) || f.path.startsWith('./' + pathFilter))
+    // Filter by path prefix. Stored paths are project-relative POSIX (e.g.
+    // "src/foo.ts"), but agents commonly pass project-root variants like "/",
+    // ".", "./", "" or Windows-style "src\foo" — and prefixes with leading
+    // "/", "./" or "\". Normalize all of those before matching so the agent
+    // gets results instead of falling back to Read/Glob (see #426).
+    const normalizedFilter = pathFilter
+      ? pathFilter
+          .replace(/\\/g, '/')
+          .replace(/^(?:\.?\/+)+/, '')
+          .replace(/^\.$/, '')
+          .replace(/\/+$/, '')
+      : '';
+    let files = normalizedFilter
+      ? allFiles.filter(f => f.path === normalizedFilter || f.path.startsWith(normalizedFilter + '/'))
       : allFiles;
 
     // Filter by glob pattern
@@ -3982,31 +3966,25 @@ export class ToolHandler {
    * treated as low risk.
    */
   private classifyEdgeRisk(kind: EdgeKind): 'high' | 'medium' | 'low' {
+    const bevy = classifyBevyEdgeRisk(kind);
+    if (bevy) return bevy;
     switch (kind) {
       case 'calls':
       case 'extends':
       case 'implements':
       case 'overrides':
       case 'pattern_match':
-      case 'on_enter':
-      case 'on_exit':
         return 'high';
       case 'instantiates':
       case 'imports':
       case 'exports':
       case 'decorates':
-      case 'runs_in':
-      case 'registers_resource':
-      case 'registers_message':
-      case 'contains_plugin':
-      case 'registers_system':
         return 'medium';
       case 'references':
       case 'type_of':
       case 'returns':
         return 'low';
       default:
-        console.warn(`classifyEdgeRisk: unknown EdgeKind "${kind}" — treating as low risk`);
         return 'low';
     }
   }
@@ -4076,30 +4054,7 @@ export class ToolHandler {
    * Res, &T), 'owning' (owned value, return type, plain T), or 'unknown'.
    */
   private classifyMutability(signature: string | undefined | null, typeName: string): 'mut' | 'shared' | 'owning' | 'unknown' {
-    if (!signature) return 'unknown';
-    const escaped = typeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Unicode-aware word boundary: JS \b only matches ASCII [a-zA-Z0-9_],
-    // so CJK type names (e.g. 导航上) never match. Use lookaround instead.
-    const WB = `(?<![\\p{L}\\p{N}_])`;
-    const WE = `(?![\\p{L}\\p{N}_])`;
-
-    // Mutable: ResMut<Type>, &mut Type
-    // Depth-aware: (?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)* handles up to 2 levels
-    // of nested generics (e.g. ResMut<Query<Filter<Type>>>) instead of
-    // stopping at the first > like [^>]* would.
-    const NESTED = `(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*`;
-    if (new RegExp(`ResMut\\s*<${NESTED}${WB}${escaped}${WE}`, 'u').test(signature)) return 'mut';
-    if (new RegExp(`&mut\\s+${WB}${escaped}${WE}`, 'u').test(signature)) return 'mut';
-
-    // Shared: Res<Type> (but not ResMut), &Type (but not &mut)
-    if (new RegExp(`(?<!Mut)Res\\s*<${NESTED}${WB}${escaped}${WE}`, 'u').test(signature)) return 'shared';
-    if (new RegExp(`(?<!&mut\\s)&${WB}${escaped}${WE}`, 'u').test(signature)) return 'shared';
-
-    // Owned: return type (-> Type or -> impl ... Type ...), or plain param without &
-    if (new RegExp(`->\\s*[^;{]*${WB}${escaped}${WE}`, 'u').test(signature)) return 'owning';
-    if (new RegExp(`${WB}${escaped}${WE}`, 'u').test(signature)) return 'owning';
-
-    return 'unknown';
+    return classifyMutability(signature, typeName);
   }
 
   private formatUsageResults(symbol: string, usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }>, limit: number): string {

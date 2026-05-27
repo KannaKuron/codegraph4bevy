@@ -257,4 +257,33 @@ export interface LanguageExtractor {
    * complete set of extracted nodes (e.g. Bevy add_systems fallback).
    */
   postExtract?: (ctx: PostExtractContext) => void;
+
+  /**
+   * Node types representing a file-level package/namespace declaration
+   * (e.g. Kotlin `package_header`, Java `package_declaration`). When set,
+   * the core wraps every top-level declaration in an implicit `namespace`
+   * node carrying the FQN, so cross-file import resolution can match by
+   * qualifiedName instead of filename (Kotlin filename ≠ class name).
+   */
+  packageTypes?: string[];
+
+  /** Extract the dotted package name from a package declaration node. */
+  extractPackage?: (node: SyntaxNode, source: string) => string | null;
+
+  // --- Fork extension hooks ---
+
+  /**
+   * Check if a call expression should be suppressed (not emitted as an edge).
+   * Used by Rust to suppress struct update base expressions (`..default()`).
+   * Return true to skip emitting the call edge.
+   */
+  shouldSuppressCall?: (node: SyntaxNode, calleeName: string, source: string) => boolean;
+
+  /**
+   * Resolve the edge kind for a type reference found during AST traversal.
+   * Used by Rust to emit 'type_of' edges inside type arguments (turbofish).
+   * Return the desired EdgeKind, or undefined to use the default 'references'.
+   */
+  resolveTypeRefKind?: (insideTypeArgs: boolean) => string | undefined;
+
 }

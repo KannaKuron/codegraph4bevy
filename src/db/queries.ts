@@ -21,6 +21,8 @@ import { safeJsonParse } from '../utils';
 import { kindBonus, nameMatchBonus, scorePathRelevance, escapeLike, enrichCJKForFTS } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 
+const SQLITE_PARAM_CHUNK_SIZE = 500;
+
 /**
  * Database row types (snake_case from SQLite)
  */
@@ -150,6 +152,11 @@ export class QueryBuilder {
   private nodeCache: Map<string, Node> = new Map();
   private readonly maxCacheSize = 1000;
 
+  // Whether the 'nodes' table has a 'fts_tokens' column (fork schema).
+  // Upstream schema omits it; detect at construction so both prepared-statement
+  // paths coexist and upstream edits to queries.ts merge cleanly.
+  private readonly hasFtsTokens: boolean;
+
   // Prepared statements (lazily initialized)
   private stmts: {
     insertNode?: SqliteStatement;
@@ -185,6 +192,15 @@ export class QueryBuilder {
 
   constructor(db: SqliteDatabase) {
     this.db = db;
+    // Detect fork-specific fts_tokens column.
+    // pragma() uses .get() which returns only the first row, so we
+    // use prepare().all() instead since table_info returns one row per column.
+    try {
+      const cols = this.db.prepare('PRAGMA table_info(nodes)').all() as Array<{ name: string }>;
+      this.hasFtsTokens = cols.some(c => c.name === 'fts_tokens');
+    } catch {
+      this.hasFtsTokens = false;
+    }
   }
 
   /**
@@ -204,21 +220,39 @@ export class QueryBuilder {
    */
   insertNode(node: Node): void {
     if (!this.stmts.insertNode) {
-      this.stmts.insertNode = this.db.prepare(`
-        INSERT OR REPLACE INTO nodes (
-          id, kind, name, qualified_name, file_path, language,
-          start_line, end_line, start_column, end_column,
-          docstring, signature, visibility,
-          is_exported, is_async, is_static, is_abstract,
-          decorators, type_parameters, updated_at, fts_tokens
-        ) VALUES (
-          @id, @kind, @name, @qualifiedName, @filePath, @language,
-          @startLine, @endLine, @startColumn, @endColumn,
-          @docstring, @signature, @visibility,
-          @isExported, @isAsync, @isStatic, @isAbstract,
-          @decorators, @typeParameters, @updatedAt, @ftsTokens
-        )
-      `);
+      if (this.hasFtsTokens) {
+        this.stmts.insertNode = this.db.prepare(`
+          INSERT OR REPLACE INTO nodes (
+            id, kind, name, qualified_name, file_path, language,
+            start_line, end_line, start_column, end_column,
+            docstring, signature, visibility,
+            is_exported, is_async, is_static, is_abstract,
+            decorators, type_parameters, updated_at, fts_tokens
+          ) VALUES (
+            @id, @kind, @name, @qualifiedName, @filePath, @language,
+            @startLine, @endLine, @startColumn, @endColumn,
+            @docstring, @signature, @visibility,
+            @isExported, @isAsync, @isStatic, @isAbstract,
+            @decorators, @typeParameters, @updatedAt, @ftsTokens
+          )
+        `);
+      } else {
+        this.stmts.insertNode = this.db.prepare(`
+          INSERT OR REPLACE INTO nodes (
+            id, kind, name, qualified_name, file_path, language,
+            start_line, end_line, start_column, end_column,
+            docstring, signature, visibility,
+            is_exported, is_async, is_static, is_abstract,
+            decorators, type_parameters, updated_at
+          ) VALUES (
+            @id, @kind, @name, @qualifiedName, @filePath, @language,
+            @startLine, @endLine, @startColumn, @endColumn,
+            @docstring, @signature, @visibility,
+            @isExported, @isAsync, @isStatic, @isAbstract,
+            @decorators, @typeParameters, @updatedAt
+          )
+        `);
+      }
     }
 
     // Validate required fields to prevent SQLite bind errors
@@ -260,8 +294,7 @@ export class QueryBuilder {
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
       updatedAt: node.updatedAt ?? Date.now(),
-      // fts_tokens: jieba-segmented tokens for CJK FTS search
-      ftsTokens: enrichCJKForFTS(node.name),
+      ...(this.hasFtsTokens ? { ftsTokens: enrichCJKForFTS(node.name) } : {}),
     });
   }
 
@@ -281,30 +314,56 @@ export class QueryBuilder {
    */
   updateNode(node: Node): void {
     if (!this.stmts.updateNode) {
-      this.stmts.updateNode = this.db.prepare(`
-        UPDATE nodes SET
-          kind = @kind,
-          name = @name,
-          qualified_name = @qualifiedName,
-          file_path = @filePath,
-          language = @language,
-          start_line = @startLine,
-          end_line = @endLine,
-          start_column = @startColumn,
-          end_column = @endColumn,
-          docstring = @docstring,
-          signature = @signature,
-          visibility = @visibility,
-          is_exported = @isExported,
-          is_async = @isAsync,
-          is_static = @isStatic,
-          is_abstract = @isAbstract,
-          decorators = @decorators,
-          type_parameters = @typeParameters,
-          fts_tokens = @ftsTokens,
-          updated_at = @updatedAt
-        WHERE id = @id
-      `);
+      if (this.hasFtsTokens) {
+        this.stmts.updateNode = this.db.prepare(`
+          UPDATE nodes SET
+            kind = @kind,
+            name = @name,
+            qualified_name = @qualifiedName,
+            file_path = @filePath,
+            language = @language,
+            start_line = @startLine,
+            end_line = @endLine,
+            start_column = @startColumn,
+            end_column = @endColumn,
+            docstring = @docstring,
+            signature = @signature,
+            visibility = @visibility,
+            is_exported = @isExported,
+            is_async = @isAsync,
+            is_static = @isStatic,
+            is_abstract = @isAbstract,
+            decorators = @decorators,
+            type_parameters = @typeParameters,
+            fts_tokens = @ftsTokens,
+            updated_at = @updatedAt
+          WHERE id = @id
+        `);
+      } else {
+        this.stmts.updateNode = this.db.prepare(`
+          UPDATE nodes SET
+            kind = @kind,
+            name = @name,
+            qualified_name = @qualifiedName,
+            file_path = @filePath,
+            language = @language,
+            start_line = @startLine,
+            end_line = @endLine,
+            start_column = @startColumn,
+            end_column = @endColumn,
+            docstring = @docstring,
+            signature = @signature,
+            visibility = @visibility,
+            is_exported = @isExported,
+            is_async = @isAsync,
+            is_static = @isStatic,
+            is_abstract = @isAbstract,
+            decorators = @decorators,
+            type_parameters = @typeParameters,
+            updated_at = @updatedAt
+          WHERE id = @id
+        `);
+      }
     }
 
     // Invalidate cache before update
@@ -336,7 +395,7 @@ export class QueryBuilder {
       isAbstract: node.isAbstract ? 1 : 0,
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
-      ftsTokens: enrichCJKForFTS(node.name),
+      ...(this.hasFtsTokens ? { ftsTokens: enrichCJKForFTS(node.name) } : {}),
       updatedAt: node.updatedAt ?? Date.now(),
     });
   }
@@ -432,9 +491,8 @@ export class QueryBuilder {
     // Chunk under SQLite's parameter limit (default 999, raised to 32766
     // in better-sqlite3 builds — chunk at 500 for safety across both
     // backends and to keep the query plan simple).
-    const CHUNK = 500;
-    for (let i = 0; i < misses.length; i += CHUNK) {
-      const chunk = misses.slice(i, i + CHUNK);
+    for (let i = 0; i < misses.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = misses.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db
         .prepare(`SELECT * FROM nodes WHERE id IN (${placeholders})`)
@@ -445,6 +503,25 @@ export class QueryBuilder {
         this.cacheNode(node);
       }
     }
+    return out;
+  }
+
+  private getExistingNodeIds(ids: readonly string[]): Set<string> {
+    const out = new Set<string>();
+    if (ids.length === 0) return out;
+
+    const uniqueIds = [...new Set(ids)];
+    for (let i = 0; i < uniqueIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = uniqueIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT id FROM nodes WHERE id IN (${placeholders})`)
+        .all(...chunk) as { id: string }[];
+      for (const row of rows) {
+        out.add(row.id);
+      }
+    }
+
     return out;
   }
 
@@ -785,7 +862,12 @@ export class QueryBuilder {
       return [];
     }
 
-    // BM25 column weights: id=0, name=20, qualified_name=5, docstring=1, signature=2, fts_tokens=15
+    // BM25 column weights depend on FTS table schema.
+    // With fts_tokens (fork): id=0, name=20, qualified_name=5, docstring=1, signature=2, fts_tokens=15
+    // Without fts_tokens (upstream): id=0, name=20, qualified_name=5, docstring=1, signature=2
+    const bm25Weights = this.hasFtsTokens
+      ? 'bm25(nodes_fts, 0, 20, 5, 1, 2, 15)'
+      : 'bm25(nodes_fts, 0, 20, 5, 1, 2)';
     // Heavy name weight ensures exact/prefix name matches rank above incidental
     // mentions in long docstrings or qualified names of nested symbols.
     // fts_tokens gets high weight so jieba-segmented CJK tokens contribute meaningfully.
@@ -794,7 +876,7 @@ export class QueryBuilder {
     const ftsLimit = Math.max(limit * 5, 100);
 
     let sql = `
-      SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2, 15) as score
+      SELECT nodes.*, ${bm25Weights} as score
       FROM nodes_fts
       JOIN nodes ON nodes_fts.id = nodes.id
       WHERE nodes_fts MATCH ?
@@ -1188,8 +1270,20 @@ export class QueryBuilder {
    * Insert multiple edges in a transaction
    */
   insertEdges(edges: Edge[]): void {
+    if (edges.length === 0) return;
+
     this.db.transaction(() => {
+      const endpointIds = new Set<string>();
       for (const edge of edges) {
+        endpointIds.add(edge.source);
+        endpointIds.add(edge.target);
+      }
+      const existingNodeIds = this.getExistingNodeIds([...endpointIds]);
+
+      for (const edge of edges) {
+        if (!existingNodeIds.has(edge.source) || !existingNodeIds.has(edge.target)) {
+          continue;
+        }
         this.insertEdge(edge);
       }
     })();
@@ -1600,6 +1694,19 @@ export class QueryBuilder {
   // ===========================================================================
   // Statistics
   // ===========================================================================
+
+  /**
+   * Lightweight (nodes, edges) count snapshot. Used around an index/sync
+   * run to compute true additions across extraction + resolution +
+   * synthesis — the per-phase counter in the orchestrator only sees
+   * extraction's contribution, which is why the CLI summary under-reported
+   * the edge count (resolution + synthesizer edges were invisible).
+   */
+  getNodeAndEdgeCount(): { nodes: number; edges: number } {
+    return this.db
+      .prepare('SELECT (SELECT COUNT(*) FROM nodes) AS nodes, (SELECT COUNT(*) FROM edges) AS edges')
+      .get() as { nodes: number; edges: number };
+  }
 
   /**
    * Get graph statistics

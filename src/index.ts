@@ -51,8 +51,12 @@ import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { logWarn } from './errors';
-import { FileWatcher, WatchOptions, PendingFile } from './sync';
+import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { indexExternalCrates } from './extraction/external-crates';
+
+// Fork extensions — side-effect import triggers Bevy synthesizer registration
+import './bevy';
+import { resolveReceiverType } from './bevy/receiver-resolver';
 
 // Re-export types for consumers
 export * from './types';
@@ -81,7 +85,7 @@ export {
   defaultLogger,
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
-export { FileWatcher, WatchOptions, PendingFile } from './sync';
+export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
 
 /**
@@ -331,6 +335,7 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
+        const before = this.queries.getNodeAndEdgeCount();
         const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
 
         // Re-detect frameworks now that the index is populated. The resolver
@@ -388,6 +393,15 @@ export class CodeGraph {
         // Cheap and non-blocking; never load-bearing for correctness.
         if (result.success && result.filesIndexed > 0) {
           this.db.runMaintenance();
+        }
+
+        // The orchestrator only sees extraction-phase counts; resolution and
+        // synthesizer edges (often >50% of the graph on JVM repos) come later.
+        // Recompute against the DB so the CLI summary reports the true totals.
+        if (result.success && result.filesIndexed > 0) {
+          const after = this.queries.getNodeAndEdgeCount();
+          result.nodesCreated = after.nodes - before.nodes;
+          result.edgesCreated = after.edges - before.edges;
         }
 
         return result;
@@ -524,6 +538,14 @@ export class CodeGraph {
       this.projectRoot,
       async () => {
         const result = await this.sync();
+        // sync() returns this exact zero-shape iff it failed to acquire the
+        // file lock (a real empty sync always has filesChecked > 0 because
+        // scanDirectory ran). Surface that to the watcher as a typed error
+        // so it keeps pendingFiles + reschedules instead of clearing them
+        // (#449).
+        if (result.filesChecked === 0 && result.durationMs === 0) {
+          throw new LockUnavailableError();
+        }
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },
@@ -763,7 +785,7 @@ export class CodeGraph {
         }
       }
       // Resolve declared type from the receiver variable's type_of edge
-      const declaredType = receiverHint ? this.resolveReceiverType(ref.fromNodeId, receiverHint, name) : undefined;
+      const declaredType = receiverHint ? resolveReceiverType(ref.fromNodeId, receiverHint, this.queries, this.traverser, name) : undefined;
       results.push({ filePath: ref.filePath ?? '', line: ref.line, column: ref.column, fromNodeId: ref.fromNodeId, receiverHint, declaredType });
       if (results.length >= limit) return results;
     }
@@ -1017,177 +1039,6 @@ export class CodeGraph {
     return this.traverser.getDescendantsRecursive(nodeId, maxDepth);
   }
 
-  /**
-   * Extract the base type name from a Rust parameter signature.
-   * Handles: "&mut Commands" → "Commands", "ResMut<Commands>" → "Commands",
-   * "Res<AssetServer>" → "AssetServer", "Option<&mut Commands>" → "Commands",
-   * "Commands" → "Commands", "Query<&T>" → "Query".
-   *
-   * Bevy system param wrappers (Res, ResMut, NonSend, NonSendMut) are
-   * unwrapped to their inner type because they Deref/DerefMut to it —
-   * method calls on these wrappers resolve against the inner type.
-   */
-  private extractBaseTypeFromSignature(sig: string): string | undefined {
-    let s = sig.trim();
-    // Strip leading reference + mut: &mut, &
-    s = s.replace(/^&(?:mut\s+)?/, '');
-    // Unwrap Option<...>
-    while (s.startsWith('Option<') && s.endsWith('>')) {
-      s = s.slice(7, -1).trim();
-      s = s.replace(/^&(?:mut\s+)?/, '');
-    }
-    // Handle generic types: ResMut<Commands>, Res<AssetServer>, Query<&T>, etc.
-    const angleIdx = s.indexOf('<');
-    if (angleIdx > 0) {
-      const baseType = s.slice(0, angleIdx).trim();
-      // Bevy system param wrappers that Deref/DerefMut to the inner type.
-      // For these, return the inner type (e.g. Commands from ResMut<Commands>).
-      if (baseType === 'Res' || baseType === 'ResMut' || baseType === 'NonSend' || baseType === 'NonSendMut') {
-        const closeIdx = s.lastIndexOf('>');
-        if (closeIdx > angleIdx) {
-          const inner = s.slice(angleIdx + 1, closeIdx).trim().replace(/^&(?:mut\s+)?/, '');
-          if (inner && /^[A-Z\p{Lu}]/u.test(inner)) {
-            return inner;
-          }
-        }
-      }
-      s = baseType;
-    }
-    s = s.trim();
-    // Only return if it looks like a type name (starts with uppercase or is a known pattern)
-    if (s && /^[A-Z\p{Lu}]/u.test(s)) {
-      return s;
-    }
-    return undefined;
-  }
-
-  /**
-   * Resolve the declared type name for a variable by following type_of edges.
-   * Three-tier resolution:
-   *
-   * Tier 1: Search all descendants (not just immediate children) for a parameter
-   *         node with matching name, then follow type_of edges to get declared type.
-   *         Covers: `commands: Commands`, `窗口: Single<&mut Window>`, etc.
-   *
-   * Tier 2: For closure parameters without type annotations (no type_of edge),
-   *         look up the method being called in external_symbols to infer the type.
-   *         Covers: `|父节点|` in `with_children` → `ChildBuilder`.
-   *
-   * Tier 3: Hardcoded fallback for well-known Bevy patterns.
-   *         Covers: `with_children` → `ChildBuilder` (safety net when crate index unavailable).
-   */
-  private resolveReceiverType(fromNodeId: string, varName: string, methodName?: string): string | undefined {
-    // ── Tier 1: Recursive parameter search with type_of / references edges ─────
-    const descendants = this.traverser.getDescendantsRecursive(fromNodeId);
-    for (const child of descendants) {
-      if (child.kind === 'parameter' && child.name === varName) {
-        // Parameter types may be stored as type_of (generic/turbofish context)
-        // or references (direct type annotations). Check both.
-        let typeEdges = this.queries.getOutgoingEdges(child.id, ['type_of']);
-        if (typeEdges.length === 0) {
-          typeEdges = this.queries.getOutgoingEdges(child.id, ['references']);
-        }
-        if (typeEdges.length > 0) {
-          const typeNode = this.queries.getNodeById(typeEdges[0]!.target);
-          if (typeNode) return typeNode.name;
-        }
-        // No resolved type edge (external type like ActionSpawnerCommands).
-        // Parse type name from the parameter's stored signature.
-        const sig = child.signature;
-        if (sig) {
-          const extractedType = this.extractBaseTypeFromSignature(sig);
-          if (extractedType) return extractedType;
-          // Tier 1.5: Closure parameter type inference from external_symbols.
-          // When a closure parameter has no type annotation, its signature holds the
-          // method name (stored by extractVariables in rust.ts). Look up the method
-          // to find which types have it, then extract the inner param type from
-          // the method's signature (e.g. impl FnOnce(&mut ChildBuilder) → ChildBuilder).
-          if (sig.length > 0 && !/[<: ]/u.test(sig)) {
-            const types = this.queries.findTypesByMethod(sig);
-            let bestName: string | undefined;
-            for (const t of types) {
-              if (t.paramTypes) {
-                try {
-                  const paramTypes: string[] = JSON.parse(t.paramTypes);
-                  for (const pt of paramTypes) {
-                    let p = pt.trim();
-                    if (/^&?(?:mut\s+)?self$/i.test(p)) continue;
-                    p = p.replace(/^impl\s+/, '');
-                    const fnMatch = p.match(/^(FnOnce|FnMut|Fn)\s*\(\s*(.+)\s*\)$/);
-                    if (fnMatch) {
-                      const inner = fnMatch[2]!.split(',')[0]!.trim();
-                      const innerType = this.extractBaseTypeFromSignature(inner);
-                      if (innerType) return innerType;
-                      continue;
-                    }
-                    const directType = this.extractBaseTypeFromSignature(p);
-                    if (directType) return directType;
-                  }
-                } catch (e) {
-                  logWarn(`[resolveReceiverType] Failed to parse param_types for type "${t.symbolName}" with method "${sig}": ${(e as Error).message}`);
-                }
-              }
-              // Remember the first type name as fallback, but keep checking others
-              if (!bestName) bestName = t.symbolName;
-            }
-            if (bestName) return bestName;
-          }
-        }
-        continue;
-      }
-    }
-
-    // Also check immediate children (backward compat — non-parameter variable declarations)
-    const children = this.traverser.getChildren(fromNodeId);
-    for (const child of children) {
-      if (child.name === varName && child.kind !== 'parameter') {
-        const typeEdges = this.queries.getOutgoingEdges(child.id, ['type_of']);
-        if (typeEdges.length > 0) {
-          const typeNode = this.queries.getNodeById(typeEdges[0]!.target);
-          if (typeNode) return typeNode.name;
-        }
-      }
-    }
-
-    // ── Tier 2: Generalized external symbol lookup by method name ────
-    if (methodName) {
-      const types = this.queries.findTypesByMethod(methodName);
-      if (types.length > 0) return types[0]!.symbolName;
-    }
-
-    // ── Tier 3: Hardcoded fallback for well-known Bevy patterns ──
-    // (safety net when external_symbols is empty — CI, no Cargo.lock, etc.)
-    if (methodName) {
-      if (methodName === 'with_children' || methodName === 'spawn_children') {
-        return 'ChildBuilder';
-      }
-      if (methodName === 'with_related_entities') {
-        return 'EntityCommands';
-      }
-      if (methodName === 'spawn' || methodName === 'insert' || methodName === 'remove' || methodName === 'despawn') {
-        return 'EntityCommands';
-      }
-      if (methodName === 'entity' || methodName === 'commands' || methodName === 'id'
-        || methodName === 'entry' || methodName === 'with_child'
-        || methodName === 'spawn_empty' || methodName === 'spawn_batch') {
-        return 'EntityCommands';
-      }
-      if (methodName === 'single' || methodName === 'get' || methodName === 'iter') {
-        return 'Query';
-      }
-      if (methodName === 'iter_mut' || methodName === 'get_single' || methodName === 'query') {
-        return 'Query';
-      }
-      if (methodName === 'send' || methodName === 'send_batch' || methodName === 'trigger') {
-        return 'EventWriter';
-      }
-      if (methodName === 'set') {
-        return 'NextState';
-      }
-    }
-
-    return undefined;
-  }
 
   /**
    * Get dependencies of a file

@@ -1148,6 +1148,19 @@ export const rustExtractor: LanguageExtractor = {
     handleRustOnExtractCall(node, callerId, calleeName, ctx);
   },
 
+  shouldSuppressCall: (node, _calleeName, source) => {
+    // Rust struct update syntax: Struct { ..default() } — the call inside
+    // .. position is a value expression, not a project-internal call.
+    const beforeText = source.slice(Math.max(0, node.startIndex - 200), node.startIndex);
+    return /(?:^|[,\s{])\s*\.\.\s*$/.test(beforeText);
+  },
+
+  resolveTypeRefKind: (insideTypeArgs) => {
+    // Inside turbofish type arguments, emit 'type_of' so resolution
+    // prefers type symbols (struct, enum) over value symbols.
+    return insideTypeArgs ? 'type_of' : undefined;
+  },
+
   postExtract: (ctx) => {
     scanBevyPatternsFallback(ctx);
     scanAttributeTypeRefs(ctx);
