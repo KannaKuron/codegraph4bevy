@@ -739,12 +739,15 @@ export class CodeGraph {
 
   /**
    * Search for method call sites by method name.
-   * Returns deduplicated call locations from unresolved method_call references.
+   * Returns deduplicated call locations from both unresolved method_call references
+   * and resolved calls edges (when the underlying ref was resolved and deleted).
    */
   searchMethodCalls(name: string, limit: number = 30): Array<{ filePath: string; line: number; column: number; fromNodeId: string; receiverHint: string; declaredType?: string }> {
-    const refs = this.queries.getUnresolvedByName(name);
     const seen = new Set<string>();
     const results: Array<{ filePath: string; line: number; column: number; fromNodeId: string; receiverHint: string; declaredType?: string }> = [];
+
+    // ── Phase 1: Unresolved method_call refs ──────────────────────────
+    const refs = this.queries.getUnresolvedByName(name);
     for (const ref of refs) {
       if (ref.referenceKind !== 'method_call') continue;
       const key = `${ref.filePath}:${ref.line}`;
@@ -762,8 +765,46 @@ export class CodeGraph {
       // Resolve declared type from the receiver variable's type_of edge
       const declaredType = receiverHint ? this.resolveReceiverType(ref.fromNodeId, receiverHint, name) : undefined;
       results.push({ filePath: ref.filePath ?? '', line: ref.line, column: ref.column, fromNodeId: ref.fromNodeId, receiverHint, declaredType });
-      if (results.length >= limit) break;
+      if (results.length >= limit) return results;
     }
+
+    // ── Phase 2: Resolved calls edges ─────────────────────────────────
+    // When a method_call reference is resolved to a project-internal symbol,
+    // the unresolved ref is deleted and a calls edge is created. Search for
+    // nodes named `name` (any kind — resolution may map to fields, methods,
+    // or functions) that have incoming calls edges, then extract the declared
+    // type from the target's qualified name where available.
+    const methodNodes = this.queries.getNodesByName(name);
+    for (const methodNode of methodNodes) {
+      const incomingCalls = this.queries.getIncomingEdges(methodNode.id, ['calls']);
+      for (const edge of incomingCalls) {
+        const sourceNode = this.queries.getNodeById(edge.source);
+        if (!sourceNode) continue;
+        const key = `${sourceNode.filePath}:${edge.line}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        // Extract the declared type from the target's qualified name
+        // (e.g. "Commands::spawn" → declaredType = "Commands")
+        let declaredType: string | undefined;
+        const qn = methodNode.qualifiedName;
+        if (qn) {
+          const lastColon = qn.lastIndexOf('::');
+          if (lastColon > 0) {
+            declaredType = qn.slice(0, lastColon);
+          }
+        }
+        results.push({
+          filePath: sourceNode.filePath,
+          line: edge.line ?? sourceNode.startLine,
+          column: 0,
+          fromNodeId: edge.source,
+          receiverHint: '',
+          declaredType,
+        });
+        if (results.length >= limit) return results;
+      }
+    }
+
     return results;
   }
 

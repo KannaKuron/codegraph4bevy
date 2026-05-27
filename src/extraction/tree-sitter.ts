@@ -1707,6 +1707,38 @@ export class TreeSitterExtractor {
               calleeName = methodName;
             }
           }
+        } else if (func.type === 'generic_function') {
+          // Rust turbofish method call: receiver.method::<Type>(...)
+          // generic_function wraps function + type_arguments. Unwrap the inner
+          // function and process it as a method call when it's a field_expression.
+          const innerFunc = getChildByField(func, 'function') || func.namedChild(0);
+          if (innerFunc && innerFunc.type === 'field_expression') {
+            const field = getChildByField(innerFunc, 'field') || innerFunc.namedChild(1);
+            if (field) {
+              bareMethodName = getNodeText(field, this.source);
+              isMethodCall = true;
+              const value = getChildByField(innerFunc, 'value') || innerFunc.namedChild(0);
+              if (value) {
+                if (value.type === 'identifier' || value.type === 'scoped_identifier') {
+                  const receiverName = getNodeText(value, this.source);
+                  calleeName = `${receiverName}.${bareMethodName}`;
+                } else if (value.type === 'field_expression') {
+                  const fullChain = buildFieldExpressionChain(innerFunc, this.source);
+                  calleeName = fullChain || bareMethodName;
+                } else if (value.type === 'call_expression') {
+                  const nestedFunc = getChildByField(value, 'function') || value.namedChild(0);
+                  const innerName = nestedFunc ? getNodeText(nestedFunc, this.source) : '';
+                  calleeName = innerName ? `${innerName}.${bareMethodName}` : bareMethodName;
+                } else {
+                  calleeName = bareMethodName;
+                }
+              } else {
+                calleeName = bareMethodName;
+              }
+            }
+          } else if (innerFunc) {
+            calleeName = getNodeText(innerFunc, this.source);
+          }
         } else if (func.type === 'field_expression') {
           // Rust method call: receiver.method() or a.b.c()
           // field_expression has 'value' (receiver) and 'field' (method name)
