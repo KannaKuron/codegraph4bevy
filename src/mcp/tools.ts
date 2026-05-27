@@ -1469,15 +1469,19 @@ export class ToolHandler {
           usages.push({ sourceNode, targetNode: node, edgeKind: edge.kind, line: edge.line ?? sourceNode.startLine });
         }
       }
-      // Outgoing: node is the SOURCE
-      for (const edge of cg.getOutgoingEdges(node.id)) {
-        if (edgeKinds !== undefined && !edgeKinds.includes(edge.kind)) continue;
-        const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const targetNode = cg.getNode(edge.target);
-        if (targetNode) {
-          usages.push({ sourceNode: node, targetNode, edgeKind: edge.kind, line: edge.line ?? node.startLine });
+      // Outgoing: node is the SOURCE.
+      // Skip for kind="calls" — outgoing calls are the symbol's own callees,
+      // not callers of the symbol (B17).
+      if (kindFilter !== 'calls') {
+        for (const edge of cg.getOutgoingEdges(node.id)) {
+          if (edgeKinds !== undefined && !edgeKinds.includes(edge.kind)) continue;
+          const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const targetNode = cg.getNode(edge.target);
+          if (targetNode) {
+            usages.push({ sourceNode: node, targetNode, edgeKind: edge.kind, line: edge.line ?? node.startLine });
+          }
         }
       }
     }
@@ -1821,19 +1825,21 @@ export class ToolHandler {
       lines.push('');
     }
     for (const ext of shownExternal) {
+      // Clean whitespace from method chain names that span source lines (B18).
+      const cleanName = ext.name.replace(/\s+/g, '');
       // Format method calls: capitalize receiver for readability
       // "commands.spawn" → "Commands::spawn", "下一个状态.set" → "下一个状态::set"
-      let displayName = ext.name;
-      const dotIdx = ext.name.indexOf('.');
+      let displayName = cleanName;
+      const dotIdx = cleanName.indexOf('.');
       if (dotIdx > 0) {
-        const receiver = ext.name.slice(0, dotIdx);
-        const method = ext.name.slice(dotIdx + 1);
+        const receiver = cleanName.slice(0, dotIdx);
+        const method = cleanName.slice(dotIdx + 1);
         const capReceiver = receiver.charAt(0).toUpperCase() + receiver.slice(1);
         displayName = `${capReceiver}::${method}`;
       }
       lines.push(`- **${displayName}** (${ext.kind})`);
-      if (displayName !== ext.name) {
-        lines.push(`  via: \`${ext.name}\``);
+      if (displayName !== cleanName) {
+        lines.push(`  via: \`${cleanName}\``);
       }
       lines.push(`  call: ${ext.filePath}:${ext.line}`);
       lines.push('');

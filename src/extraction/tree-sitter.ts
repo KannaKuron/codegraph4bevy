@@ -1759,7 +1759,15 @@ export class TreeSitterExtractor {
                 // Chain call: foo().bar(). Extract inner function name for
                 // qualified reference (e.g., "commands.spawn.with_children").
                 const innerFunc = getChildByField(value, 'function') || value.namedChild(0);
-                const innerName = innerFunc ? getNodeText(innerFunc, this.source) : '';
+                let innerName = '';
+                if (innerFunc) {
+                  // Use buildFieldExpressionChain for clean names when the
+                  // inner function is a field_expression spanning multiple
+                  // source lines — getNodeText would include newlines/indent.
+                  innerName = innerFunc.type === 'field_expression'
+                    ? (buildFieldExpressionChain(innerFunc, this.source) ?? getNodeText(innerFunc, this.source).replace(/\s+/g, ''))
+                    : getNodeText(innerFunc, this.source);
+                }
                 calleeName = innerName ? `${innerName}.${bareMethodName}` : bareMethodName;
               } else {
                 calleeName = bareMethodName;
