@@ -344,11 +344,6 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: '查找实现指定 trait/interface 的所有类型（通过 implements 边或未解析引用）。设置后 query 仅作 fallback。',
         },
-        limit: {
-          type: 'number',
-          description: '最大结果数（默认: 10）',
-          default: 10,
-        },
         projectPath: projectPathProperty,
       },
       required: ['query'],
@@ -1110,15 +1105,13 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const kind = args.kind as string | undefined;
-    const rawLimit = Number(args.limit) || 10;
-    const limit = clamp(rawLimit, 1, 100);
     const referencesType = args.referencesType as string | undefined;
     const implFor = args.impl_for as string | undefined;
 
     let results: SearchResult[];
     if (kind === 'comment') {
       // Comment search via FTS5 — directly query comments table
-      const commentResults = cg.searchComments(query, limit);
+      const commentResults = cg.searchComments(query);
       if (commentResults.length === 0) {
         return this.textResult(`No comments found for "${query}"`);
       }
@@ -1135,7 +1128,7 @@ export class ToolHandler {
       return this.textResult(this.truncateOutput(lines.join('\n')));
     } else if (kind === 'macro') {
       // Macro call search — find all call sites of a specific macro (e.g., info!, println!)
-      const macroCalls = cg.searchMacroCalls(query, limit);
+      const macroCalls = cg.searchMacroCalls(query);
       if (macroCalls.length === 0) {
         return this.textResult(`No macro invocations of "${query}" found`);
       }
@@ -1159,7 +1152,7 @@ export class ToolHandler {
       return this.textResult(this.truncateOutput(lines.join('\n')));
     } else if (kind === 'method_call') {
       // Method call search — find all .method() call sites across the project
-      const methodCalls = cg.searchMethodCalls(query, limit);
+      const methodCalls = cg.searchMethodCalls(query);
       if (methodCalls.length === 0) {
         return this.textResult(`No method calls "${query}" found`);
       }
@@ -1186,37 +1179,28 @@ export class ToolHandler {
       return this.textResult(this.truncateOutput(lines.join('\n')));
     } else if (implFor) {
       results = cg.findImplementors(implFor, {
-        limit,
         kinds: kind ? [kind as NodeKind] : undefined,
       });
       if (results.length === 0) {
         results = cg.searchNodes(`implements ${implFor}`, {
-          limit,
           kinds: kind ? [kind as NodeKind] : undefined,
         });
       }
     } else if (referencesType) {
-      // When mutability filter is active, fetch more results since many
-      // may be filtered out. The final slice respects the user's limit.
-      const mutability = args.mutability as string | undefined;
-      const fetchLimit = mutability ? Math.max(limit * 3, 100) : limit;
       results = cg.findNodesByReferencedType(referencesType, {
-        limit: fetchLimit,
         kinds: kind ? [kind as NodeKind] : undefined,
       });
+      const mutability = args.mutability as string | undefined;
       if (mutability && (mutability === 'mut' || mutability === 'shared' || mutability === 'owning')) {
         results = results.filter(r => this.classifyMutability(r.node.signature, referencesType) === mutability);
-        results = results.slice(0, limit);
       }
       if (results.length === 0) {
         results = cg.searchNodes(query, {
-          limit,
           kinds: kind ? [kind as NodeKind] : undefined,
         });
       }
     } else {
       results = cg.searchNodes(query, {
-        limit,
         kinds: kind ? [kind as NodeKind] : undefined,
       });
     }
@@ -1449,13 +1433,18 @@ export class ToolHandler {
       if (unresolvedResult !== null) return unresolvedResult;
     }
 
-    // Expand container nodes (enum, struct, trait, class, interface) to include
-    // their children — this fixes enum references returning 0 (B2) by querying
-    // variant-level edges too.
-    const CONTAINER_KINDS = new Set(['enum', 'struct', 'trait', 'class', 'interface']);
+    // Expand container nodes to include their children.
+    // - enum: variant-level edges (e.g. MyEnum::V pattern_match) — always expand
+    // - trait/interface: default method implementations — always expand
+    // - struct/class: DO NOT expand for references/type_of — field-level edges
+    //   are about the field's own type/access, not about the parent struct.
+    //   (B15: expanding struct fields mixed in field-type refs and field accesses)
+    const ALWAYS_EXPAND = new Set(['enum', 'trait', 'interface']);
+    const STRUCT_LIKE = new Set(['struct', 'class']);
     const nodesToQuery: Node[] = [...allMatches.nodes];
     for (const node of allMatches.nodes) {
-      if (CONTAINER_KINDS.has(node.kind)) {
+      if (ALWAYS_EXPAND.has(node.kind) ||
+          (STRUCT_LIKE.has(node.kind) && kindFilter !== 'references' && kindFilter !== 'type_of')) {
         for (const child of cg.getChildren(node.id)) {
           if (!nodesToQuery.some(n => n.id === child.id)) {
             nodesToQuery.push(child);

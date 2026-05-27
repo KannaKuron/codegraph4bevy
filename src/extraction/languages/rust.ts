@@ -612,6 +612,76 @@ function scanBevyPatternsFallback(ctx: PostExtractContext): void {
   }
 }
 
+// ── Attribute type-reference extraction ─────────────────────────────
+
+/**
+ * Extract type references from Rust attribute macro arguments.
+ * tree-sitter parses `#[source(游戏流程_状态 = 游戏流程_状态::初始化)]` as
+ * meta_item nodes, not as type paths, so the normal extraction misses them.
+ * This scans for known Bevy attribute patterns and creates references edges.
+ */
+function scanAttributeTypeRefs(ctx: PostExtractContext): void {
+  const source = ctx.source;
+  const lines = source.split('\n');
+
+  // Build lookup: startLine → nodeId for ALL non-file nodes
+  const nodeByStartLine = new Map<number, string>();
+  for (const n of ctx.nodes) {
+    if (n.startLine && n.kind !== 'file') {
+      nodeByStartLine.set(n.startLine, n.id);
+    }
+  }
+
+  const existingKeys = new Set<string>();
+  for (const ref of ctx.unresolvedReferences) {
+    existingKeys.add(`${ref.fromNodeId}:${ref.referenceName}:${ref.referenceKind}:${ref.line}`);
+  }
+
+  // Match #[source(TypePath = ValuePath)] — Bevy SubStates source attribute
+  // Handles CJK names: 游戏流程_状态, scoped paths: State::Variant
+  const IDENT = '[\\p{L}\\p{N}_]+';
+  const PATH = `${IDENT}(?:\\s*::\\s*${IDENT})*`;
+  const SOURCE_ATTR_RE = new RegExp(
+    `#\\[\\s*source\\s*\\(\\s*(${PATH})\\s*=\\s*(${PATH})\\s*\\)\\s*\\]`, 'gu',
+  );
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    SOURCE_ATTR_RE.lastIndex = 0;
+    const match = SOURCE_ATTR_RE.exec(line);
+    if (!match) continue;
+
+    const leftPath = match[1]!.replace(/\s/g, '');
+    const rightPath = match[2]!.replace(/\s/g, '');
+    const attrLine = i + 1;
+
+    // Find the decorated item: next non-empty, non-attribute, non-comment line
+    let decoratedNodeId: string | undefined;
+    for (let j = i + 1; j < lines.length; j++) {
+      const trimmed = lines[j]!.trim();
+      if (trimmed === '' || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
+      decoratedNodeId = nodeByStartLine.get(j + 1);
+      break;
+    }
+
+    if (!decoratedNodeId) continue;
+
+    for (const path of [leftPath, rightPath]) {
+      const key = `${decoratedNodeId}:${path}:references:${attrLine}`;
+      if (!existingKeys.has(key)) {
+        existingKeys.add(key);
+        ctx.addUnresolvedReference({
+          fromNodeId: decoratedNodeId,
+          referenceName: path,
+          referenceKind: 'references',
+          line: attrLine,
+          column: line.indexOf(path.split('::')[0]!) + 1,
+        });
+      }
+    }
+  }
+}
+
 // ── Rust variable extraction ───────────────────────────────────────
 
 function extractRustVariable(
@@ -1080,5 +1150,6 @@ export const rustExtractor: LanguageExtractor = {
 
   postExtract: (ctx) => {
     scanBevyPatternsFallback(ctx);
+    scanAttributeTypeRefs(ctx);
   },
 };

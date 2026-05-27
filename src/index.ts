@@ -719,7 +719,7 @@ export class CodeGraph {
    * Search for macro call sites by macro name.
    * Returns deduplicated call locations from unresolved macro_call references.
    */
-  searchMacroCalls(name: string, limit: number = 20): Array<{ filePath: string; line: number; column: number; fromNodeId: string }> {
+  searchMacroCalls(name: string, limit: number = 500): Array<{ filePath: string; line: number; column: number; fromNodeId: string }> {
     // Normalize: strip trailing ! — macro names are stored without it (tree-sitter
     // parses info! as macro_name=info + bang), but users naturally search info!
     const normalized = name.endsWith('!') ? name.slice(0, -1) : name;
@@ -742,7 +742,7 @@ export class CodeGraph {
    * Returns deduplicated call locations from both unresolved method_call references
    * and resolved calls edges (when the underlying ref was resolved and deleted).
    */
-  searchMethodCalls(name: string, limit: number = 30): Array<{ filePath: string; line: number; column: number; fromNodeId: string; receiverHint: string; declaredType?: string }> {
+  searchMethodCalls(name: string, limit: number = 500): Array<{ filePath: string; line: number; column: number; fromNodeId: string; receiverHint: string; declaredType?: string }> {
     const seen = new Set<string>();
     const results: Array<{ filePath: string; line: number; column: number; fromNodeId: string; receiverHint: string; declaredType?: string }> = [];
 

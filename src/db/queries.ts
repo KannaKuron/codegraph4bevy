@@ -547,7 +547,7 @@ export class QueryBuilder {
    * 3. Score results based on match quality
    */
   searchNodes(query: string, options: SearchOptions = {}): SearchResult[] {
-    const { limit = 100, offset = 0 } = options;
+    const { limit = 500, offset = 0 } = options;
 
     // Parse field-qualified bits out of the raw query (kind:, lang:,
     // path:, name:). Anything not recognised stays in `text` and goes
@@ -1701,7 +1701,7 @@ export class QueryBuilder {
   /**
    * Search comments by text using FTS5.
    */
-  searchComments(query: string, limit: number = 20): Array<{
+  searchComments(query: string, limit: number = 500): Array<{
     filePath: string;
     startLine: number;
     endLine: number;
