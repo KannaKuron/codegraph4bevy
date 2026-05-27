@@ -194,7 +194,7 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
  * (See issue #193.)
  */
 function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): void {
-  const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'] };
+  const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true };
 
   // Tracked files. --recurse-submodules pulls in files from active submodules,
   // which the index would otherwise represent only as a commit pointer.
@@ -244,7 +244,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     const gitRoot = execFileSync(
       'git',
       ['rev-parse', '--show-toplevel'],
-      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     ).trim();
 
     if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
@@ -253,7 +253,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
         execFileSync(
           'git',
           ['check-ignore', '-q', path.resolve(rootDir)],
-          { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+          { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
         );
         // Directory is gitignored by parent repo — fall back to filesystem walk
         return null;
@@ -294,7 +294,7 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
     const output = execFileSync(
       'git',
       ['status', '--porcelain', '--no-renames'],
-      { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] }
+      { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
 
     const modified: string[] = [];
