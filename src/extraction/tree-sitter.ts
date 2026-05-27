@@ -673,6 +673,13 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(funcNode.id);
+
+    // B11: Extract function parameters as variable nodes so resolveReceiverType
+    // Tier 1 can find them. The top-level walker skips function children
+    // (skipChildren=true) and the body walker only visits the body block,
+    // so parameters are never reached otherwise.
+    this.extractParameters(node, this.extractor.paramsField || 'parameters');
+
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
     if (body) {
@@ -803,6 +810,10 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(methodNode.id);
+
+    // B11: Extract method parameters as variable nodes.
+    this.extractParameters(node, this.extractor.paramsField || 'parameters');
+
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
     if (body) {
@@ -1734,13 +1745,17 @@ export class TreeSitterExtractor {
       }
     }
 
-    // B13: Rust struct update syntax `Struct { ..default() }` generates
-    // a bare call_expression for `default()`. This is <TargetType as Default>::default(),
-    // not a call to a project-internal function. Detect by checking for `..`
-    // immediately before the call and skip the calls reference.
-    if (this.language === 'rust' && calleeName && !calleeName.includes('.') && !calleeName.includes('::')) {
-      const beforeText = this.source.slice(Math.max(0, node.startIndex - 10), node.startIndex);
-      if (/\.\.\s*$/.test(beforeText)) {
+    // B13: Rust struct update syntax `Struct { ..default() }` or
+    // `Struct { ..Default::default() }` generates a bare call_expression
+    // inside struct update syntax. This is a value expression, not a
+    // project-internal call. Detect by looking backwards for `..` that
+    // is preceded by a struct-literal context (comma, brace, whitespace).
+    // Use a 200-char window to handle whitespace/indentation between `..`
+    // and the call. Also excludes range expressions (0..foo(), x..bar())
+    // by requiring a comma/brace/whitespace before the `..`.
+    if (this.language === 'rust' && calleeName) {
+      const beforeText = this.source.slice(Math.max(0, node.startIndex - 200), node.startIndex);
+      if (/(?:^|[,\s{])\s*\.\.\s*$/.test(beforeText)) {
         return; // struct update base, not a project call
       }
     }
@@ -2369,6 +2384,24 @@ export class TreeSitterExtractor {
     'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64',
     'float32', 'float64', 'complex64', 'complex128', 'rune', 'error',
   ]);
+
+  /**
+   * B11: Extract parameter nodes from a function/method/closure node.
+   * Iterates through the `parameters`/`closure_parameters` child and creates
+   * variable nodes for each individual parameter so resolveReceiverType can
+   * find them via getDescendantsRecursive.
+   */
+  private extractParameters(node: SyntaxNode, paramsField: string): void {
+    if (!this.extractor) return;
+    const paramsNode = getChildByField(node, paramsField);
+    if (!paramsNode) return;
+    for (let i = 0; i < paramsNode.namedChildCount; i++) {
+      const param = paramsNode.namedChild(i);
+      if (param && this.extractor.variableTypes.includes(param.type)) {
+        this.extractVariable(param);
+      }
+    }
+  }
 
   /**
    * Extract type references from type annotations on a function/method/field node.

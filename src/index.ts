@@ -978,8 +978,13 @@ export class CodeGraph {
 
   /**
    * Extract the base type name from a Rust parameter signature.
-   * Handles: "&mut Commands" → "Commands", "&mut ActionSpawnerCommands<Foo>" → "ActionSpawnerCommands",
-   * "Option<&mut Commands>" → "Commands", "Commands" → "Commands".
+   * Handles: "&mut Commands" → "Commands", "ResMut<Commands>" → "Commands",
+   * "Res<AssetServer>" → "AssetServer", "Option<&mut Commands>" → "Commands",
+   * "Commands" → "Commands", "Query<&T>" → "Query".
+   *
+   * Bevy system param wrappers (Res, ResMut, NonSend, NonSendMut) are
+   * unwrapped to their inner type because they Deref/DerefMut to it —
+   * method calls on these wrappers resolve against the inner type.
    */
   private extractBaseTypeFromSignature(sig: string): string | undefined {
     let s = sig.trim();
@@ -990,10 +995,22 @@ export class CodeGraph {
       s = s.slice(7, -1).trim();
       s = s.replace(/^&(?:mut\s+)?/, '');
     }
-    // Strip trailing generic args: ActionSpawnerCommands<Foo, Bar> → ActionSpawnerCommands
+    // Handle generic types: ResMut<Commands>, Res<AssetServer>, Query<&T>, etc.
     const angleIdx = s.indexOf('<');
     if (angleIdx > 0) {
-      s = s.slice(0, angleIdx);
+      const baseType = s.slice(0, angleIdx).trim();
+      // Bevy system param wrappers that Deref/DerefMut to the inner type.
+      // For these, return the inner type (e.g. Commands from ResMut<Commands>).
+      if (baseType === 'Res' || baseType === 'ResMut' || baseType === 'NonSend' || baseType === 'NonSendMut') {
+        const closeIdx = s.lastIndexOf('>');
+        if (closeIdx > angleIdx) {
+          const inner = s.slice(angleIdx + 1, closeIdx).trim().replace(/^&(?:mut\s+)?/, '');
+          if (inner && /^[A-Z\p{Lu}]/u.test(inner)) {
+            return inner;
+          }
+        }
+      }
+      s = baseType;
     }
     s = s.trim();
     // Only return if it looks like a type name (starts with uppercase or is a known pattern)
