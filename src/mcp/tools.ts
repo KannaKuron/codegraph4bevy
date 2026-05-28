@@ -329,7 +329,7 @@ export const tools: ToolDefinition[] = [
         },
         kind: {
           type: 'string',
-          description: '按节点类型过滤。通用别名：`type`=所有类型定义（struct/enum/type_alias/trait/interface/protocol/class）、`variable`=变量和常量。也支持具体类型：struct、enum、enum_member、field、parameter、import、export、type_alias、trait、protocol、namespace、constant、module、file、property、route、component。特殊类型：`comment`（注释搜索）、`macro`（宏调用位置）、`method_call`（方法调用点）。',
+          description: '按节点类型过滤。别名：type（所有类型定义）、variable（变量和常量）。特殊：comment（注释搜索）、macro（宏调用位置）、method_call（方法调用点）。完整枚举值见 MCP Server Instructions。',
           enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'struct', 'enum', 'enum_member', 'field', 'parameter', 'import', 'export', 'type_alias', 'trait', 'protocol', 'namespace', 'constant', 'module', 'file', 'property', 'route', 'component', 'comment', 'macro', 'method_call'],
         },
         path: {
@@ -366,7 +366,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_context',
-    description: '主工具 — 任何"X 怎么工作"、架构、功能或 bug 上下文问题都先调这个。组合 search + node + callers + callees，一次调用返回入口点、相关符号和关键代码 — 通常无需进一步搜索/Read/Grep。优于链式 codegraph_search + codegraph_node 和 codegraph_explore。注意：提供的是代码上下文，不是产品需求；新功能仍需与用户确认 UX/边界条件。',
+    description: '主工具 — 任何"X 怎么工作"、架构、功能或 bug 上下文问题都先调这个。组合 search + node + callers + callees，一次返回入口点、相关符号和关键代码。注意：提供的是代码上下文，不是产品需求；新功能仍需与用户确认 UX/边界条件。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -391,7 +391,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callers',
-    description: '查找调用指定符号的所有函数/方法。返回调用点行号和单行源码片段。加 "kind" 参数可查非调用关系：references、type_of、pattern_match、instantiates 及框架特定边。include_external 显示外部未解析引用。支持 symbols 数组批量查询。',
+    description: '查找调用指定符号的所有函数/方法。返回调用点行号和单行源码片段。kind 参数可查非调用关系（references、type_of、pattern_match 等及 Bevy 框架边）。include_external 显示外部未解析引用。支持 symbols 数组批量查询。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -406,7 +406,7 @@ export const tools: ToolDefinition[] = [
         },
         kind: {
           type: 'string',
-          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。通用类型："references"、"type_of"、"pattern_match"、"instantiates"、"contains"。Bevy 特定类型使用 bevy: 前缀：bevy:runs_in、bevy:on_enter、bevy:on_exit、bevy:on_transition、bevy:registers_system、bevy:registers_resource、bevy:registers_message、bevy:registers_state、bevy:registers_observer、bevy:contains_plugin、bevy:configures_set、bevy:registers_type、bevy:registers_non_send。',
+          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。完整枚举值见 MCP Server Instructions。',
           enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'all', 'bevy:runs_in', 'bevy:on_enter', 'bevy:on_exit', 'bevy:on_transition', 'bevy:registers_system', 'bevy:registers_resource', 'bevy:registers_message', 'bevy:registers_state', 'bevy:registers_observer', 'bevy:contains_plugin', 'bevy:configures_set', 'bevy:registers_type', 'bevy:registers_non_send'],
         },
         mutability: {
@@ -538,7 +538,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: '一次有上限调用返回多个相关符号的源码（按文件分组）和关系图。高效查看多个相关符号的首选 — 优于多次 codegraph_node 或 Read（每次单独调用重读整个上下文，10 次 node 远比 1 次 explore 开销大）。codegraph_context 后需要看实际源码时使用。用具体符号/文件/代码术语查询，不要用自然语言句子 — 先用 codegraph_search 找名字。好的查询："renderStaticScene drawElementOnCanvas ShapeCache"。差的查询："agent prompts are loaded"。返回的是原始源码（与 Read 逐字节一致），带行号，非摘要。',
+    description: '一次有上限调用返回多个相关符号的源码（按文件分组）和关系图。高效查看多个相关符号的首选 — 优于多次 codegraph_node 或 Read。用具体符号/文件/代码术语查询，不要用自然语言句子。返回原始源码（与 Read 逐字节一致），带行号，非摘要。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -629,7 +629,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_trace',
-    description: '追踪两个符号之间的调用路径 — "from 如何到达/变成 to？" 一次调用返回完整函数链（每跳带 file:line 和内联源码及目的地本身的被调用者）。这是 grep/Read 结构上无法做到的 — 没有"从 A 到 B 的路径"这种文本模式。适用于流程问题 — 更新如何触发渲染、请求如何到达处理器。如无静态路径则链在动态调度处断开（回调/描述符/元类）；工具会指出断开点。',
+    description: '追踪两个符号之间的调用路径 — "from 如何到达/变成 to？" 一次返回完整函数链（每跳带 file:line 和内联源码及目的地本身的被调用者）。适用于流程问题。如无静态路径则链在动态调度处断开（回调/描述符/元类）；工具会指出断开点。',
     inputSchema: {
       type: 'object',
       properties: {

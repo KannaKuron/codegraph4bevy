@@ -403,7 +403,7 @@ describe('Installer targets — partial-state idempotency', () => {
 
     const md = fs.readFileSync(steering, 'utf-8');
     expect(md).toContain('codegraph_callers');
-    expect(md).toContain('CodeGraph MCP server');
+    expect(md).toContain('CodeGraph MCP 服务器');
   });
 
   it('kiro: install preserves a pre-existing sibling MCP server in mcp.json', () => {
