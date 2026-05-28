@@ -329,8 +329,8 @@ export const tools: ToolDefinition[] = [
         },
         kind: {
           type: 'string',
-          description: '按节点类型过滤',
-          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component', 'comment', 'macro', 'method_call'],
+          description: '按节点类型过滤。通用别名：`type`=所有类型定义（struct/enum/type_alias/trait/interface/protocol/class）、`variable`=变量和常量。也支持具体类型：struct、enum、enum_member、field、parameter、import、export、type_alias、trait、protocol、namespace、constant、module、file、property。',
+          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'struct', 'enum', 'enum_member', 'field', 'parameter', 'import', 'export', 'type_alias', 'trait', 'protocol', 'namespace', 'constant', 'module', 'file', 'property', 'route', 'component', 'comment', 'macro', 'method_call'],
         },
         referencesType: {
           type: 'string',
@@ -1098,6 +1098,18 @@ export class ToolHandler {
   }
 
   /**
+   * Map a `kind` parameter value to an array of concrete NodeKind values.
+   * Generic aliases expand to multiple kinds; direct NodeKind values pass through.
+   */
+  private static kindToNodeKinds(kind: string): NodeKind[] {
+    switch (kind) {
+      case 'type': return ['struct', 'enum', 'type_alias', 'trait', 'interface', 'protocol', 'class'];
+      case 'variable': return ['variable', 'constant'];
+      default: return [kind as NodeKind];
+    }
+  }
+
+  /**
    * Handle codegraph_search
    */
   private async handleSearch(args: Record<string, unknown>): Promise<ToolResult> {
@@ -1106,6 +1118,7 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const kind = args.kind as string | undefined;
+    const kinds = kind ? ToolHandler.kindToNodeKinds(kind) : undefined;
     const referencesType = args.referencesType as string | undefined;
     const implFor = args.impl_for as string | undefined;
 
@@ -1180,16 +1193,16 @@ export class ToolHandler {
       return this.textResult(this.truncateOutput(lines.join('\n')));
     } else if (implFor) {
       results = cg.findImplementors(implFor, {
-        kinds: kind ? [kind as NodeKind] : undefined,
+        kinds,
       });
       if (results.length === 0) {
         results = cg.searchNodes(`implements ${implFor}`, {
-          kinds: kind ? [kind as NodeKind] : undefined,
+          kinds,
         });
       }
     } else if (referencesType) {
       results = cg.findNodesByReferencedType(referencesType, {
-        kinds: kind ? [kind as NodeKind] : undefined,
+        kinds,
       });
       const mutability = args.mutability as string | undefined;
       if (mutability && (mutability === 'mut' || mutability === 'shared' || mutability === 'owning')) {
@@ -1197,12 +1210,12 @@ export class ToolHandler {
       }
       if (results.length === 0) {
         results = cg.searchNodes(query, {
-          kinds: kind ? [kind as NodeKind] : undefined,
+          kinds,
         });
       }
     } else {
       results = cg.searchNodes(query, {
-        kinds: kind ? [kind as NodeKind] : undefined,
+        kinds,
       });
     }
 
@@ -1437,15 +1450,16 @@ export class ToolHandler {
     // Expand container nodes to include their children.
     // - enum: variant-level edges (e.g. MyEnum::V pattern_match) — always expand
     // - trait/interface: default method implementations — always expand
-    // - struct/class: DO NOT expand for references/type_of — field-level edges
-    //   are about the field's own type/access, not about the parent struct.
-    //   (B15: expanding struct fields mixed in field-type refs and field accesses)
+    // - struct/class: DO NOT expand for type_of — field-level type_of edges
+    //   point to the field's own type (e.g. f32), not about the parent struct.
+    //   DO expand for references — field accesses (e.g. config.标题_字号) are
+    //   relevant when querying references to a type (B14 fix).
     const ALWAYS_EXPAND = new Set(['enum', 'trait', 'interface']);
     const STRUCT_LIKE = new Set(['struct', 'class']);
     const nodesToQuery: Node[] = [...allMatches.nodes];
     for (const node of allMatches.nodes) {
       if (ALWAYS_EXPAND.has(node.kind) ||
-          (STRUCT_LIKE.has(node.kind) && kindFilter !== 'references' && kindFilter !== 'type_of')) {
+          (STRUCT_LIKE.has(node.kind) && kindFilter !== 'type_of')) {
         for (const child of cg.getChildren(node.id)) {
           if (!nodesToQuery.some(n => n.id === child.id)) {
             nodesToQuery.push(child);
