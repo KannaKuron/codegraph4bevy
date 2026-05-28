@@ -57,7 +57,12 @@ function parseAddSystems(
     let scheduleName: string | null = null;
     const onEnterMatch = /^OnEnter\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
     const onExitMatch = /^OnExit\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
-    const onTransitionMatch = /^OnTransition\s*\{\s*exited\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*entered\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\}$/u.exec(scheduleArg);
+    const onTransitionMatchExitFirst = /^OnTransition\s*\{\s*exited\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*entered\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\}$/u.exec(scheduleArg);
+    const onTransitionMatchEnterFirst = /^OnTransition\s*\{\s*entered\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*exited\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\}$/u.exec(scheduleArg);
+    const onTransitionMatch = onTransitionMatchExitFirst
+      ?? (onTransitionMatchEnterFirst
+        ? Object.assign(onTransitionMatchEnterFirst, { 1: onTransitionMatchEnterFirst[2], 2: onTransitionMatchEnterFirst[1] })
+        : null);
 
     if (onEnterMatch || onExitMatch) {
       const stateName = (onEnterMatch ?? onExitMatch)![1]!.replace(/\s+/g, '');
@@ -308,7 +313,7 @@ function parseRegistersState(
   lineOffset: number,
 ): Edge[] {
   const edges: Edge[] = [];
-  const re = /\.(init_state|add_sub_state|add_computed_state|insert_state)\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
+  const re = /\.(init_state|add_sub_state|add_computed_state|insert_state)\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*(?:\s*<\s*[\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*(?:\s*<\s*[\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)?\s*>)?)\s*>/gu;
   let m: RegExpExecArray | null;
 
   while ((m = re.exec(buildBody))) {

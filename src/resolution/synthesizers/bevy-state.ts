@@ -16,7 +16,7 @@ const NEXT_STATE_SET_RE = /[\p{L}\p{N}_]+\s*\.\s*set\s*\(\s*([\p{L}\p{N}_]+(?:\s
 const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
 const IMPL_HEADER_RE = /impl\s+ComputedStates\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)(?:\s+where\s+[^{]+)?\s*\{/gu;
 const ADD_SYSTEMS_ONENTEREXIT_RE = /\.add_systems\s*\(\s*(OnEnter|OnExit)\s*\(/g;
-const ADD_SYSTEMS_ONTRANSITION_RE = /\.add_systems\s*\(\s*OnTransition\s*\{\s*exited\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*entered\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\}/gu;
+const ADD_SYSTEMS_ONTRANSITION_RE = /\.add_systems\s*\(\s*OnTransition\s*\{\s*(?:exited\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*entered\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)|entered\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*exited\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*))\s*\}/gu;
 const SUBSTATES_SOURCE_RE = /#\[\s*source\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*=\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)\s*\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?enum\s+([\p{L}\p{N}_]+)\s*\{/gu;
 const DEFAULT_VARIANT_RE = /#\[\s*default\s*\]\s*([\p{L}\p{N}_]+)/gu;
 
@@ -292,7 +292,7 @@ export function bevyStateEdges(ctx: ResolutionContext): Edge[] {
     ADD_SYSTEMS_ONTRANSITION_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = ADD_SYSTEMS_ONTRANSITION_RE.exec(content))) {
-      const toStateFull = m[2]!.replace(/\s+/g, '');
+      const toStateFull = (m[2] ?? m[3])!.replace(/\s+/g, '');
       const { full, variant } = normalizeStateName(toStateFull);
       const braceClose = content.indexOf('}', m.index + m[0].length - 1);
       if (braceClose < 0) continue;

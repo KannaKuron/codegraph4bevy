@@ -319,13 +319,13 @@ const projectPathProperty: PropertySchema = {
 export const tools: ToolDefinition[] = [
   {
     name: 'codegraph_search',
-    description: '按名称快速搜索符号。只返回位置（不含源码）。需要全面的任务上下文时用 codegraph_context。',
+    description: '按名称快速搜索符号。只返回位置（不含源码）。支持正则（/pattern/flags 或含 $| 等元字符自动检测）。需要全面的任务上下文时用 codegraph_context。',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: '符号名或部分名称（如 "auth"、"signIn"、"UserService"）',
+          description: '符号名或部分名称（如 "auth"、"signIn"、"UserService"）。支持正则：/handle.*Event$/ 或含 $| 等元字符自动检测。',
         },
         kind: {
           type: 'string',
@@ -344,6 +344,16 @@ export const tools: ToolDefinition[] = [
         impl_for: {
           type: 'string',
           description: '查找实现指定 trait/interface 的所有类型（通过 implements 边或未解析引用）。设置后 query 仅作 fallback。',
+        },
+        limit: {
+          type: 'number',
+          description: '返回的最大结果数（默认: 50）',
+          default: 50,
+        },
+        offset: {
+          type: 'number',
+          description: '跳过前 N 个结果（默认: 0）',
+          default: 0,
         },
         projectPath: projectPathProperty,
       },
@@ -461,13 +471,18 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_impact',
-    description: '分析修改某符号的影响半径 — 改了会破坏什么？显示可能受影响的代码，按依赖距离排序。includeCode 内联受影响符号的源码。',
+    description: '分析修改某符号的影响半径 — 改了会破坏什么？显示可能受影响的代码，按依赖距离排序。includeCode 内联受影响符号的源码。支持 symbols 数组批量查询。',
     inputSchema: {
       type: 'object',
       properties: {
         symbol: {
           type: 'string',
           description: '要分析影响的符号名',
+        },
+        symbols: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '批量查询：多个符号名，结果按符号分组',
         },
         depth: {
           type: 'number',
@@ -481,7 +496,11 @@ export const tools: ToolDefinition[] = [
         },
         projectPath: projectPathProperty,
       },
-      required: ['symbol'],
+      required: [],
+      anyOf: [
+        { required: ['symbol'] },
+        { required: ['symbols'] },
+      ],
     },
   },
   {
@@ -531,6 +550,15 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: '包含源码的最大文件数（默认: 12）',
           default: 12,
+        },
+        maxChars: {
+          type: 'number',
+          description: '覆盖默认输出字符上限（如 maxChars: 30000）',
+        },
+        filesOffset: {
+          type: 'number',
+          description: '跳过前 N 个文件（0-indexed），配合"Not shown above"列表分页',
+          default: 0,
         },
         sourceOnly: {
           type: 'boolean',
@@ -1121,6 +1149,8 @@ export class ToolHandler {
     const kinds = kind ? ToolHandler.kindToNodeKinds(kind) : undefined;
     const referencesType = args.referencesType as string | undefined;
     const implFor = args.impl_for as string | undefined;
+    const searchLimit = clamp(Number(args.limit) || 50, 1, 500);
+    const searchOffset = Math.max(0, Number(args.offset) || 0);
 
     let results: SearchResult[];
     if (kind === 'comment') {
@@ -1198,6 +1228,7 @@ export class ToolHandler {
       if (results.length === 0) {
         results = cg.searchNodes(`implements ${implFor}`, {
           kinds,
+          limit: searchLimit + searchOffset + 1,
         });
       }
     } else if (referencesType) {
@@ -1211,12 +1242,31 @@ export class ToolHandler {
       if (results.length === 0) {
         results = cg.searchNodes(query, {
           kinds,
+          limit: searchLimit + searchOffset + 1,
         });
       }
     } else {
       results = cg.searchNodes(query, {
         kinds,
+        limit: searchLimit + searchOffset + 1,
+        offset: searchOffset,
       });
+    }
+
+    // Post-hoc slice for implFor/referencesType paths that don't accept offset natively.
+    // For the searchNodes path, offset was applied in SQL, so results.length is
+    // min(remaining, searchLimit+1). For implFor/referencesType, results include
+    // everything from the start, so total is the full count.
+    const offsetApplied = !implFor && !referencesType;
+    const hasMore = offsetApplied
+      ? results.length > searchLimit           // SQL already skipped offset rows
+      : results.length > searchLimit + searchOffset; // full set; more than we need
+    const total = offsetApplied ? searchOffset + results.length : results.length;
+    if (!offsetApplied && searchOffset > 0) {
+      results = results.slice(searchOffset);
+    }
+    if (results.length > searchLimit) {
+      results = results.slice(0, searchLimit);
     }
 
     if (results.length === 0) {
@@ -1231,7 +1281,7 @@ export class ToolHandler {
       return this.textResult(label);
     }
 
-    const formatted = this.formatSearchResults(results);
+    const formatted = this.formatSearchResults(results, (searchOffset > 0 || hasMore) ? { total, offset: searchOffset, hasMore } : undefined);
     return this.textResult(this.truncateOutput(formatted));
   }
 
@@ -1656,6 +1706,10 @@ export class ToolHandler {
           const sourceNode = cg.getNode(edge.source);
           if (sourceNode) { usages.push({ sourceNode, targetNode: node, edgeKind: edge.kind, line: edge.line ?? sourceNode.startLine }); }
         }
+      // Outgoing: node is the SOURCE.
+      // Skip for kind="calls" — outgoing calls are the symbol's own callees,
+      // not callers of the symbol (B17).
+      if (effectiveKind !== 'calls') {
         for (const edge of cg.getOutgoingEdges(node.id)) {
           if (edgeKinds !== undefined && !edgeKinds.includes(edge.kind)) continue;
           const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
@@ -1665,6 +1719,7 @@ export class ToolHandler {
           if (targetNode) { usages.push({ sourceNode: node, targetNode, edgeKind: edge.kind, line: edge.line ?? node.startLine }); }
         }
       }
+    }
 
       if (mutability && (mutability === 'mut' || mutability === 'shared' || mutability === 'owning')) {
         const filtered: typeof usages = [];
@@ -1876,10 +1931,16 @@ export class ToolHandler {
    * Handle codegraph_impact
    */
   private async handleImpact(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+
+    // Batch mode: symbols array
+    if (Array.isArray(args.symbols) && args.symbols.length > 0) {
+      return this.handleBatchImpact(cg, args.symbols as string[], args);
+    }
+
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const depth = clamp((args.depth as number) || 2, 1, 10);
     const includeCode = args.includeCode === true;
 
@@ -1915,6 +1976,66 @@ export class ToolHandler {
 
     const formatted = this.formatImpact(symbol, mergedImpact, includeCode ? cg : null) + allMatches.note;
     return this.textResult(this.truncateOutput(formatted));
+  }
+
+  /**
+   * Handle batch codegraph_impact — multiple symbols in one call
+   */
+  private handleBatchImpact(cg: CodeGraph, symbols: string[], args: Record<string, unknown>): ToolResult {
+    const batchLimit = Math.min(symbols.length, 20);
+    const depth = clamp((args.depth as number) || 2, 1, 10);
+    const includeCode = args.includeCode === true;
+    const allLines: string[] = [`## Batch Impact (${batchLimit} symbols)`, ''];
+    let totalAffected = 0;
+
+    for (const symbol of symbols.slice(0, batchLimit)) {
+      const valid = this.validateString(symbol, 'symbols');
+      if (typeof valid !== 'string') {
+        allLines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
+        allLines.push('');
+        continue;
+      }
+      const allMatches = this.findAllSymbols(cg, valid);
+      if (allMatches.nodes.length === 0) {
+        allLines.push(`### ${valid}: not found`);
+        allLines.push('');
+        continue;
+      }
+
+      const mergedNodes = new Map<string, Node>();
+      const mergedEdges: Edge[] = [];
+      const seenEdges = new Set<string>();
+
+      for (const node of allMatches.nodes) {
+        const impact = cg.getImpactRadius(node.id, depth);
+        for (const [id, n] of impact.nodes) {
+          mergedNodes.set(id, n);
+        }
+        for (const e of impact.edges) {
+          const key = `${e.source}->${e.target}:${e.kind}`;
+          if (!seenEdges.has(key)) {
+            seenEdges.add(key);
+            mergedEdges.push(e);
+          }
+        }
+      }
+
+      const mergedImpact = {
+        nodes: mergedNodes,
+        edges: mergedEdges,
+        roots: allMatches.nodes.map(n => n.id),
+      };
+
+      const affectedCount = mergedNodes.size - allMatches.nodes.length;
+      allLines.push(this.formatImpact(valid, mergedImpact, includeCode ? cg : null));
+      if (allMatches.note) allLines.push(allMatches.note);
+      allLines.push('');
+      totalAffected += affectedCount;
+    }
+
+    allLines.push('---');
+    allLines.push(`Total: ${totalAffected} affected nodes across ${batchLimit} symbols`);
+    return this.textResult(this.truncateOutput(allLines.join('\n')));
   }
 
   /**
@@ -2559,7 +2680,18 @@ export class ToolHandler {
         gapThreshold: budget.gapThreshold * 2,
       };
     }
+    // User-specified maxChars overrides the adaptive budget
+    const userMaxChars = args.maxChars as number | undefined;
+    if (userMaxChars && userMaxChars > 0) {
+      const clampedMax = clamp(userMaxChars, 5000, 100000);
+      budget = {
+        ...budget,
+        maxOutputChars: clampedMax,
+        maxCharsPerFile: clamp(Math.floor(clampedMax / (args.maxFiles as number || budget.defaultMaxFiles)), 2000, 50000),
+      };
+    }
     const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
+    const filesOffset = Math.max(0, (args.filesOffset as number) || 0);
 
     // Step 1: Find relevant context with generous parameters.
     // Use a large maxNodes budget — explore has its own 35k char output limit
@@ -2716,7 +2848,7 @@ export class ToolHandler {
     const lines: string[] = [
       `## Exploration: ${query}`,
       '',
-      `Found ${subgraph.nodes.size} symbols across ${fileGroups.size} files.`,
+      `Found ${subgraph.nodes.size} symbols across ${fileGroups.size} files.${filesOffset > 0 ? ` (starting from file #${filesOffset + 1})` : ''}`,
       '',
     ];
 
@@ -2765,10 +2897,14 @@ export class ToolHandler {
     let filesIncluded = 0;
     let anyFileTrimmed = false;
 
-    for (const [filePath, group] of sortedFiles) {
+    for (let fileIdx = 0; fileIdx < sortedFiles.length; fileIdx++) {
       if (filesIncluded >= maxFiles) break;
       if (totalChars > budget.maxOutputChars * 0.9) break;
 
+      // Skip files before the offset (for pagination via filesOffset)
+      if (fileIdx < filesOffset) continue;
+
+      const [filePath, group] = sortedFiles[fileIdx]!;
       const absPath = validatePathWithinRoot(projectRoot, filePath);
       if (!absPath || !existsSync(absPath)) continue;
 
@@ -3070,7 +3206,7 @@ export class ToolHandler {
     // Small projects (per budget) skip this — the relevant story already fits
     // in the source section, and a trailing pointer list is pure overhead.
     if (budget.includeAdditionalFiles) {
-      const remainingRelevant = sortedFiles.slice(filesIncluded);
+      const remainingRelevant = sortedFiles.slice(filesOffset + filesIncluded);
       const peripheralFiles = [...fileGroups.entries()]
         .filter(([, group]) => group.score < 3)
         .sort((a, b) => b[1].score - a[1].score);
@@ -3084,6 +3220,11 @@ export class ToolHandler {
         }
         if (remainingFiles.length > 10) {
           lines.push(`- ... and ${remainingFiles.length - 10} more files`);
+        }
+        // Continuation hint for filesOffset pagination
+        if (remainingRelevant.length > 0) {
+          lines.push('');
+          lines.push(`> Use \`filesOffset: ${filesOffset + filesIncluded}\` to continue from where this call left off.`);
         }
       }
     }
@@ -3804,8 +3945,11 @@ export class ToolHandler {
   // Formatting helpers (compact by default to reduce context usage)
   // =========================================================================
 
-  private formatSearchResults(results: SearchResult[]): string {
-    const lines: string[] = [`## Search Results (${results.length} found)`, ''];
+  private formatSearchResults(results: SearchResult[], meta?: { total: number; offset: number; hasMore: boolean }): string {
+    const header = meta
+      ? `## Search Results (showing ${meta.offset + 1}-${meta.offset + results.length}${meta.hasMore ? '+' : ''} of ${meta.total})`
+      : `## Search Results (${results.length} found)`;
+    const lines: string[] = [header, ''];
 
     for (const result of results) {
       const { node } = result;

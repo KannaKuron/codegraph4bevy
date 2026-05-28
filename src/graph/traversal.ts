@@ -301,6 +301,11 @@ export class GraphTraverser {
     const calleeNodes = this.queries.getNodesByIds(targetIds);
 
     for (const edge of outgoingEdges) {
+      // Skip Bevy synthetic edges — these represent dataflow (state
+      // transitions, resource signals), not real call relationships.
+      const meta = edge.metadata as Record<string, unknown> | undefined;
+      if (meta?.synthesizedBy === 'bevy-ecs-state' || meta?.synthesizedBy === 'bevy-ecs-resource') continue;
+
       const calleeNode = calleeNodes.get(edge.target);
       if (calleeNode && !visited.has(calleeNode.id)) {
         result.push({ node: calleeNode, edge });

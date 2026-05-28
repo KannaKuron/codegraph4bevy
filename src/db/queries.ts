@@ -653,6 +653,71 @@ export class QueryBuilder {
     // unicode61 tokenizer + jieba fts_tokens handles CJK correctly,
     // so FTS works for all languages.
     let results: SearchResult[];
+
+    // Regex path: detect /pattern/flags or heuristic metacharacters.
+    // Early return with shared post-processing (rescoring, offset, filters).
+    if (text) {
+      const regexSpec = this.isRegexQuery(text);
+      if (regexSpec) {
+        const regexResults = this.searchNodesRegex(text, regexSpec, { kinds, languages, limit });
+        if (regexResults.length > 0) {
+          results = regexResults;
+          // Apply exact-match supplement (same as FTS path below)
+          if (query) {
+            const existingIds = new Set(results.map(r => r.node.id));
+            const maxScore = Math.max(...results.map(r => r.score));
+            const terms = query.split(/\s+/).filter(t => t.length >= 2);
+            for (const term of terms) {
+              let sql = 'SELECT * FROM nodes WHERE name = ? COLLATE NOCASE';
+              const params: (string | number)[] = [term];
+              if (kinds && kinds.length > 0) {
+                sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+                params.push(...kinds);
+              }
+              if (languages && languages.length > 0) {
+                sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
+                params.push(...languages);
+              }
+              sql += ' LIMIT 20';
+              const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+              for (const row of rows) {
+                if (!existingIds.has(row.id)) {
+                  results.push({ node: rowToNode(row), score: maxScore });
+                  existingIds.add(row.id);
+                }
+              }
+            }
+          }
+          // Apply multi-signal rescoring (same as FTS path below)
+          if (query) {
+            results = results.map(r => ({
+              ...r,
+              score: r.score
+                + kindBonus(r.node.kind)
+                + scorePathRelevance(r.node.filePath, query)
+                + nameMatchBonus(r.node.name, query),
+            }));
+            results.sort((a, b) => b.score - a.score);
+            if (results.length > limit) results = results.slice(0, limit);
+          }
+          // Apply path/name filters + offset (same as FTS path below)
+          if (pathFilters.length > 0) {
+            const lowered = pathFilters.map((p) => p.toLowerCase());
+            results = results.filter((r) => lowered.some((p) => r.node.filePath.toLowerCase().includes(p)));
+          }
+          if (nameFilters.length > 0) {
+            const lowered = nameFilters.map((n) => n.toLowerCase());
+            results = results.filter((r) => lowered.some((n) => r.node.name.toLowerCase().includes(n)));
+          }
+          if (offset > 0 && results.length > offset) {
+            results = results.slice(offset);
+          }
+          return results;
+        }
+        // If regex found nothing (e.g., invalid pattern), fall through to FTS
+      }
+    }
+
     if (text) {
       results = this.searchNodesFTS(text, { kinds, languages, limit, offset });
       if (results.length === 0 && text.length >= 2) {
@@ -772,7 +837,66 @@ export class QueryBuilder {
   }
 
   /**
-   * Fuzzy fallback: when zero FTS/LIKE hits, try an edit-distance
+   * Detect whether a query string is a regex pattern.
+   * Returns { pattern, flags } if it looks like a regex, or null otherwise.
+   *
+   * Explicit syntax: /pattern/flags
+   * Heuristic: contains regex metacharacters ($, |, [..., (?...)
+   */
+  private isRegexQuery(query: string): { pattern: string; flags: string } | null {
+    // Explicit /pattern/flags syntax
+    const slashMatch = query.match(/^\/(.+)\/([gimsuy]*)$/);
+    if (slashMatch) {
+      return { pattern: slashMatch[1]!, flags: slashMatch[2] || 'i' };
+    }
+    // Heuristic: regex metacharacters that FTS can't handle
+    if (/[|]|[?]\(|\.\*|\.\+|\[.*\]|\(\?:|\$$/.test(query) ||
+        (query.startsWith('^') && query.length > 2)) {
+      return { pattern: query, flags: 'i' };
+    }
+    return null;
+  }
+
+  /**
+   * Regex search: fetch candidates via SQL filters, then JS-side RegExp match on node.name.
+   * Falls back to empty results if the pattern is invalid.
+   */
+  private searchNodesRegex(
+    query: string,
+    spec: { pattern: string; flags: string },
+    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number }
+  ): SearchResult[] {
+    const { kinds, languages, limit } = options;
+    let re: RegExp;
+    try {
+      re = new RegExp(spec.pattern, spec.flags);
+    } catch {
+      return []; // invalid regex — let caller fall back to FTS
+    }
+
+    // Over-fetch candidates from SQL so regex has a broad pool to filter.
+    // Use searchAllByFilters when kinds/languages are set; otherwise scan all.
+    const candidates = this.searchAllByFilters({
+      kinds,
+      languages,
+      limit: limit * 3,
+    });
+
+    const results: SearchResult[] = [];
+    for (const r of candidates) {
+      if (re.test(r.node.name)) {
+        results.push({
+          node: r.node,
+          score: kindBonus(r.node.kind) + nameMatchBonus(r.node.name, query) + scorePathRelevance(r.node.filePath, query),
+        });
+      }
+      if (results.length >= limit) break;
+    }
+    results.sort((a, b) => b.score - a.score);
+    return results;
+  }
+
+  /**
    * sweep over the distinct symbol-name set. Caps `maxDist` at 2 so
    * `getUssr` finds `getUser` but `process` doesn't match `prosody`.
    * Bounded edit distance keeps each comparison cheap; the per-query
