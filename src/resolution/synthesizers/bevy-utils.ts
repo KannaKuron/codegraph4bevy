@@ -201,7 +201,11 @@ export function resolveNode(name: string, file: string, ctx: ResolutionContext):
   const match = fileNodes.find(n => n.name === name);
   if (match) return match;
   const global = ctx.getNodesByName(name);
-  return global.find(n => ['struct', 'class', 'function', 'method'].includes(n.kind)) ?? global[0] ?? null;
+  const result = global.find(n => ['struct', 'class', 'function', 'method'].includes(n.kind)) ?? global[0];
+  if (result) return result;
+  // Fallback: try qualified name lookup for paths like "module::handler"
+  const qualified = ctx.getNodesByQualifiedName(name);
+  return qualified.find(n => ['struct', 'class', 'function', 'method'].includes(n.kind)) ?? qualified[0] ?? null;
 }
 
 // =============================================================================

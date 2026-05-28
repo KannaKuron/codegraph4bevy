@@ -332,6 +332,10 @@ export const tools: ToolDefinition[] = [
           description: '按节点类型过滤。通用别名：`type`=所有类型定义（struct/enum/type_alias/trait/interface/protocol/class）、`variable`=变量和常量。也支持具体类型：struct、enum、enum_member、field、parameter、import、export、type_alias、trait、protocol、namespace、constant、module、file、property、route、component。特殊类型：`comment`（注释搜索）、`macro`（宏调用位置）、`method_call`（方法调用点）。',
           enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'struct', 'enum', 'enum_member', 'field', 'parameter', 'import', 'export', 'type_alias', 'trait', 'protocol', 'namespace', 'constant', 'module', 'file', 'property', 'route', 'component', 'comment', 'macro', 'method_call'],
         },
+        path: {
+          type: 'string',
+          description: '限定搜索此目录下的文件（如 "src/components"）。未指定则搜索全部已索引文件。',
+        },
         referencesType: {
           type: 'string',
           description: '查找引用此类型的所有符号（通过 type_of/references/returns 边）。设置后 query 仅作 fallback。按名称精确/后缀匹配，不支持正则。',
@@ -1141,8 +1145,14 @@ export class ToolHandler {
    * Handle codegraph_search
    */
   private async handleSearch(args: Record<string, unknown>): Promise<ToolResult> {
-    const query = this.validateString(args.query, 'query');
-    if (typeof query !== 'string') return query;
+    const rawQuery = this.validateString(args.query, 'query');
+    if (typeof rawQuery !== 'string') return rawQuery;
+
+    // Inject path filter into query string so it applies to all code paths
+    const pathFilter = args.path as string | undefined;
+    const needsQuoting = pathFilter && /\s/.test(pathFilter);
+    const pathClause = needsQuoting ? `path:"${pathFilter}"` : `path:${pathFilter}`;
+    const query = pathFilter ? `${pathClause} ${rawQuery}` : rawQuery;
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const kind = args.kind as string | undefined;

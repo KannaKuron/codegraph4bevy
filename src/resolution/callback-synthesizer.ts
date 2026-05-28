@@ -869,7 +869,13 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...mybatisEdges,
     ...registeredEdges,
   ]) {
-    const key = `${e.source}>${e.target}>${e.kind}`;
+    // Include type-level metadata in dedup key so generic instantiations
+    // of the same target (e.g. ButtonInput<KeyCode> vs ButtonInput<Key>)
+    // produce separate edges.
+    const typeParam = e.metadata && (e.metadata.resourceType || e.metadata.messageType || e.metadata.stateType);
+    const key = typeParam
+      ? `${e.source}>${e.target}>${e.kind}>${typeParam}`
+      : `${e.source}>${e.target}>${e.kind}`;
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(e);

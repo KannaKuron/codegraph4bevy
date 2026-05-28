@@ -240,15 +240,16 @@ function parseInitResource(
   lineOffset: number,
 ): Edge[] {
   const edges: Edge[] = [];
-  const re = /\.init_resource\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
+  const re = /\.init_resource\s*::\s*<\s*([\p{L}\p{N}_<>,: ]+)\s*>/gu;
   let m: RegExpExecArray | null;
 
   while ((m = re.exec(buildBody))) {
-    const typeName = m[1]!.replace(/\s+/g, '');
-    const resNodes = ctx.getNodesByName(typeName);
+    const fullType = m[1]!.replace(/\s+/g, '');
+    const baseName = fullType.split('<')[0]!;
+    const resNodes = ctx.getNodesByName(baseName);
     for (const rn of resNodes) {
       if (rn.kind !== 'struct' && rn.kind !== 'enum') continue;
-      const key = `${pluginNode.id}>${rn.id}>registers_resource`;
+      const key = `${pluginNode.id}>${rn.id}>registers_resource>${fullType}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
@@ -258,7 +259,7 @@ function parseInitResource(
         kind: 'registers_resource',
         line,
         provenance: 'heuristic',
-        metadata: { synthesizedBy: 'bevy-dsl' },
+        metadata: { synthesizedBy: 'bevy-dsl', resourceType: fullType },
       });
     }
   }
@@ -277,15 +278,16 @@ function parseAddMessage(
   lineOffset: number,
 ): Edge[] {
   const edges: Edge[] = [];
-  const re = /\.add_message\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
+  const re = /\.add_message\s*::\s*<\s*([\p{L}\p{N}_<>,: ]+)\s*>/gu;
   let m: RegExpExecArray | null;
 
   while ((m = re.exec(buildBody))) {
-    const typeName = m[1]!.replace(/\s+/g, '');
-    const msgNodes = ctx.getNodesByName(typeName);
+    const fullType = m[1]!.replace(/\s+/g, '');
+    const baseName = fullType.split('<')[0]!;
+    const msgNodes = ctx.getNodesByName(baseName);
     for (const mn of msgNodes) {
       if (mn.kind !== 'struct' && mn.kind !== 'enum') continue;
-      const key = `${pluginNode.id}>${mn.id}>registers_message`;
+      const key = `${pluginNode.id}>${mn.id}>registers_message>${fullType}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
@@ -295,7 +297,7 @@ function parseAddMessage(
         kind: 'registers_message',
         line,
         provenance: 'heuristic',
-        metadata: { synthesizedBy: 'bevy-dsl' },
+        metadata: { synthesizedBy: 'bevy-dsl', messageType: fullType },
       });
     }
   }
@@ -314,15 +316,16 @@ function parseRegistersState(
   lineOffset: number,
 ): Edge[] {
   const edges: Edge[] = [];
-  const re = /\.(init_state|add_sub_state|add_computed_state|insert_state)\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*(?:\s*<\s*[\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*(?:\s*<\s*[\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)?\s*>)?)\s*>/gu;
+  const re = /\.(init_state|add_sub_state|add_computed_state|insert_state)\s*::\s*<\s*([\p{L}\p{N}_<>,: ]+)\s*>/gu;
   let m: RegExpExecArray | null;
 
   while ((m = re.exec(buildBody))) {
-    const typeName = m[2]!.replace(/\s+/g, '');
-    const stateNodes = ctx.getNodesByName(typeName);
+    const fullType = m[2]!.replace(/\s+/g, '');
+    const baseName = fullType.split('<')[0]!;
+    const stateNodes = ctx.getNodesByName(baseName);
     for (const sn of stateNodes) {
       if (sn.kind !== 'struct' && sn.kind !== 'enum') continue;
-      const key = `${pluginNode.id}>${sn.id}>registers_state`;
+      const key = `${pluginNode.id}>${sn.id}>registers_state>${fullType}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
@@ -332,7 +335,7 @@ function parseRegistersState(
         kind: 'registers_state',
         line,
         provenance: 'heuristic',
-        metadata: { synthesizedBy: 'bevy-dsl', method: m[1] },
+        metadata: { synthesizedBy: 'bevy-dsl', method: m[1], stateType: fullType },
       });
     }
   }
@@ -352,7 +355,7 @@ function parseAddObserver(
   lineOffset: number,
 ): Edge[] {
   const edges: Edge[] = [];
-  const re = /\.add_observer\s*\(/g;
+  const re = /\.(?:add_observer|observe)\s*\(/g;
   let m: RegExpExecArray | null;
 
   while ((m = re.exec(buildBody))) {
@@ -607,16 +610,17 @@ function parseInitNonSend(
   lineOffset: number,
 ): Edge[] {
   const edges: Edge[] = [];
-  const re = /\.(?:init_non_send|insert_non_send)\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
+  const re = /\.(?:init_non_send|insert_non_send)\s*::\s*<\s*([\p{L}\p{N}_<>,: ]+)\s*>/gu;
   let m: RegExpExecArray | null;
 
   while ((m = re.exec(buildBody))) {
-    const typeName = m[1]!.replace(/\s+/g, '');
-    const shortName = typeName.split('::').pop() ?? typeName;
+    const fullType = m[1]!.replace(/\s+/g, '');
+    const baseName = fullType.split('<')[0]!;
+    const shortName = baseName.split('::').pop() ?? baseName;
     const resNodes = ctx.getNodesByName(shortName);
     for (const rn of resNodes) {
       if (rn.kind !== 'struct' && rn.kind !== 'enum') continue;
-      const key = `${pluginNode.id}>${rn.id}>registers_non_send`;
+      const key = `${pluginNode.id}>${rn.id}>registers_non_send>${fullType}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
@@ -626,7 +630,7 @@ function parseInitNonSend(
         kind: 'registers_non_send',
         line,
         provenance: 'heuristic',
-        metadata: { synthesizedBy: 'bevy-dsl' },
+        metadata: { synthesizedBy: 'bevy-dsl', resourceType: fullType },
       });
     }
   }
