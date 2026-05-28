@@ -42,6 +42,69 @@ export function bevySynthEdgeNote(
       registeredAt,
     };
   }
+  if (m?.synthesizedBy === 'bevy-dsl') {
+    const plugin = typeof m.plugin === 'string' ? ` by ${m.plugin}` : '';
+    const schedule = typeof m.schedule === 'string' ? m.schedule : undefined;
+    switch (edge.kind) {
+      case 'on_transition': {
+        const from = typeof m.transitionFrom === 'string' ? m.transitionFrom : '?';
+        const to = typeof m.transitionTo === 'string' ? m.transitionTo : '?';
+        return {
+          label: `Bevy state transition — OnTransition<${from}, ${to}> system trigger${plugin} (dynamic dispatch)`,
+          compact: `dynamic: OnTransition<${from}, ${to}>${plugin}${at}`,
+          registeredAt,
+        };
+      }
+      case 'on_enter':
+        return {
+          label: `Bevy state enter — system runs on state change${plugin} (dynamic dispatch)`,
+          compact: `dynamic: OnEnter${plugin}${at}`,
+          registeredAt,
+        };
+      case 'on_exit':
+        return {
+          label: `Bevy state exit — system runs on state change${plugin} (dynamic dispatch)`,
+          compact: `dynamic: OnExit${plugin}${at}`,
+          registeredAt,
+        };
+      case 'runs_in':
+        return {
+          label: `Bevy schedule — system runs in ${schedule ?? 'unknown'}${plugin} (dynamic dispatch)`,
+          compact: `dynamic: runs in ${schedule ?? 'unknown'}${plugin}${at}`,
+          registeredAt,
+        };
+      case 'registers_system':
+        return {
+          label: `Bevy system registration — plugin registers system for ${schedule ?? 'unknown'} (dynamic dispatch)`,
+          compact: `dynamic: system for ${schedule ?? 'unknown'}${at}`,
+          registeredAt,
+        };
+      case 'registers_resource':
+        return {
+          label: `Bevy resource — plugin registers resource (dynamic dispatch)`,
+          compact: `dynamic: register resource${at}`,
+          registeredAt,
+        };
+      case 'registers_message':
+        return {
+          label: `Bevy message — plugin registers event/message (dynamic dispatch)`,
+          compact: `dynamic: register message${at}`,
+          registeredAt,
+        };
+      case 'contains_plugin':
+        return {
+          label: `Bevy plugin group — contains plugin (dynamic dispatch)`,
+          compact: `dynamic: contains plugin${at}`,
+          registeredAt,
+        };
+      default:
+        return {
+          label: `Bevy DSL — ${edge.kind}${plugin} (dynamic dispatch)`,
+          compact: `dynamic: ${edge.kind}${plugin}${at}`,
+          registeredAt,
+        };
+    }
+  }
   return null;
 }
 
@@ -97,7 +160,7 @@ export function classifyMutability(signature: string | undefined | null, typeNam
 // Bevy edge risk classification
 // =============================================================================
 
-const BEVY_HIGH_RISK_KINDS = new Set(['on_enter', 'on_exit']);
+const BEVY_HIGH_RISK_KINDS = new Set(['on_enter', 'on_exit', 'on_transition']);
 const BEVY_MEDIUM_RISK_KINDS = new Set([
   'runs_in', 'registers_resource', 'registers_message',
   'contains_plugin', 'registers_system',

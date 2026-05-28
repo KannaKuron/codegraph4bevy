@@ -2889,7 +2889,7 @@ export class TreeSitterExtractor {
         // Let the language hook decide the edge kind (e.g. Rust uses 'type_of'
         // inside turbofish type arguments). Default to 'references'.
         const hookResult = this.extractor?.resolveTypeRefKind?.(insideTypeArgs);
-        const kind = hookResult ?? 'references';
+        const kind = hookResult ?? (insideTypeArgs ? 'type_of' : 'references');
         this.unresolvedReferences.push({
           fromNodeId,
           referenceName: typeName,

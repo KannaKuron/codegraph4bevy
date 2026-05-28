@@ -208,7 +208,8 @@ interface Hprops {
 `;
     const result = extractFromSource('HeaderFilter.ts', code);
 
-    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    // IPage/IOrderField inside Partial<> are type argument positions → type_of
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'type_of');
     expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
     expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });

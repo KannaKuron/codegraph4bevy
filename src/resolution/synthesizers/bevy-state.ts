@@ -353,7 +353,7 @@ export function bevyStateEdges(ctx: ResolutionContext): Edge[] {
         const consumerId = consumerKey.split('\0')[0]!;
         if (producerId === consumerId) continue;
         if (pInfo.full !== stateKey && cInfo.full !== stateKey && pInfo.full !== cInfo.full) continue;
-        const dedupKey = `${producerId}>${consumerId}`;
+        const dedupKey = `${producerId}>${consumerId}>calls`;
         if (seen.has(dedupKey)) continue;
         seen.add(dedupKey);
         edges.push({
@@ -420,7 +420,7 @@ export function bevyStateEdges(ctx: ResolutionContext): Edge[] {
       for (const [producerKey, pInfo] of sourceProducers) {
         if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
         const producerId = producerKey.split('\0')[0]!;
-        const dedupKey = `${producerId}>${computedNode.id}`;
+        const dedupKey = `${producerId}>${computedNode.id}>calls`;
         if (seen.has(dedupKey)) continue;
         seen.add(dedupKey);
         edges.push({
@@ -445,7 +445,7 @@ export function bevyStateEdges(ctx: ResolutionContext): Edge[] {
           if (cInfo.full !== computedName && !cInfo.full.startsWith(computedName + '::')) continue;
           if (perSourceCount >= MAX_COMPUTED_PER_SOURCE || globalComputedCount >= GLOBAL_COMPUTED_CAP) break;
           const consumerId = consumerKey.split('\0')[0]!;
-          const dedupKey = `${computedNode.id}>${consumerId}`;
+          const dedupKey = `${computedNode.id}>${consumerId}>calls`;
           if (seen.has(dedupKey)) continue;
           seen.add(dedupKey);
           edges.push({

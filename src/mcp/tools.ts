@@ -3348,11 +3348,20 @@ export class ToolHandler {
     // "/", "./" or "\". Normalize all of those before matching so the agent
     // gets results instead of falling back to Read/Glob (see #426).
     const normalizedFilter = pathFilter
-      ? pathFilter
-          .replace(/\\/g, '/')
-          .replace(/^(?:\.?\/+)+/, '')
-          .replace(/^\.$/, '')
-          .replace(/\/+$/, '')
+      ? (() => {
+          let p = pathFilter
+            .replace(/\\/g, '/')
+            .replace(/^(?:\.?\/+)+/, '')
+            .replace(/^\.$/, '')
+            .replace(/\/+$/, '');
+          const parts = p.split('/');
+          const resolved: string[] = [];
+          for (const seg of parts) {
+            if (seg === '..') { if (resolved.length > 0) resolved.pop(); }
+            else if (seg !== '.') { resolved.push(seg); }
+          }
+          return resolved.join('/');
+        })()
       : '';
     let files = normalizedFilter
       ? allFiles.filter(f => f.path === normalizedFilter || f.path.startsWith(normalizedFilter + '/'))
@@ -3985,6 +3994,7 @@ export class ToolHandler {
       case 'returns':
         return 'low';
       default:
+        console.warn(`[CodeGraph] classifyEdgeRisk: unhandled EdgeKind "${kind}", defaulting to 'low'`);
         return 'low';
     }
   }

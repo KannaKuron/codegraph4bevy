@@ -107,26 +107,37 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   // Step 2: install the codegraph npm package on PATH (always offered;
   // matches existing behavior). Skipped when --yes (assume present).
   if (!useDefaults) {
-    const shouldInstallGlobally = await clack.confirm({
-      message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
-      initialValue: true,
-    });
-    if (clack.isCancel(shouldInstallGlobally)) {
-      clack.cancel('Installation cancelled.');
-      process.exit(0);
-    }
-    if (shouldInstallGlobally) {
-      const s = clack.spinner();
-      s.start('Installing codegraph CLI...');
-      try {
-        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe' });
-        s.stop('Installed codegraph CLI on PATH');
-      } catch {
-        s.stop('Could not install (permission denied)');
-        clack.log.warn('Try: sudo npm install -g @colbymchenry/codegraph');
-      }
+    // Check if codegraph is already on PATH (e.g. from a prior npm link)
+    let alreadyOnPath = false;
+    try {
+      execSync('which codegraph', { stdio: 'pipe' });
+      alreadyOnPath = true;
+    } catch { /* not found */ }
+
+    if (alreadyOnPath) {
+      clack.log.success('codegraph CLI already on PATH');
     } else {
-      clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
+      const shouldInstallGlobally = await clack.confirm({
+        message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
+        initialValue: true,
+      });
+      if (clack.isCancel(shouldInstallGlobally)) {
+        clack.cancel('Installation cancelled.');
+        process.exit(0);
+      }
+      if (shouldInstallGlobally) {
+        const s = clack.spinner();
+        s.start('Installing codegraph CLI...');
+        try {
+          execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', timeout: 120_000 });
+          s.stop('Installed codegraph CLI on PATH');
+        } catch {
+          s.stop('Could not install');
+          clack.log.warn('Try: npm run build && npm link');
+        }
+      } else {
+        clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
+      }
     }
   }
 

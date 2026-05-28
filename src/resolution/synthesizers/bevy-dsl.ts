@@ -30,9 +30,9 @@ function parseAddSystems(
   lineOffset: number,
   ctx: ResolutionContext,
   seen: Set<string>,
-  queries: QueryBuilder,
-): Edge[] {
+): { edges: Edge[]; syntheticNodes: Node[] } {
   const edges: Edge[] = [];
+  const syntheticNodes: Node[] = [];
   const re = /\.add_systems\s*\(/g;
   let m: RegExpExecArray | null;
 
@@ -74,7 +74,7 @@ function parseAddSystems(
         const handlerNode = resolveNode(hName, file, ctx);
         if (!handlerNode) continue;
 
-        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleArg}`;
+        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleArg.replace(/\s+/g, '')}`;
         if (!seen.has(rsKey)) {
           seen.add(rsKey);
           const rsLine = lineOffset + buildBody.slice(0, m.index).split('\n').length;
@@ -123,7 +123,7 @@ function parseAddSystems(
         const handlerNode = resolveNode(hName, file, ctx);
         if (!handlerNode) continue;
 
-        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleArg}`;
+        const rsKey = `${pluginNode.id}>${handlerNode.id}>registers_system>${scheduleArg.replace(/\s+/g, '')}`;
         if (!seen.has(rsKey)) {
           seen.add(rsKey);
           const rsLine = lineOffset + buildBody.slice(0, m.index).split('\n').length;
@@ -171,19 +171,17 @@ function parseAddSystems(
       scheduleName = WELL_KNOWN_SCHEDULES.has(sched) ? sched : scheduleArg;
 
       const schedNodeId = `bevy-schedule-${scheduleName}`;
-      try {
-        queries.insertNodes([{
-          id: schedNodeId,
-          name: scheduleName,
-          kind: 'variable',
-          qualifiedName: scheduleName,
-          filePath: pluginNode.filePath,
-          language: 'rust',
-          startLine: 0, endLine: 0,
-          startColumn: 0, endColumn: 0,
-          updatedAt: Date.now(),
-        }]);
-      } catch { /* node already exists or insert failed — safe to ignore */ }
+      syntheticNodes.push({
+        id: schedNodeId,
+        name: scheduleName,
+        kind: 'variable',
+        qualifiedName: scheduleName,
+        filePath: pluginNode.filePath,
+        language: 'rust',
+        startLine: 0, endLine: 0,
+        startColumn: 0, endColumn: 0,
+        updatedAt: Date.now(),
+      });
 
       const handlerNames = parseHandlerNames(handlerArg);
       for (const hName of handlerNames) {
@@ -219,7 +217,7 @@ function parseAddSystems(
       }
     }
   }
-  return edges;
+  return { edges, syntheticNodes };
 }
 
 // =============================================================================
@@ -344,6 +342,7 @@ function parsePluginGroupBuild(
 
 export function bevyDslEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
+  const allSyntheticNodes: Node[] = [];
   const seen = new Set<string>();
 
   const IMPL_RE = /impl\s+(Plugin(?:Group)?)\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)/gu;
@@ -381,7 +380,9 @@ export function bevyDslEdges(queries: QueryBuilder, ctx: ResolutionContext): Edg
         const lineOffset = implStartLine + buildStartLine - 1;
 
         if (traitName === 'Plugin') {
-          edges.push(...parseAddSystems(buildBody, structNode, file, lineOffset, ctx, seen, queries));
+          const addSystemsResult = parseAddSystems(buildBody, structNode, file, lineOffset, ctx, seen);
+          edges.push(...addSystemsResult.edges);
+          allSyntheticNodes.push(...addSystemsResult.syntheticNodes);
           edges.push(...parseInitResource(buildBody, structNode, ctx, seen, lineOffset));
           edges.push(...parseAddMessage(buildBody, structNode, ctx, seen, lineOffset));
         } else {
@@ -389,6 +390,10 @@ export function bevyDslEdges(queries: QueryBuilder, ctx: ResolutionContext): Edg
         }
       }
     }
+  }
+
+  if (allSyntheticNodes.length > 0) {
+    try { queries.insertNodes(allSyntheticNodes); } catch { /* duplicates — safe to ignore */ }
   }
 
   return edges;

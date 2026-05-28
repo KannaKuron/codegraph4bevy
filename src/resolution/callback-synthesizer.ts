@@ -844,7 +844,14 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const mybatisEdges = mybatisJavaXmlEdges(queries);
 
   // Registered synthesizers (fork extensions)
-  const registeredEdges = synthesizerRegistry.flatMap(fn => fn(queries, ctx));
+  const registeredEdges = synthesizerRegistry.flatMap(fn => {
+    try {
+      return fn(queries, ctx);
+    } catch (err) {
+      console.warn(`[CodeGraph] Registered synthesizer threw: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+  });
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -862,7 +869,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...mybatisEdges,
     ...registeredEdges,
   ]) {
-    const key = `${e.source}>${e.target}`;
+    const key = `${e.source}>${e.target}>${e.kind}`;
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(e);

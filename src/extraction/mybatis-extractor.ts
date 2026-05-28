@@ -95,12 +95,13 @@ export class MyBatisExtractor {
     const open = /<mapper\b([^>]*)>/.exec(this.source);
     if (!open) return null;
     const attrs = open[1] ?? '';
-    const nsMatch = /\bnamespace\s*=\s*"([^"]+)"/.exec(attrs);
+    const nsMatch = /\bnamespace\s*=\s*(?:"([^"]+)"|'([^']+)')/.exec(attrs);
     if (!nsMatch) return null;
+    const namespace = nsMatch[1] ?? nsMatch[2]!;
     const bodyStart = open.index + open[0].length;
     const closeIdx = this.source.indexOf('</mapper>', bodyStart);
     const bodyEnd = closeIdx >= 0 ? closeIdx : this.source.length;
-    return { namespace: nsMatch[1]!, bodyStart, bodyEnd };
+    return { namespace, bodyStart, bodyEnd };
   }
 
   private extractMapper(fileNodeId: string, namespace: string, bodyStart: number, bodyEnd: number): void {
@@ -115,9 +116,9 @@ export class MyBatisExtractor {
       const elemType = m[1]!;
       const attrs = m[2] ?? '';
       const elemBody = m[3] ?? '';
-      const idMatch = /\bid\s*=\s*"([^"]+)"/.exec(attrs);
+      const idMatch = /\bid\s*=\s*(?:"([^"]+)"|'([^']+)')/.exec(attrs);
       if (!idMatch) continue;
-      const id = idMatch[1]!;
+      const id = idMatch[1] ?? idMatch[2]!;
       const absoluteIndex = bodyStart + m.index;
       const startLine = this.getLineNumber(absoluteIndex);
       const endLine = this.getLineNumber(absoluteIndex + m[0].length);
@@ -144,10 +145,10 @@ export class MyBatisExtractor {
 
       // <include refid="X"/> → reference to the SQL fragment in this mapper
       // (or in another mapper, when the refid is qualified — `ns.X`).
-      const includeRegex = /<include\b[^>]*\brefid\s*=\s*"([^"]+)"/g;
+      const includeRegex = /<include\b[^>]*\brefid\s*=\s*(?:"([^"]+)"|'([^']+)')/g;
       let inc: RegExpExecArray | null;
       while ((inc = includeRegex.exec(elemBody)) !== null) {
-        const refid = inc[1]!;
+        const refid = inc[1] ?? inc[2]!;
         const refQualified = refid.includes('.') ? refid.replace(/\./g, '::') : `${namespace}::${refid}`;
         const includeOffset = absoluteIndex + (m[0].length - m[3]!.length - `</${elemType}>`.length) + inc.index;
         const line = this.getLineNumber(includeOffset);
@@ -165,11 +166,13 @@ export class MyBatisExtractor {
   private buildSignature(elemType: string, attrs: string, isSqlFragment: boolean): string {
     if (isSqlFragment) return '<sql>';
     const verb = elemType.toUpperCase();
-    const result = /\bresultType\s*=\s*"([^"]+)"/.exec(attrs)?.[1];
-    const param = /\bparameterType\s*=\s*"([^"]+)"/.exec(attrs)?.[1];
+    const result = /\bresultType\s*=\s*(?:"([^"]+)"|'([^']+)')/.exec(attrs);
+    const resultType = result ? (result[1] ?? result[2]) : undefined;
+    const param = /\bparameterType\s*=\s*(?:"([^"]+)"|'([^']+)')/.exec(attrs);
+    const paramType = param ? (param[1] ?? param[2]) : undefined;
     const parts = [verb];
-    if (param) parts.push(`param=${param}`);
-    if (result) parts.push(`result=${result}`);
+    if (paramType) parts.push(`param=${paramType}`);
+    if (resultType) parts.push(`result=${resultType}`);
     return parts.join(' ');
   }
 

@@ -85,6 +85,46 @@ export function stripRustComments(src: string): string {
         }
         if (i < src.length) { result += ' '; i++; }
       }
+    } else if (src[i] === 'b' && src[i + 1] === 'r' && (src[i + 2] === '#' || src[i + 2] === '"')) {
+      // byte raw string br#"…"# or br"…"
+      if (src[i + 2] === '#') {
+        let hashes = 0;
+        let j = i + 2;
+        while (j < src.length && src[j] === '#') { hashes++; j++; }
+        if (j < src.length && src[j] === '"') {
+          j++;
+          const closing = '"' + '#'.repeat(hashes);
+          const end = src.indexOf(closing, j);
+          if (end >= 0) {
+            for (let k = i; k < end + closing.length; k++) {
+              result += src[k] === '\n' ? '\n' : ' ';
+            }
+            i = end + closing.length;
+          } else {
+            for (let k = i; k < src.length; k++) {
+              result += src[k] === '\n' ? '\n' : ' ';
+            }
+            i = src.length;
+          }
+        } else {
+          result += src[i]; i++;
+        }
+      } else {
+        // br"…"
+        let j = i + 3;
+        const end = src.indexOf('"', j);
+        if (end >= 0) {
+          for (let k = i; k <= end; k++) {
+            result += src[k] === '\n' ? '\n' : ' ';
+          }
+          i = end + 1;
+        } else {
+          for (let k = i; k < src.length; k++) {
+            result += src[k] === '\n' ? '\n' : ' ';
+          }
+          i = src.length;
+        }
+      }
     } else if (src[i] === 'r') {
       if (src[i + 1] === '#') {
         let hashes = 0;
@@ -161,7 +201,7 @@ export function resolveNode(name: string, file: string, ctx: ResolutionContext):
   const match = fileNodes.find(n => n.name === name);
   if (match) return match;
   const global = ctx.getNodesByName(name);
-  return global.find(n => n.kind === 'struct' || n.kind === 'class') ?? global[0] ?? null;
+  return global.find(n => ['struct', 'class', 'function', 'method'].includes(n.kind)) ?? global[0] ?? null;
 }
 
 // =============================================================================

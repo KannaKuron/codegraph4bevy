@@ -381,7 +381,14 @@ function extractSpringConfig(
       let inStr: string | null = null;
       for (let j = 0; j < raw.length; j++) {
         const ch = raw[j];
-        if (inStr) { if (ch === inStr && raw[j - 1] !== '\\') inStr = null; continue; }
+        if (inStr) {
+          if (ch === inStr) {
+            let bs = 0;
+            for (let k = j - 1; k >= 0 && raw[k] === '\\'; k--) bs++;
+            if (bs % 2 === 0) inStr = null;
+          }
+          continue;
+        }
         if (ch === '"' || ch === "'") { inStr = ch; continue; }
         if (ch === ':') return j;
       }
@@ -394,6 +401,8 @@ function extractSpringConfig(
     while (stack.length > 0 && stack[stack.length - 1]!.indent >= indent) stack.pop();
     const dotted = [...stack.map((s) => s.key), key].join('.');
     if (after === '' || after.startsWith('#')) {
+      stack.push({ indent, key });
+    } else if (/^[|>][+-]?\d*$/.test(after)) {
       stack.push({ indent, key });
     } else {
       // A leaf with an inline value (or a flow-mapping like `{ a: 1 }` — we
@@ -416,7 +425,7 @@ function extractSpringValueBindings(
   nodes: Node[],
   references: UnresolvedRef[],
 ): void {
-  const valueRe = /@Value\s*\(\s*["']\$\{([^}:]+)(?::[^}]*)?\}["']\s*\)/g;
+  const valueRe = /@Value\s*\(\s*["']\$\{([^}:]+)(?::[^"']*?)?\}["']\s*\)/g;
   let m: RegExpExecArray | null;
   while ((m = valueRe.exec(safe)) !== null) {
     const key = m[1]!.trim();

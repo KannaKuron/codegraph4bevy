@@ -127,6 +127,8 @@ export function resolveReceiverType(
   }
 
   // Tier 2: Generalized external symbol lookup by method name
+  // TODO: types[0] is non-deterministic for common method names (get, insert, etc.)
+  // and may return wrong types across crates. Needs crate/file proximity scoring.
   if (methodName) {
     const types = queries.findTypesByMethod(methodName);
     if (types.length > 0) return types[0]!.symbolName;
