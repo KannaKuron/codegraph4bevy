@@ -13,7 +13,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, EdgeKind, UnresolvedReference } from '../types';
-import { bevySynthEdgeNote, formatSchedule, classifyMutability, classifyBevyEdgeRisk } from './bevy-formatters';
+import { bevySynthEdgeNote, formatSchedule, classifyMutability, classifyBevyEdgeRisk, isBevyPluginStruct, formatBevyWidgetOverview } from './bevy-formatters';
 import { createHash } from 'crypto';
 import {
   constants as fsConstants,
@@ -319,7 +319,7 @@ const projectPathProperty: PropertySchema = {
 export const tools: ToolDefinition[] = [
   {
     name: 'codegraph_search',
-    description: '按名称快速搜索符号。只返回位置（不含源码）。支持正则（/pattern/flags 或含 $| 等元字符自动检测）。需要全面的任务上下文时用 codegraph_context。',
+    description: '按名称快速搜索符号。只返回位置（不含源码）。支持正则（/pattern/flags 或含 $| 等元字符自动检测）。offset 翻页，返回 total 总数。需要全面的任务上下文时用 codegraph_context。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -329,12 +329,12 @@ export const tools: ToolDefinition[] = [
         },
         kind: {
           type: 'string',
-          description: '按节点类型过滤。通用别名：`type`=所有类型定义（struct/enum/type_alias/trait/interface/protocol/class）、`variable`=变量和常量。也支持具体类型：struct、enum、enum_member、field、parameter、import、export、type_alias、trait、protocol、namespace、constant、module、file、property。',
+          description: '按节点类型过滤。通用别名：`type`=所有类型定义（struct/enum/type_alias/trait/interface/protocol/class）、`variable`=变量和常量。也支持具体类型：struct、enum、enum_member、field、parameter、import、export、type_alias、trait、protocol、namespace、constant、module、file、property、route、component。特殊类型：`comment`（注释搜索）、`macro`（宏调用位置）、`method_call`（方法调用点）。',
           enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'struct', 'enum', 'enum_member', 'field', 'parameter', 'import', 'export', 'type_alias', 'trait', 'protocol', 'namespace', 'constant', 'module', 'file', 'property', 'route', 'component', 'comment', 'macro', 'method_call'],
         },
         referencesType: {
           type: 'string',
-          description: '查找引用此类型的所有符号（通过 type_of/references/returns 边）。设置后 query 仅作 fallback。',
+          description: '查找引用此类型的所有符号（通过 type_of/references/returns 边）。设置后 query 仅作 fallback。按名称精确/后缀匹配，不支持正则。',
         },
         mutability: {
           type: 'string',
@@ -343,7 +343,7 @@ export const tools: ToolDefinition[] = [
         },
         impl_for: {
           type: 'string',
-          description: '查找实现指定 trait/interface 的所有类型（通过 implements 边或未解析引用）。设置后 query 仅作 fallback。',
+          description: '查找实现指定 trait/interface 的所有类型（通过 implements 边或未解析引用）。设置后 query 仅作 fallback。按名称精确/后缀匹配，不支持正则。',
         },
         limit: {
           type: 'number',
@@ -402,8 +402,8 @@ export const tools: ToolDefinition[] = [
         },
         kind: {
           type: 'string',
-          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。通用类型："references"、"type_of"、"pattern_match"、"instantiates"、"contains"。Bevy 特定类型使用 bevy: 前缀：bevy:runs_in、bevy:on_enter、bevy:on_exit、bevy:on_transition、bevy:registers_system、bevy:registers_resource、bevy:registers_message、bevy:registers_state、bevy:contains_plugin。',
-          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'all', 'bevy:runs_in', 'bevy:on_enter', 'bevy:on_exit', 'bevy:on_transition', 'bevy:registers_system', 'bevy:registers_resource', 'bevy:registers_message', 'bevy:registers_state', 'bevy:contains_plugin'],
+          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。通用类型："references"、"type_of"、"pattern_match"、"instantiates"、"contains"。Bevy 特定类型使用 bevy: 前缀：bevy:runs_in、bevy:on_enter、bevy:on_exit、bevy:on_transition、bevy:registers_system、bevy:registers_resource、bevy:registers_message、bevy:registers_state、bevy:registers_observer、bevy:contains_plugin、bevy:configures_set、bevy:registers_type、bevy:registers_non_send。',
+          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'all', 'bevy:runs_in', 'bevy:on_enter', 'bevy:on_exit', 'bevy:on_transition', 'bevy:registers_system', 'bevy:registers_resource', 'bevy:registers_message', 'bevy:registers_state', 'bevy:registers_observer', 'bevy:contains_plugin', 'bevy:configures_set', 'bevy:registers_type', 'bevy:registers_non_send'],
         },
         mutability: {
           type: 'string',
@@ -431,7 +431,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callees',
-    description: '查找指定符号调用的所有函数/方法。返回调用点行号和单行源码片段。include_external 显示对项目外符号的调用（框架 API、第三方库、标准库宏等）。支持 symbols 数组批量查询。',
+    description: '查找指定符号调用的所有函数/方法。返回调用点行号和单行源码片段。include_external 显示对项目外符号的调用（框架 API、第三方库、标准库宏等）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -505,7 +505,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_node',
-    description: '获取一个符号的详情（位置、签名、文档）及上下游 — 调用什么、被谁调用，各带 file:line。includeCode=true 返回函数体/成员概览源码。用于逐跳遍历调用图。批量总览用 codegraph_explore，深入具体路径用 node。返回的源码与 Read 逐字节一致。',
+    description: '获取一个符号的详情（位置、签名、文档）及上下游 — 调用什么、被谁调用，各带 file:line。includeCode=true 返回函数体/成员概览源码。用于逐跳遍历调用图。批量总览用 codegraph_explore，深入具体路径用 node。支持 symbols 数组批量查询。返回的源码与 Read 逐字节一致。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2056,6 +2056,67 @@ export class ToolHandler {
     const lines: string[] = [`## Symbol Info: "${symbol}"`, ''];
 
     for (const node of allMatches.nodes) {
+      // Issue #9: Bevy Plugin struct → structured widget overview
+      if (isBevyPluginStruct(cg, node)) {
+        const widgetOverview = formatBevyWidgetOverview(cg, node);
+        if (widgetOverview) {
+          lines.push(widgetOverview);
+          lines.push('');
+          // Supplement with incoming edges and impact radius
+          const incoming = cg.getIncomingEdges(node.id);
+          const inByKind = new Map<string, Edge[]>();
+          for (const e of incoming) {
+            const arr = inByKind.get(e.kind) || [];
+            arr.push(e);
+            inByKind.set(e.kind, arr);
+          }
+          if (inByKind.size > 0) {
+            lines.push('#### 引用者 (Incoming Edges)');
+            for (const [kind, edges] of inByKind) {
+              lines.push(`- ${kind}: ${edges.length}`);
+            }
+            lines.push('');
+          }
+          const impact = cg.getImpactRadius(node.id, 2);
+          const rootSet = new Set(impact.roots);
+          let l1 = 0, l2 = 0, l3 = 0;
+          const dist = new Map<string, number>();
+          const queue: string[] = [];
+          for (const rootId of impact.roots) {
+            dist.set(rootId, 0);
+            queue.push(rootId);
+          }
+          const adj = new Map<string, string[]>();
+          for (const e of impact.edges) {
+            if (e.kind === 'contains') continue;
+            const targets = adj.get(e.target) || [];
+            targets.push(e.source);
+            adj.set(e.target, targets);
+          }
+          for (let h = 0; h < queue.length; h++) {
+            const cur = queue[h]!;
+            const curDist = dist.get(cur)!;
+            const sources = adj.get(cur) || [];
+            for (const src of sources) {
+              if (!dist.has(src)) {
+                dist.set(src, curDist + 1);
+                queue.push(src);
+              }
+            }
+          }
+          for (const n of impact.nodes.values()) {
+            if (n.kind === 'file' || rootSet.has(n.id)) continue;
+            const d = dist.get(n.id) ?? 99;
+            if (d <= 1) l1++;
+            else if (d <= 2) l2++;
+            else l3++;
+          }
+          lines.push(`- **影响半径**: ${impact.nodes.size} nodes, L1=${l1}, L2=${l2}, L3=${l3}`);
+          lines.push('');
+          continue;
+        }
+      }
+
       lines.push(`### ${node.name} (${node.kind})`);
       lines.push(`- **定义**: ${node.filePath}:${node.startLine}`);
       if (node.signature) lines.push(`- **签名**: \`${node.signature}\``);

@@ -2251,3 +2251,1153 @@ describe('Bevy ECS state transition synthesis', () => {
     cg.close();
   });
 });
+
+describe('Bevy DSL observer registration synthesis', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('simple fn reference creates registers_observer edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-obs-simple-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'fn on_click(trigger: Trigger<ClickEvent>) {\n' +
+        '    // handle click\n' +
+        '}\n' +
+        '\n' +
+        'struct ClickEvent;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_observer(on_click);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const on_click = plugins.find((n) => n.name === 'on_click') ?? cg.getNodesByKind('function').find((n) => n.name === 'on_click');
+    expect(myPlugin).toBeDefined();
+    expect(on_click).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regObs = edges.find((e) => e.target === on_click!.id && e.kind === 'registers_observer');
+    expect(regObs, 'MyPlugin should have registers_observer edge to on_click').toBeDefined();
+    expect(regObs!.provenance).toBe('heuristic');
+    expect((regObs!.metadata as Record<string, unknown>)?.synthesizedBy).toBe('bevy-dsl');
+
+    cg.close();
+  });
+
+  it('chained add_observer creates multiple edges', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-obs-chain-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'fn on_click_a(trigger: Trigger<Click>) {}\n' +
+        'fn on_click_b(trigger: Trigger<Click>) {}\n' +
+        '\n' +
+        'struct Click;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_observer(on_click_a).add_observer(on_click_b);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const on_click_a = cg.getNodesByKind('function').find((n) => n.name === 'on_click_a');
+    const on_click_b = cg.getNodesByKind('function').find((n) => n.name === 'on_click_b');
+    expect(myPlugin).toBeDefined();
+    expect(on_click_a).toBeDefined();
+    expect(on_click_b).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const aEdge = edges.find((e) => e.target === on_click_a!.id && e.kind === 'registers_observer');
+    const bEdge = edges.find((e) => e.target === on_click_b!.id && e.kind === 'registers_observer');
+    expect(aEdge, 'chained — first observer should have edge').toBeDefined();
+    expect(bEdge, 'chained — second observer should have edge').toBeDefined();
+
+    cg.close();
+  });
+
+  it('closure handler is skipped (no graph node)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-obs-closure-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_observer(|trigger: Trigger<Click>| {\n' +
+        '            info!("clicked");\n' +
+        '        });\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    expect(myPlugin).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regObs = edges.filter((e) => e.kind === 'registers_observer');
+    expect(regObs.length, 'closure should produce no registers_observer edge').toBe(0);
+
+    cg.close();
+  });
+
+  it('turbofish factory resolves to function node', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-obs-turbo-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'fn make_observer<T: Event>(trigger: Trigger<T>) {}\n' +
+        '\n' +
+        'struct ClickEvent;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_observer(make_observer::<ClickEvent>());\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const make_observer = cg.getNodesByKind('function').find((n) => n.name === 'make_observer');
+    expect(myPlugin).toBeDefined();
+    expect(make_observer).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regObs = edges.find((e) => e.target === make_observer!.id && e.kind === 'registers_observer');
+    expect(regObs, 'turbofish factory should resolve to make_observer').toBeDefined();
+    expect(regObs!.provenance).toBe('heuristic');
+
+    cg.close();
+  });
+});
+
+describe('Bevy ECS observer trigger dataflow', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('commands.trigger(Event) → observer handler with Trigger<Event>', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-obs-flow-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct DamageEvent { amount: u32 }\n' +
+        '\n' +
+        'fn attack_system(mut commands: Commands) {\n' +
+        '    commands.trigger(DamageEvent { amount: 10 });\n' +
+        '}\n' +
+        '\n' +
+        'fn on_damage(trigger: Trigger<DamageEvent>) {\n' +
+        '    info!("took damage");\n' +
+        '}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(Update, attack_system);\n' +
+        '        app.add_observer(on_damage);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const attack_system = cg.getNodesByKind('function').find((n) => n.name === 'attack_system');
+    const on_damage = cg.getNodesByKind('function').find((n) => n.name === 'on_damage');
+    expect(attack_system).toBeDefined();
+    expect(on_damage).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(attack_system!.id);
+    const dataflow = edges.find(
+      (e) => e.target === on_damage!.id && e.kind === 'calls' && e.provenance === 'heuristic',
+    );
+    expect(dataflow, 'attack_system should have synthesized calls edge to on_damage').toBeDefined();
+    const meta = dataflow!.metadata as Record<string, unknown>;
+    expect(meta?.synthesizedBy).toBe('bevy-ecs-observer');
+
+    cg.close();
+  });
+
+  it('no edge when event types differ', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-obs-nomatch-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct EventA;\n' +
+        'struct EventB;\n' +
+        '\n' +
+        'fn producer(mut commands: Commands) {\n' +
+        '    commands.trigger(EventA);\n' +
+        '}\n' +
+        '\n' +
+        'fn consumer(trigger: Trigger<EventB>) {}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(Update, producer);\n' +
+        '        app.add_observer(consumer);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const producer = cg.getNodesByKind('function').find((n) => n.name === 'producer');
+    const consumer = cg.getNodesByKind('function').find((n) => n.name === 'consumer');
+    expect(producer).toBeDefined();
+    expect(consumer).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(producer!.id);
+    const syntheticCalls = edges.filter(
+      (e) =>
+        e.kind === 'calls' &&
+        e.provenance === 'heuristic' &&
+        (e.metadata as Record<string, unknown>)?.synthesizedBy === 'bevy-ecs-observer',
+    );
+    expect(syntheticCalls.length, 'different event types should not produce edge').toBe(0);
+
+    cg.close();
+  });
+
+  it('world.trigger() also detected as producer', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-obs-world-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct MyEvent;\n' +
+        '\n' +
+        'fn producer(world: &mut World) {\n' +
+        '    world.trigger(MyEvent);\n' +
+        '}\n' +
+        '\n' +
+        'fn consumer(trigger: Trigger<MyEvent>) {}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_observer(consumer);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const producer = cg.getNodesByKind('function').find((n) => n.name === 'producer');
+    const consumer = cg.getNodesByKind('function').find((n) => n.name === 'consumer');
+    expect(producer).toBeDefined();
+    expect(consumer).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(producer!.id);
+    const dataflow = edges.find(
+      (e) => e.target === consumer!.id && e.kind === 'calls' && e.provenance === 'heuristic',
+    );
+    expect(dataflow, 'world.trigger should also be detected').toBeDefined();
+
+    cg.close();
+  });
+
+  it('lifecycle hooks (On<Add>) are excluded from matching', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-obs-lifecycle-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct Add;\n' +
+        '\n' +
+        'fn trigger_add(mut commands: Commands) {\n' +
+        '    commands.trigger(Add);\n' +
+        '}\n' +
+        '\n' +
+        'fn on_add_component(trigger: Trigger<On<Add, SomeComponent>>) {}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.add_systems(Update, trigger_add);\n' +
+        '        app.add_observer(on_add_component);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const trigger_add = cg.getNodesByKind('function').find((n) => n.name === 'trigger_add');
+    expect(trigger_add).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(trigger_add!.id);
+    const syntheticCalls = edges.filter(
+      (e) =>
+        e.kind === 'calls' &&
+        e.provenance === 'heuristic' &&
+        (e.metadata as Record<string, unknown>)?.synthesizedBy === 'bevy-ecs-observer',
+    );
+    expect(
+      syntheticCalls.length,
+      'lifecycle hook On<Add> should be excluded from observer matching',
+    ).toBe(0);
+
+    cg.close();
+  });
+});
+
+describe('Bevy DSL configure_sets synthesis', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('chained set expression', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-configsets-chain-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct AudioPlaybackSystems;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.configure_sets(PostUpdate, AudioPlaybackSystems.run_if(x).after(y));\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const audioSystems = plugins.find((n) => n.name === 'AudioPlaybackSystems');
+    expect(myPlugin).toBeDefined();
+    expect(audioSystems).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const configEdge = edges.find((e) => e.target === audioSystems!.id && e.kind === 'configures_set');
+    expect(configEdge, 'MyPlugin should have configures_set edge to AudioPlaybackSystems').toBeDefined();
+    expect(configEdge!.provenance).toBe('heuristic');
+    expect((configEdge!.metadata as Record<string, unknown>)?.synthesizedBy).toBe('bevy-dsl');
+
+    cg.close();
+  });
+
+  it('tuple syntax', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-configsets-tuple-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct SetA;\n' +
+        'struct SetB;\n' +
+        'struct SetC;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.configure_sets(Update, (SetA, SetB.before(SetC)));\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const setA = plugins.find((n) => n.name === 'SetA');
+    const setB = plugins.find((n) => n.name === 'SetB');
+    const setC = plugins.find((n) => n.name === 'SetC');
+    expect(myPlugin).toBeDefined();
+    expect(setA).toBeDefined();
+    expect(setB).toBeDefined();
+    expect(setC).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const configEdges = edges.filter((e) => e.kind === 'configures_set');
+    expect(configEdges.length, 'should have 2 configures_set edges (SetA + SetB, not SetC)').toBe(2);
+
+    const toSetA = configEdges.find((e) => e.target === setA!.id);
+    const toSetB = configEdges.find((e) => e.target === setB!.id);
+    const toSetC = configEdges.find((e) => e.target === setC!.id);
+    expect(toSetA, 'should have edge to SetA').toBeDefined();
+    expect(toSetB, 'should have edge to SetB').toBeDefined();
+    expect(toSetC, 'should NOT have edge to SetC (it is a dependency, not a configured set)').toBeUndefined();
+
+    cg.close();
+  });
+
+  it('bare set name', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-configsets-bare-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct MySet;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.configure_sets(Update, MySet);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const mySet = plugins.find((n) => n.name === 'MySet');
+    expect(myPlugin).toBeDefined();
+    expect(mySet).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const configEdge = edges.find((e) => e.target === mySet!.id && e.kind === 'configures_set');
+    expect(configEdge, 'MyPlugin should have configures_set edge to MySet').toBeDefined();
+    expect(configEdge!.provenance).toBe('heuristic');
+
+    cg.close();
+  });
+});
+
+describe('Bevy DSL register_system synthesis', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('simple fn', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-regsys-simple-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'fn my_system() {}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.register_system(my_system);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const mySystem = cg.getNodesByKind('function').find((n) => n.name === 'my_system');
+    expect(myPlugin).toBeDefined();
+    expect(mySystem).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regEdge = edges.find((e) => e.target === mySystem!.id && e.kind === 'registers_system');
+    expect(regEdge, 'MyPlugin should have registers_system edge to my_system').toBeDefined();
+    expect(regEdge!.provenance).toBe('heuristic');
+    expect((regEdge!.metadata as Record<string, unknown>)?.synthesizedBy).toBe('bevy-dsl');
+    // register_system has no schedule field
+    expect((regEdge!.metadata as Record<string, unknown>)?.schedule).toBeUndefined();
+
+    cg.close();
+  });
+
+  it('closure skip', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-regsys-closure-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.register_system(|x: Res<Time>| {\n' +
+        '            info!("tick");\n' +
+        '        });\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    expect(myPlugin).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regEdges = edges.filter((e) => e.kind === 'registers_system');
+    expect(regEdges.length, 'closure should produce no registers_system edge').toBe(0);
+
+    cg.close();
+  });
+
+  it('chained calls', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-regsys-chain-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'fn system_a() {}\n' +
+        'fn system_b() {}\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.register_system(system_a).register_system(system_b);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const systemA = cg.getNodesByKind('function').find((n) => n.name === 'system_a');
+    const systemB = cg.getNodesByKind('function').find((n) => n.name === 'system_b');
+    expect(myPlugin).toBeDefined();
+    expect(systemA).toBeDefined();
+    expect(systemB).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regEdges = edges.filter((e) => e.kind === 'registers_system');
+    expect(regEdges.length, 'should have 2 registers_system edges').toBe(2);
+
+    const toA = regEdges.find((e) => e.target === systemA!.id);
+    const toB = regEdges.find((e) => e.target === systemB!.id);
+    expect(toA, 'should have edge to system_a').toBeDefined();
+    expect(toB, 'should have edge to system_b').toBeDefined();
+
+    cg.close();
+  });
+});
+
+describe('Bevy DSL register_type synthesis', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('simple register_type creates registers_type edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-regtype-simple-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct MyType;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.register_type::<MyType>();\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const myType = plugins.find((n) => n.name === 'MyType');
+    expect(myPlugin).toBeDefined();
+    expect(myType).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regType = edges.find((e) => e.target === myType!.id && e.kind === 'registers_type');
+    expect(regType, 'MyPlugin should have registers_type edge to MyType').toBeDefined();
+    expect(regType!.provenance).toBe('heuristic');
+    expect((regType!.metadata as Record<string, unknown>)?.synthesizedBy).toBe('bevy-dsl');
+
+    cg.close();
+  });
+
+  it('chained multiple register_type creates multiple edges', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-regtype-chain-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct A;\n' +
+        'struct B;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.register_type::<A>().register_type::<B>();\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const a = plugins.find((n) => n.name === 'A');
+    const b = plugins.find((n) => n.name === 'B');
+    expect(myPlugin).toBeDefined();
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regEdges = edges.filter((e) => e.kind === 'registers_type');
+    expect(regEdges.length, 'should have 2 registers_type edges').toBe(2);
+    expect(regEdges.some((e) => e.target === a!.id), 'should have edge to A').toBe(true);
+    expect(regEdges.some((e) => e.target === b!.id), 'should have edge to B').toBe(true);
+
+    cg.close();
+  });
+
+  it('register_type_data only takes first type parameter', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-regtype-data-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct T;\n' +
+        'struct D;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.register_type_data::<T, D>();\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const t = plugins.find((n) => n.name === 'T');
+    const d = plugins.find((n) => n.name === 'D');
+    expect(myPlugin).toBeDefined();
+    expect(t).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regEdges = edges.filter((e) => e.kind === 'registers_type');
+    expect(regEdges.length, 'should have exactly 1 registers_type edge (only first type param)').toBe(1);
+    if (regEdges.length > 0) {
+      expect(regEdges[0]!.target, 'should point to T (first type param)').toBe(t!.id);
+    }
+
+    cg.close();
+  });
+});
+
+describe('Bevy DSL init_non_send synthesis', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('init_non_send creates registers_non_send edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-nonsend-init-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct MyRes;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.init_non_send::<MyRes>();\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const myRes = plugins.find((n) => n.name === 'MyRes');
+    expect(myPlugin).toBeDefined();
+    expect(myRes).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regEdge = edges.find((e) => e.target === myRes!.id && e.kind === 'registers_non_send');
+    expect(regEdge, 'MyPlugin should have registers_non_send edge to MyRes').toBeDefined();
+    expect(regEdge!.provenance).toBe('heuristic');
+    expect((regEdge!.metadata as Record<string, unknown>)?.synthesizedBy).toBe('bevy-dsl');
+
+    cg.close();
+  });
+
+  it('insert_non_send turbofish creates registers_non_send edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-nonsend-insert-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct MyRes;\n' +
+        '\n' +
+        'struct MyPlugin;\n' +
+        'impl Plugin for MyPlugin {\n' +
+        '    fn build(&self, app: &mut App) {\n' +
+        '        app.insert_non_send::<MyRes>(MyRes);\n' +
+        '    }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const plugins = cg.getNodesByKind('struct');
+    const myPlugin = plugins.find((n) => n.name === 'MyPlugin');
+    const myRes = plugins.find((n) => n.name === 'MyRes');
+    expect(myPlugin).toBeDefined();
+    expect(myRes).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(myPlugin!.id);
+    const regEdge = edges.find((e) => e.target === myRes!.id && e.kind === 'registers_non_send');
+    expect(regEdge, 'MyPlugin should have registers_non_send edge to MyRes').toBeDefined();
+
+    cg.close();
+  });
+});
+
+describe('Bevy state commands.set_state producer', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('set_state creates state producer edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-setstate-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Clone, PartialEq, Eq, Hash, Debug, Default)]\n' +
+        'enum GameState {\n' +
+        '    #[default]\n' +
+        '    Menu,\n' +
+        '    Playing,\n' +
+        '}\n' +
+        '\n' +
+        'fn enter_playing(mut commands: Commands) {\n' +
+        '    commands.set_state(GameState::Playing);\n' +
+        '}\n' +
+        '\n' +
+        'fn check_state() {\n' +
+        '    if in_state(GameState::Playing) {}\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const enter_playing = fns.find((n) => n.name === 'enter_playing');
+    const check_state = fns.find((n) => n.name === 'check_state');
+    expect(enter_playing).toBeDefined();
+    expect(check_state).toBeDefined();
+
+    // enter_playing should have a synthesized calls edge to check_state via state transition
+    const edges = cg.getOutgoingEdges(enter_playing!.id);
+    const toConsumer = edges.find(
+      (e) => e.target === check_state!.id && e.kind === 'calls'
+        && ((e.metadata as Record<string, unknown>)?.synthesizedBy === 'bevy-ecs-state'),
+    );
+    expect(toConsumer, 'enter_playing should reach check_state via Bevy state synthesis').toBeDefined();
+
+    cg.close();
+  });
+
+  it('set_state_if_neq creates state producer edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-setstate-neq-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Clone, PartialEq, Eq, Hash, Debug, Default)]\n' +
+        'enum GameState {\n' +
+        '    #[default]\n' +
+        '    Menu,\n' +
+        '    Playing,\n' +
+        '}\n' +
+        '\n' +
+        'fn go_to_menu(mut commands: Commands) {\n' +
+        '    commands.set_state_if_neq(GameState::Menu);\n' +
+        '}\n' +
+        '\n' +
+        'fn on_menu_enter() {\n' +
+        '    info!("menu entered");\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const go_to_menu = fns.find((n) => n.name === 'go_to_menu');
+    expect(go_to_menu).toBeDefined();
+
+    // Verify the state variant was registered — check references from go_to_menu to Menu enum_member
+    const edges = cg.getOutgoingEdges(go_to_menu!.id);
+    const refEdge = edges.find((e) => e.kind === 'references'
+      && ((e.metadata as Record<string, unknown>)?.synthesizedBy === 'bevy-ecs-state'));
+    expect(refEdge, 'go_to_menu should have reference edge to Menu variant').toBeDefined();
+
+    cg.close();
+  });
+});
+
+describe('Bevy state state_exists consumer', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('state_exists creates state consumer dataflow edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-stateexists-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(States, Clone, PartialEq, Eq, Hash, Debug, Default)]\n' +
+        'enum GameState {\n' +
+        '    #[default]\n' +
+        '    Menu,\n' +
+        '    Playing,\n' +
+        '}\n' +
+        '\n' +
+        'fn start_game(mut next_state: ResMut<NextState<GameState>>) {\n' +
+        '    next_state.set(GameState::Playing);\n' +
+        '}\n' +
+        '\n' +
+        'fn check_game_exists() {\n' +
+        '    let _ = state_exists::<GameState>;\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const start_game = fns.find((n) => n.name === 'start_game');
+    const check_game_exists = fns.find((n) => n.name === 'check_game_exists');
+    expect(start_game).toBeDefined();
+    expect(check_game_exists).toBeDefined();
+
+    // start_game produces GameState::Playing → check_game_exists consumes via state_exists::<GameState>
+    const edges = cg.getOutgoingEdges(start_game!.id);
+    const toConsumer = edges.find(
+      (e) => e.target === check_game_exists!.id && e.kind === 'calls'
+        && ((e.metadata as Record<string, unknown>)?.synthesizedBy === 'bevy-ecs-state'),
+    );
+    expect(toConsumer, 'start_game should reach check_game_exists via state_exists synthesis').toBeDefined();
+
+    cg.close();
+  });
+});
+
+describe('Bevy ECS on_message dataflow', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('add_message producer and on_message consumer creates dataflow edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-onmsg-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        'struct MyMsg;\n' +
+        '\n' +
+        'fn send_msg(mut commands: Commands) {\n' +
+        '    commands.add_message::<MyMsg>(MyMsg);\n' +
+        '}\n' +
+        '\n' +
+        'fn handle_msg() {\n' +
+        '    let _ = on_message::<MyMsg>;\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const send_msg = fns.find((n) => n.name === 'send_msg');
+    const handle_msg = fns.find((n) => n.name === 'handle_msg');
+    expect(send_msg).toBeDefined();
+    expect(handle_msg).toBeDefined();
+
+    // send_msg (add_message) → handle_msg (on_message) should have synthesized dataflow edge
+    const edges = cg.getOutgoingEdges(send_msg!.id);
+    const toConsumer = edges.find(
+      (e) => e.target === handle_msg!.id && e.kind === 'calls'
+        && ((e.metadata as Record<string, unknown>)?.synthesizedBy === 'bevy-ecs-message'),
+    );
+    expect(toConsumer, 'send_msg should reach handle_msg via on_message dataflow').toBeDefined();
+
+    cg.close();
+  });
+});
+
+describe('Bevy relationship attribute synthesis', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('parses #[relationship(relationship_target = X)] creating references edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-rel-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.rs'),
+      'use bevy::prelude::*;\n' +
+        '\n' +
+        '#[derive(Component)]\n' +
+        '#[relationship(relationship_target = TargetedBy)]\n' +
+        'struct Targeting(Entity);\n' +
+        '\n' +
+        '#[derive(Component)]\n' +
+        '#[relationship_target(relationship = Targeting)]\n' +
+        'struct TargetedBy(Vec<Entity>);\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const structs = cg.getNodesByKind('struct');
+    const targeting = structs.find((n) => n.name === 'Targeting');
+    const targetedBy = structs.find((n) => n.name === 'TargetedBy');
+    expect(targeting).toBeDefined();
+    expect(targetedBy).toBeDefined();
+
+    // Targeting should reference TargetedBy via #[relationship(relationship_target = TargetedBy)]
+    const targetingEdges = cg.getOutgoingEdges(targeting!.id);
+    const toTarget = targetingEdges.find(
+      (e) => e.target === targetedBy!.id && e.kind === 'references'
+        && ((e.metadata as Record<string, unknown>)?.synthesizedBy === 'bevy-relationship'),
+    );
+    expect(toTarget, 'Targeting should reference TargetedBy via relationship attr').toBeDefined();
+
+    // TargetedBy should reference Targeting via #[relationship_target(relationship = Targeting)]
+    const targetedByEdges = cg.getOutgoingEdges(targetedBy!.id);
+    const toSource = targetedByEdges.find(
+      (e) => e.target === targeting!.id && e.kind === 'references'
+        && ((e.metadata as Record<string, unknown>)?.synthesizedBy === 'bevy-relationship'),
+    );
+    expect(toSource, 'TargetedBy should reference Targeting via relationship_target attr').toBeDefined();
+
+    cg.close();
+  });
+
+  it('parses fully-qualified target type in relationship attribute', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bevy-rel-qual-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cargo.toml'),
+      '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.mkdirSync(path.join(tmpDir, 'src', 'monitor'));
+    fs.writeFileSync(path.join(tmpDir, 'src', 'monitor.rs'), 'pub mod monitor;');
+    fs.writeFileSync(
+      path.join(tmpDir, 'src', 'monitor', 'mod.rs'),
+      '#[derive(Component)]\n' +
+        'pub struct HasWindows(Vec<Entity>);\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src', 'main.rs'),
+      'use bevy::prelude::*;\n' +
+        'mod monitor;\n' +
+        '\n' +
+        '#[derive(Component)]\n' +
+        '#[relationship(relationship_target = monitor::HasWindows)]\n' +
+        'struct OnMonitor(Entity);\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const structs = cg.getNodesByKind('struct');
+    const onMonitor = structs.find((n) => n.name === 'OnMonitor');
+    const hasWindows = structs.find((n) => n.name === 'HasWindows');
+    expect(onMonitor).toBeDefined();
+    expect(hasWindows).toBeDefined();
+
+    const edges = cg.getOutgoingEdges(onMonitor!.id);
+    const toTarget = edges.find(
+      (e) => e.target === hasWindows!.id && e.kind === 'references'
+        && ((e.metadata as Record<string, unknown>)?.synthesizedBy === 'bevy-relationship'),
+    );
+    expect(toTarget, 'OnMonitor should reference HasWindows via qualified relationship attr').toBeDefined();
+
+    cg.close();
+  });
+});

@@ -2,11 +2,11 @@
  * Bevy DSL semantic edge synthesizer (N12).
  *
  * Scans Plugin/PluginGroup `build()` method bodies for
- * add_systems, init_resource, add_message, init_state/add_sub_state/
+ * add_systems, add_observer, init_resource, add_message, init_state/add_sub_state/
  * add_computed_state/insert_state, and PluginGroup::build patterns,
  * creating structured edges (on_enter, on_exit, on_transition, runs_in,
  * registers_system, registers_resource, registers_message, registers_state,
- * contains_plugin) that static tree-sitter extraction treats as opaque calls.
+ * registers_observer, contains_plugin) that static tree-sitter extraction treats as opaque calls.
  */
 import type { Edge, Node } from '../../types';
 import type { QueryBuilder } from '../../db/queries';
@@ -19,6 +19,7 @@ const WELL_KNOWN_SCHEDULES = new Set([
   'PreStartup', 'FixedPreUpdate', 'FixedPostUpdate',
   'FixedFirst', 'FixedLast',
   'Main', 'FixedMain', 'RunFixedMainLoop', 'StateTransition',
+  'SpawnScene',
 ]);
 
 // =============================================================================
@@ -339,6 +340,60 @@ function parseRegistersState(
 }
 
 // =============================================================================
+// parseAddObserver
+// =============================================================================
+
+function parseAddObserver(
+  buildBody: string,
+  pluginNode: Node,
+  file: string,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  lineOffset: number,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.add_observer\s*\(/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const open = m.index + m[0].length;
+    let depth = 0;
+    let close = -1;
+    for (let i = open - 1; i < buildBody.length; i++) {
+      if (buildBody[i] === '(') depth++;
+      else if (buildBody[i] === ')') { depth--; if (depth === 0) { close = i; break; } }
+    }
+    if (close < 0) continue;
+    const argsStr = buildBody.slice(open, close);
+    const args = splitTopLevelCommas(argsStr);
+    if (args.length < 1) continue;
+
+    const firstArg = args[0]!.trim();
+    if (firstArg.startsWith('|')) continue; // skip closures — no graph node
+
+    const handlerNames = parseHandlerNames(firstArg);
+    for (const hName of handlerNames) {
+      const handlerNode = resolveNode(hName, file, ctx);
+      if (!handlerNode) continue;
+
+      const key = `${pluginNode.id}>${handlerNode.id}>registers_observer`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+      edges.push({
+        source: pluginNode.id,
+        target: handlerNode.id,
+        kind: 'registers_observer',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'bevy-dsl' },
+      });
+    }
+  }
+  return edges;
+}
+
+// =============================================================================
 // parsePluginGroupBuild
 // =============================================================================
 
@@ -371,6 +426,204 @@ function parsePluginGroupBuild(
         source: groupNode.id,
         target: pn.id,
         kind: 'contains_plugin',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'bevy-dsl' },
+      });
+    }
+  }
+  return edges;
+}
+
+// =============================================================================
+// parseConfigureSets
+// =============================================================================
+
+function parseConfigureSets(
+  buildBody: string,
+  pluginNode: Node,
+  file: string,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  lineOffset: number,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.configure_sets\s*\(/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const open = m.index + m[0].length;
+    let depth = 0;
+    let close = -1;
+    for (let i = open - 1; i < buildBody.length; i++) {
+      if (buildBody[i] === '(') depth++;
+      else if (buildBody[i] === ')') { depth--; if (depth === 0) { close = i; break; } }
+    }
+    if (close < 0) continue;
+    const argsStr = buildBody.slice(open, close);
+    const args = splitTopLevelCommas(argsStr);
+    if (args.length < 2) continue;
+
+    const setExprs = args.slice(1); // arg[0] is schedule, rest are set expressions
+
+    for (const setExpr of setExprs) {
+      const trimmed = setExpr.trim();
+      if (!trimmed) continue;
+
+      const setNames: string[] = [];
+      if (trimmed.startsWith('(')) {
+        const inner = extractBlock('(' + trimmed.slice(1), 0);
+        if (inner) {
+          const parts = splitTopLevelCommas(inner);
+          for (const p of parts) setNames.push(...parseHandlerNames(p));
+        }
+      } else {
+        setNames.push(...parseHandlerNames(trimmed));
+      }
+
+      for (const setName of setNames) {
+        const setNode = resolveNode(setName, file, ctx);
+        if (!setNode) continue;
+
+        const key = `${pluginNode.id}>${setNode.id}>configures_set`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+        edges.push({
+          source: pluginNode.id,
+          target: setNode.id,
+          kind: 'configures_set',
+          line,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'bevy-dsl' },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+// =============================================================================
+// parseRegisterSystem
+// =============================================================================
+
+function parseRegisterSystem(
+  buildBody: string,
+  pluginNode: Node,
+  file: string,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  lineOffset: number,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.register_system\s*\(/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const open = m.index + m[0].length;
+    let depth = 0;
+    let close = -1;
+    for (let i = open - 1; i < buildBody.length; i++) {
+      if (buildBody[i] === '(') depth++;
+      else if (buildBody[i] === ')') { depth--; if (depth === 0) { close = i; break; } }
+    }
+    if (close < 0) continue;
+    const argsStr = buildBody.slice(open, close);
+    const args = splitTopLevelCommas(argsStr);
+    if (args.length < 1) continue;
+
+    const firstArg = args[0]!.trim();
+    if (firstArg.startsWith('|')) continue; // skip closures — no graph node
+
+    const handlerNames = parseHandlerNames(firstArg);
+    for (const hName of handlerNames) {
+      const handlerNode = resolveNode(hName, file, ctx);
+      if (!handlerNode) continue;
+
+      const key = `${pluginNode.id}>${handlerNode.id}>registers_system`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+      edges.push({
+        source: pluginNode.id,
+        target: handlerNode.id,
+        kind: 'registers_system',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'bevy-dsl' },
+      });
+    }
+  }
+  return edges;
+}
+
+// =============================================================================
+// parseRegisterType
+// =============================================================================
+
+function parseRegisterType(
+  buildBody: string,
+  pluginNode: Node,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  lineOffset: number,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.register_type(?:_data)?\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)[^>]*>/gu;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const typeName = m[1]!.replace(/\s+/g, '');
+    const shortName = typeName.split('::').pop() ?? typeName;
+    const typeNodes = ctx.getNodesByName(shortName);
+    for (const tn of typeNodes) {
+      if (tn.kind !== 'struct' && tn.kind !== 'enum') continue;
+      const key = `${pluginNode.id}>${tn.id}>registers_type`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+      edges.push({
+        source: pluginNode.id,
+        target: tn.id,
+        kind: 'registers_type',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'bevy-dsl' },
+      });
+    }
+  }
+  return edges;
+}
+
+// =============================================================================
+// parseInitNonSend
+// =============================================================================
+
+function parseInitNonSend(
+  buildBody: string,
+  pluginNode: Node,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  lineOffset: number,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.(?:init_non_send|insert_non_send)\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const typeName = m[1]!.replace(/\s+/g, '');
+    const shortName = typeName.split('::').pop() ?? typeName;
+    const resNodes = ctx.getNodesByName(shortName);
+    for (const rn of resNodes) {
+      if (rn.kind !== 'struct' && rn.kind !== 'enum') continue;
+      const key = `${pluginNode.id}>${rn.id}>registers_non_send`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+      edges.push({
+        source: pluginNode.id,
+        target: rn.id,
+        kind: 'registers_non_send',
         line,
         provenance: 'heuristic',
         metadata: { synthesizedBy: 'bevy-dsl' },
@@ -430,6 +683,11 @@ export function bevyDslEdges(queries: QueryBuilder, ctx: ResolutionContext): Edg
           edges.push(...parseInitResource(buildBody, structNode, ctx, seen, lineOffset));
           edges.push(...parseAddMessage(buildBody, structNode, ctx, seen, lineOffset));
           edges.push(...parseRegistersState(buildBody, structNode, ctx, seen, lineOffset));
+          edges.push(...parseAddObserver(buildBody, structNode, file, ctx, seen, lineOffset));
+          edges.push(...parseConfigureSets(buildBody, structNode, file, ctx, seen, lineOffset));
+          edges.push(...parseRegisterSystem(buildBody, structNode, file, ctx, seen, lineOffset));
+          edges.push(...parseRegisterType(buildBody, structNode, ctx, seen, lineOffset));
+          edges.push(...parseInitNonSend(buildBody, structNode, ctx, seen, lineOffset));
         } else {
           edges.push(...parsePluginGroupBuild(buildBody, structNode, ctx, seen, lineOffset));
         }

@@ -14,6 +14,8 @@ import { stripRustComments, parseHandlerNames } from './bevy-utils';
 const NEXT_STATE_PENDING_RE = /NextState\s*::\s*Pending\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
 const NEXT_STATE_SET_RE = /[\p{L}\p{N}_]+\s*\.\s*set\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
 const IN_STATE_RE = /in_state\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
+const SET_STATE_RE = /[\p{L}\p{N}_]+\s*\.\s*set_state(?:_if_neq)?\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)/gu;
+const STATE_EXISTS_RE = /state_exists\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
 const IMPL_HEADER_RE = /impl\s+ComputedStates\s+for\s+([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)(?:\s+where\s+[^{]+)?\s*\{/gu;
 const ADD_SYSTEMS_ONENTEREXIT_RE = /\.add_systems\s*\(\s*(OnEnter|OnExit)\s*\(/g;
 const ADD_SYSTEMS_ONTRANSITION_RE = /\.add_systems\s*\(\s*OnTransition\s*\{\s*(?:exited\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*entered\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)|entered\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*exited\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*))\s*\}/gu;
@@ -131,6 +133,7 @@ export function bevyStateEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const states = new Map<string, { producers: Map<string, { line: number; full: string }>; consumers: Map<string, { line: number; full: string }> }>();
+  const stateExistsConsumers = new Map<string, Map<string, { line: number; full: string }>>();
 
   function ensure(s: string) {
     if (!states.has(s)) states.set(s, { producers: new Map(), consumers: new Map() });
@@ -211,6 +214,20 @@ export function bevyStateEdges(ctx: ResolutionContext): Edge[] {
       }
     }
 
+    // Producers: commands.set_state(X) / set_state_if_neq(X)
+    if (content.includes('set_state')) {
+      SET_STATE_RE.lastIndex = 0;
+      while ((m = SET_STATE_RE.exec(content))) {
+        const { full, variant } = normalizeStateName(m[1]!.trim());
+        const line = content.substring(0, m.index).split('\n').length;
+        const fnId = findEnclosingFn(line);
+        if (fnId) {
+          const entry = ensure(variant);
+          entry.producers.set(fnId + '\0' + full, { line, full });
+        }
+      }
+    }
+
     // Consumers: in_state(X)
     IN_STATE_RE.lastIndex = 0;
     while ((m = IN_STATE_RE.exec(content))) {
@@ -220,6 +237,20 @@ export function bevyStateEdges(ctx: ResolutionContext): Edge[] {
       if (fnId) {
         const entry = ensure(variant);
         entry.consumers.set(fnId + '\0' + full, { line, full });
+      }
+    }
+
+    // Consumers: state_exists::<S>()
+    STATE_EXISTS_RE.lastIndex = 0;
+    while ((m = STATE_EXISTS_RE.exec(content))) {
+      const rawTypeName = m[1]!.replace(/\s+/g, '');
+      const typeName = rawTypeName.split('::').pop() ?? rawTypeName;
+      const line = content.substring(0, m.index).split('\n').length;
+      const fnId = findEnclosingFn(line);
+      if (fnId) {
+        let consumerMap = stateExistsConsumers.get(typeName);
+        if (!consumerMap) { consumerMap = new Map(); stateExistsConsumers.set(typeName, consumerMap); }
+        consumerMap.set(fnId + '\0' + typeName, { line, full: typeName });
       }
     }
   }
@@ -386,6 +417,39 @@ export function bevyStateEdges(ctx: ResolutionContext): Edge[] {
           line: pInfo.line,
           provenance: 'heuristic',
           metadata: { synthesizedBy: 'bevy-ecs-state', stateName: stateKey },
+        });
+      }
+    }
+  }
+
+  // state_exists::<S>() consumers — connect all variant producers to state_exists consumers
+  for (const [stateType, consumers] of stateExistsConsumers) {
+    if (consumers.size === 0) continue;
+    // Collect all producers for any variant of this state type
+    const matchingProducers = new Map<string, { line: number; full: string }>();
+    for (const [, data] of states) {
+      for (const [producerKey, pInfo] of data.producers) {
+        if (pInfo.full === stateType || pInfo.full.startsWith(stateType + '::')) {
+          matchingProducers.set(producerKey, pInfo);
+        }
+      }
+    }
+    if (matchingProducers.size === 0) continue;
+    for (const [producerKey, pInfo] of matchingProducers) {
+      const producerId = producerKey.split('\0')[0]!;
+      for (const [consumerKey, _cInfo] of consumers) {
+        const consumerId = consumerKey.split('\0')[0]!;
+        if (producerId === consumerId) continue;
+        const dedupKey = `${producerId}>${consumerId}>calls`;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
+        edges.push({
+          source: producerId,
+          target: consumerId,
+          kind: 'calls',
+          line: pInfo.line,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'bevy-ecs-state', stateName: stateType },
         });
       }
     }

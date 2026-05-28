@@ -67,10 +67,14 @@ export type EdgeKind =
   | 'registers_resource' // Bevy: Plugin registers a resource
   | 'registers_message'  // Bevy: Plugin registers an event/message
   | 'registers_state'    // Bevy: Plugin registers a state (init_state/add_sub_state/add_computed_state/insert_state)
+  | 'registers_observer' // Bevy: Plugin registers an observer (add_observer)
   | 'contains_plugin'    // Bevy: PluginGroup contains a Plugin
   | 'on_enter'          // Bevy: State enter transition
   | 'on_exit'           // Bevy: State exit transition
-  | 'on_transition';    // Bevy: State transition (OnTransition)
+  | 'on_transition'    // Bevy: State transition (OnTransition)
+  | 'configures_set'   // Bevy: Plugin configures a system set (configure_sets)
+  | 'registers_type'    // Bevy: Plugin registers a type for reflection (register_type/register_type_data)
+  | 'registers_non_send'; // Bevy: Plugin registers a non-Send resource (insert_non_send/init_non_send)
 
 /**
  * Supported programming languages. See NODE_KINDS for why this is a

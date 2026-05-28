@@ -680,6 +680,56 @@ function scanAttributeTypeRefs(ctx: PostExtractContext): void {
       }
     }
   }
+
+  // Match #[derive(Trait1, Trait2, ...)] — generic derive macro attributes.
+  // Creates `implements` unresolved references so findImplementors() and
+  // codegraph_search(impl_for="Trait") can discover derive-based trait impls.
+  const DERIVE_ATTR_RE = /#\[\s*derive\s*\(([^)]+)\)\s*\]/g;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    DERIVE_ATTR_RE.lastIndex = 0;
+    const match = DERIVE_ATTR_RE.exec(line);
+    if (!match) continue;
+
+    const inner = match[1]!.trim();
+    const attrLine = i + 1;
+
+    // Find the decorated struct/enum on this line or the next non-empty, non-attribute line
+    let decoratedNodeId: string | undefined;
+    // First check same line (e.g. `#[derive(Component)] struct Foo;`)
+    const afterAttr = line.slice(match.index + match[0].length);
+    const sameLineMatch = afterAttr.match(/(?:pub(?:\s*\([^)]*\))?\s+)?(?:struct|enum)\s+([\p{L}\p{N}_]+)/u);
+    if (sameLineMatch) {
+      decoratedNodeId = nodeByStartLine.get(attrLine);
+    } else {
+      for (let j = i + 1; j < lines.length; j++) {
+        const trimmed = lines[j]!.trim();
+        if (trimmed === '' || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
+        decoratedNodeId = nodeByStartLine.get(j + 1);
+        break;
+      }
+    }
+    if (!decoratedNodeId) continue;
+
+    // Split by comma: #[derive(Component, Debug, Clone)]
+    const traitNames = inner.split(',').map(t => t.trim().split('<')[0]!.trim()).filter(Boolean);
+    for (const traitName of traitNames) {
+      // Skip attributes that look like paths (e.g. serde::Serialize) but
+      // keep simple identifiers and module-qualified paths
+      if (!/^[\p{L}\p{N}_]+(?:::\s*[\p{L}\p{N}_]+)*$/u.test(traitName)) continue;
+      const key = `${decoratedNodeId}:${traitName}:implements:${attrLine}`;
+      if (!existingKeys.has(key)) {
+        existingKeys.add(key);
+        ctx.addUnresolvedReference({
+          fromNodeId: decoratedNodeId,
+          referenceName: traitName,
+          referenceKind: 'implements',
+          line: attrLine,
+          column: line.indexOf(traitName.split('::')[0]!) + 1,
+        });
+      }
+    }
+  }
 }
 
 // ── Rust variable extraction ───────────────────────────────────────

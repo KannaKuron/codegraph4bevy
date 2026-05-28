@@ -13,7 +13,11 @@ import { registerSynthesizer } from '../resolution/callback-synthesizer';
 import { bevyEcsEdges } from '../resolution/synthesizers/bevy-ecs';
 import { bevyStateEdges } from '../resolution/synthesizers/bevy-state';
 import { bevyDslEdges } from '../resolution/synthesizers/bevy-dsl';
+import { bevyObserverEdges } from '../resolution/synthesizers/bevy-observer';
+import { bevyRelationshipEdges } from '../resolution/synthesizers/bevy-relationship';
 
 registerSynthesizer((_queries, ctx) => bevyEcsEdges(ctx));
 registerSynthesizer((_queries, ctx) => bevyStateEdges(ctx));
 registerSynthesizer((queries, ctx) => bevyDslEdges(queries, ctx));
+registerSynthesizer((_queries, ctx) => bevyObserverEdges(ctx));
+registerSynthesizer((_queries, ctx) => bevyRelationshipEdges(ctx));
