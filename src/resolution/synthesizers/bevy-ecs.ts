@@ -14,7 +14,7 @@ import { stripRustComments } from './bevy-utils';
 // group 2 = constructor arg (base type, stops before ::Variant).
 // Uses Unicode-aware [\p{L}\p{N}_] so CJK type names match.
 const INSERT_RESOURCE_RE = /[\p{L}\p{N}_]+\s*\.\s*insert_resource\s*(?:::\s*<([\p{L}\p{N}_<>,: >]+)>\s*)?\(\s*([\p{L}\p{N}_]+)(?:::[\p{L}\p{N}_]+(?:\([^)]*\))?)*\s*[;{)]/gu;
-const RESOURCE_EXISTS_RE = /run_if\s*\(\s*resource_exists\s*::\s*<\s*([\p{L}\p{N}_<>,: >]+)\s*>\s*\)/gu;
+const RESOURCE_EXISTS_RE = /run_if\s*\(\s*resource_exists\s*::\s*<\s*([\p{L}\p{N}_<>,: >]+)\s*>\s*\)?/gu;
 
 export function bevyEcsEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];

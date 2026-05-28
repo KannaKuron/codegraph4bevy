@@ -392,8 +392,8 @@ export const tools: ToolDefinition[] = [
         },
         kind: {
           type: 'string',
-          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。通用类型："references"、"type_of"、"pattern_match"、"instantiates"、"contains"。框架特定边：runs_in、on_enter、on_exit、registers_resource、registers_message、contains_plugin。',
-          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'runs_in', 'on_enter', 'on_exit', 'registers_resource', 'registers_message', 'contains_plugin', 'all'],
+          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。通用类型："references"、"type_of"、"pattern_match"、"instantiates"、"contains"。Bevy 特定类型使用 bevy: 前缀：bevy:runs_in、bevy:on_enter、bevy:on_exit、bevy:on_transition、bevy:registers_system、bevy:registers_resource、bevy:registers_message、bevy:registers_state、bevy:contains_plugin。',
+          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'all', 'bevy:runs_in', 'bevy:on_enter', 'bevy:on_exit', 'bevy:on_transition', 'bevy:registers_system', 'bevy:registers_resource', 'bevy:registers_message', 'bevy:registers_state', 'bevy:contains_plugin'],
         },
         mutability: {
           type: 'string',
@@ -1437,13 +1437,15 @@ export class ToolHandler {
    * Checks both incoming and outgoing edges for the specified kind.
    */
   private handleCallersWithKind(cg: CodeGraph, symbol: string, limit: number, kindFilter: string, mutability?: string): ToolResult {
+    // Strip bevy: prefix for internal query (prefix is MCP-layer only)
+    const effectiveKind = kindFilter.startsWith('bevy:') ? kindFilter.slice(5) : kindFilter;
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
       return this.textResult(`Symbol "${symbol}" not found in the codebase`);
     }
     const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, symbol));
     if (!exactMatch) {
-      const unresolvedResult = this.handleUsagesFromUnresolved(cg, symbol, limit, kindFilter);
+      const unresolvedResult = this.handleUsagesFromUnresolved(cg, symbol, limit, effectiveKind);
       if (unresolvedResult !== null) return unresolvedResult;
     }
 
@@ -1459,7 +1461,7 @@ export class ToolHandler {
     const nodesToQuery: Node[] = [...allMatches.nodes];
     for (const node of allMatches.nodes) {
       if (ALWAYS_EXPAND.has(node.kind) ||
-          (STRUCT_LIKE.has(node.kind) && kindFilter !== 'type_of')) {
+          (STRUCT_LIKE.has(node.kind) && effectiveKind !== 'type_of')) {
         for (const child of cg.getChildren(node.id)) {
           if (!nodesToQuery.some(n => n.id === child.id)) {
             nodesToQuery.push(child);
@@ -1471,7 +1473,7 @@ export class ToolHandler {
     const seen = new Set<string>();
     const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
     // kind="all": no edge kind filter — collect all edge kinds
-    const edgeKinds: EdgeKind[] | undefined = kindFilter === 'all' ? undefined : [kindFilter as EdgeKind];
+    const edgeKinds: EdgeKind[] | undefined = effectiveKind === 'all' ? undefined : [effectiveKind as EdgeKind];
 
     for (const node of nodesToQuery) {
       // Incoming: node is the TARGET
@@ -1487,7 +1489,7 @@ export class ToolHandler {
       // Outgoing: node is the SOURCE.
       // Skip for kind="calls" — outgoing calls are the symbol's own callees,
       // not callers of the symbol (B17).
-      if (kindFilter !== 'calls') {
+      if (effectiveKind !== 'calls') {
         for (const edge of cg.getOutgoingEdges(node.id)) {
           if (edgeKinds !== undefined && !edgeKinds.includes(edge.kind)) continue;
           const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
@@ -1523,7 +1525,7 @@ export class ToolHandler {
     }
 
     // kind="all": group by edgeKind for structured output
-    if (kindFilter === 'all') {
+    if (effectiveKind === 'all') {
       return this.formatAllKindUsages(usages, symbol, limit, allMatches.note);
     }
 
@@ -1598,6 +1600,8 @@ export class ToolHandler {
    * Batch mode for kind-filtered callers (general usages).
    */
   private handleBatchUsagesMode(cg: CodeGraph, symbols: string[], limit: number, kindFilter: string, mutability?: string): ToolResult {
+    // Strip bevy: prefix for internal query (prefix is MCP-layer only)
+    const effectiveKind = kindFilter.startsWith('bevy:') ? kindFilter.slice(5) : kindFilter;
     const batchLimit = Math.min(symbols.length, 20);
     const lines: string[] = [`## Batch ${kindFilter} Usages (${batchLimit} symbols)`, ''];
     let totalUsages = 0;
@@ -1611,7 +1615,7 @@ export class ToolHandler {
       }
       const allMatches = this.findAllSymbols(cg, valid);
       if (allMatches.nodes.length === 0) {
-        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), kindFilter);
+        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), effectiveKind);
         if (unresolvedResult !== null) {
           lines.push((unresolvedResult.content[0] as { type: 'text'; text: string }).text);
           lines.push('');
@@ -1622,7 +1626,7 @@ export class ToolHandler {
       }
       const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, valid));
       if (!exactMatch) {
-        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), kindFilter);
+        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), effectiveKind);
         if (unresolvedResult !== null) {
           lines.push((unresolvedResult.content[0] as { type: 'text'; text: string }).text);
           lines.push('');
@@ -1643,7 +1647,7 @@ export class ToolHandler {
 
       const seen = new Set<string>();
       const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
-      const edgeKinds: EdgeKind[] | undefined = kindFilter === 'all' ? undefined : [kindFilter as EdgeKind];
+      const edgeKinds: EdgeKind[] | undefined = effectiveKind === 'all' ? undefined : [effectiveKind as EdgeKind];
       for (const node of nodesToQuery) {
         for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
           const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;

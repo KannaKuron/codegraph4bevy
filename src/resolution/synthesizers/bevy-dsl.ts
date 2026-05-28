@@ -2,10 +2,11 @@
  * Bevy DSL semantic edge synthesizer (N12).
  *
  * Scans Plugin/PluginGroup `build()` method bodies for
- * add_systems, init_resource, add_message, and PluginGroup::build
- * patterns, creating structured edges (on_enter, on_exit, runs_in,
- * registers_resource, registers_message, contains_plugin) that
- * static tree-sitter extraction treats as opaque calls.
+ * add_systems, init_resource, add_message, init_state/add_sub_state/
+ * add_computed_state/insert_state, and PluginGroup::build patterns,
+ * creating structured edges (on_enter, on_exit, on_transition, runs_in,
+ * registers_system, registers_resource, registers_message, registers_state,
+ * contains_plugin) that static tree-sitter extraction treats as opaque calls.
  */
 import type { Edge, Node } from '../../types';
 import type { QueryBuilder } from '../../db/queries';
@@ -16,7 +17,8 @@ const WELL_KNOWN_SCHEDULES = new Set([
   'Update', 'FixedUpdate', 'PreUpdate', 'PostUpdate',
   'Startup', 'PostStartup', 'First', 'Last',
   'PreStartup', 'FixedPreUpdate', 'FixedPostUpdate',
-  'FixedFirst', 'FixedLast', 'RunOnce',
+  'FixedFirst', 'FixedLast',
+  'Main', 'FixedMain', 'RunFixedMainLoop', 'StateTransition',
 ]);
 
 // =============================================================================
@@ -55,7 +57,7 @@ function parseAddSystems(
     let scheduleName: string | null = null;
     const onEnterMatch = /^OnEnter\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
     const onExitMatch = /^OnExit\s*\(\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\)$/u.exec(scheduleArg);
-    const onTransitionMatch = /^OnTransition\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>$/u.exec(scheduleArg);
+    const onTransitionMatch = /^OnTransition\s*\{\s*exited\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*,\s*entered\s*:\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*\}$/u.exec(scheduleArg);
 
     if (onEnterMatch || onExitMatch) {
       const stateName = (onEnterMatch ?? onExitMatch)![1]!.replace(/\s+/g, '');
@@ -295,6 +297,43 @@ function parseAddMessage(
 }
 
 // =============================================================================
+// parseRegistersState — init_state / add_sub_state / add_computed_state / insert_state
+// =============================================================================
+
+function parseRegistersState(
+  buildBody: string,
+  pluginNode: Node,
+  ctx: ResolutionContext,
+  seen: Set<string>,
+  lineOffset: number,
+): Edge[] {
+  const edges: Edge[] = [];
+  const re = /\.(init_state|add_sub_state|add_computed_state|insert_state)\s*::\s*<\s*([\p{L}\p{N}_]+(?:\s*::\s*[\p{L}\p{N}_]+)*)\s*>/gu;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(buildBody))) {
+    const typeName = m[2]!.replace(/\s+/g, '');
+    const stateNodes = ctx.getNodesByName(typeName);
+    for (const sn of stateNodes) {
+      if (sn.kind !== 'struct' && sn.kind !== 'enum') continue;
+      const key = `${pluginNode.id}>${sn.id}>registers_state`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = lineOffset + buildBody.slice(0, m.index).split('\n').length;
+      edges.push({
+        source: pluginNode.id,
+        target: sn.id,
+        kind: 'registers_state',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'bevy-dsl', method: m[1] },
+      });
+    }
+  }
+  return edges;
+}
+
+// =============================================================================
 // parsePluginGroupBuild
 // =============================================================================
 
@@ -385,6 +424,7 @@ export function bevyDslEdges(queries: QueryBuilder, ctx: ResolutionContext): Edg
           allSyntheticNodes.push(...addSystemsResult.syntheticNodes);
           edges.push(...parseInitResource(buildBody, structNode, ctx, seen, lineOffset));
           edges.push(...parseAddMessage(buildBody, structNode, ctx, seen, lineOffset));
+          edges.push(...parseRegistersState(buildBody, structNode, ctx, seen, lineOffset));
         } else {
           edges.push(...parsePluginGroupBuild(buildBody, structNode, ctx, seen, lineOffset));
         }

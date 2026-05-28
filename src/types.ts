@@ -66,6 +66,7 @@ export type EdgeKind =
   | 'runs_in'          // Bevy: System runs in a schedule
   | 'registers_resource' // Bevy: Plugin registers a resource
   | 'registers_message'  // Bevy: Plugin registers an event/message
+  | 'registers_state'    // Bevy: Plugin registers a state (init_state/add_sub_state/add_computed_state/insert_state)
   | 'contains_plugin'    // Bevy: PluginGroup contains a Plugin
   | 'on_enter'          // Bevy: State enter transition
   | 'on_exit'           // Bevy: State exit transition
