@@ -406,7 +406,7 @@ export const tools: ToolDefinition[] = [
         },
         kind: {
           type: 'string',
-          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。完整枚举值见 MCP Server Instructions。',
+          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。kind="all" 仅返回该符号已有入边的种类，不含未产生边的框架关系。完整枚举值见 MCP Server Instructions。',
           enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'all', 'bevy:runs_in', 'bevy:on_enter', 'bevy:on_exit', 'bevy:on_transition', 'bevy:registers_system', 'bevy:registers_resource', 'bevy:registers_message', 'bevy:registers_state', 'bevy:registers_observer', 'bevy:contains_plugin', 'bevy:configures_set', 'bevy:registers_type', 'bevy:registers_non_send'],
         },
         mutability: {
@@ -629,7 +629,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_trace',
-    description: '追踪两个符号之间的调用路径 — "from 如何到达/变成 to？" 一次返回完整函数链（每跳带 file:line 和内联源码及目的地本身的被调用者）。适用于流程问题。如无静态路径则链在动态调度处断开（回调/描述符/元类）；工具会指出断开点。',
+    description: '追踪两个符号之间的调用路径 — "from 如何到达/变成 to？" 一次返回完整函数链（每跳带 file:line 和内联源码及目的地本身的被调用者）。适用于流程问题。无静态路径时列出 from 的直接调用目标并标注断点（动态调度/回调处断开）。',
     inputSchema: {
       type: 'object',
       properties: {
