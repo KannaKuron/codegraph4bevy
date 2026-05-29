@@ -49,12 +49,14 @@ function formatNumber(n: number): string {
 }
 
 function renderBar(frame: number, filled: number, empty: number): string {
-  if (filled === 0) return `${DM}${G.barEmpty.repeat(empty)}${RST}`;
+  if (filled <= 0) return `${DM}${G.barEmpty.repeat(Math.max(0, empty))}${RST}`;
+  const clampedFilled = Math.min(filled, 25);
+  const clampedEmpty = Math.max(0, 25 - clampedFilled);
   const cycleFrames = 24;
-  const shimmerPos = ((frame % cycleFrames) / cycleFrames) * (filled + 6) - 3;
+  const shimmerPos = ((frame % cycleFrames) / cycleFrames) * (clampedFilled + 6) - 3;
   const shimmerWidth = 3;
   let bar = '';
-  for (let i = 0; i < filled; i++) {
+  for (let i = 0; i < clampedFilled; i++) {
     const dist = Math.abs(i - shimmerPos);
     const t = Math.max(0, 1 - dist / shimmerWidth);
     const r = lerp(160, 251, t);
@@ -62,7 +64,7 @@ function renderBar(frame: number, filled: number, empty: number): string {
     const b = lerp(9, 36, t);
     bar += `\x1b[38;2;${r};${g};${b}m${BOLD}${G.barFilled}`;
   }
-  bar += `${RST}${DM}${G.barEmpty.repeat(empty)}${RST}`;
+  bar += `${RST}${DM}${G.barEmpty.repeat(clampedEmpty)}${RST}`;
   return bar;
 }
 

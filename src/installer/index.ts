@@ -12,7 +12,6 @@
  * `--print-config` CLI flags.
  */
 
-import { execSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import {
@@ -92,7 +91,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   const useDefaults = opts.yes === true;
 
   // Step 1: which agent targets? Asked FIRST so the user knows what
-  // they're committing to before we touch npm or disk. Detection
+  // they're committing to before we touch disk. Detection
   // probes the user-provided location if known, else 'global' as the
   // most common default — labels are a hint, not load-bearing.
   const detectionLocation: Location = opts.location ?? 'global';
@@ -102,44 +101,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     return;
   }
 
-  // Step 2: install the codegraph npm package on PATH (always offered;
-  // matches existing behavior). Skipped when --yes (assume present).
-  if (!useDefaults) {
-    // Check if codegraph is already on PATH (e.g. from a prior npm link)
-    let alreadyOnPath = false;
-    try {
-      execSync('which codegraph', { stdio: 'pipe' });
-      alreadyOnPath = true;
-    } catch { /* not found */ }
-
-    if (alreadyOnPath) {
-      clack.log.success('codegraph CLI already on PATH');
-    } else {
-      const shouldInstallGlobally = await clack.confirm({
-        message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
-        initialValue: true,
-      });
-      if (clack.isCancel(shouldInstallGlobally)) {
-        clack.cancel('Installation cancelled.');
-        process.exit(0);
-      }
-      if (shouldInstallGlobally) {
-        const s = clack.spinner();
-        s.start('Installing codegraph CLI...');
-        try {
-          execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true, timeout: 120_000 });
-          s.stop('Installed codegraph CLI on PATH');
-        } catch {
-          s.stop('Could not install');
-          clack.log.warn('Try: npm run build && npm link');
-        }
-      } else {
-        clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
-      }
-    }
-  }
-
-  // Step 3: where the per-agent config files should land.
+  // Step 2: where the per-agent config files should land.
   let location: Location;
   if (opts.location) {
     location = opts.location;
@@ -170,7 +132,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
-  // Step 4: auto-allow permissions (only meaningful for Claude;
+  // Step 3: auto-allow permissions (only meaningful for Claude;
   // skipped silently by other targets).
   let autoAllow: boolean;
   if (opts.autoAllow !== undefined) {
@@ -191,7 +153,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     autoAllow = false;
   }
 
-  // Step 5: per-target install loop.
+  // Step 4: per-target install loop.
   for (const target of targets) {
     if (!target.supportsLocation(location)) {
       clack.log.warn(
@@ -213,7 +175,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
-  // Step 6: for local install, initialize the project.
+  // Step 5: for local install, initialize the project.
   if (location === 'local') {
     await initializeLocalProject(clack, useDefaults);
   }
