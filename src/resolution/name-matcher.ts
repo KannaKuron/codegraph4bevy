@@ -141,26 +141,6 @@ export function matchByQualifiedName(
         };
       }
     }
-    // Retry with common path prefixes stripped (crate::, self::, super::).
-    // Tree-sitter preserves these in the source text, but buildQualifiedName
-    // does not include them — so a reference like crate::mod::Enum::Variant
-    // won't endsWith-match the stored qualifiedName mod::Enum::Variant.
-    for (const prefix of ['crate::', 'self::', 'super::']) {
-      if (ref.referenceName.startsWith(prefix)) {
-        const stripped = ref.referenceName.slice(prefix.length);
-        for (const candidate of partialCandidates) {
-          if (candidate.qualifiedName.endsWith(stripped)) {
-            return {
-              original: ref,
-              targetNodeId: candidate.id,
-              confidence: 0.83,
-              resolvedBy: 'qualified-name',
-            };
-          }
-        }
-        break;
-      }
-    }
   }
 
   return null;
@@ -437,7 +417,7 @@ export function matchMethodCall(
   const classCandidates = context.getNodesByName(objectOrClass!);
 
   for (const classNode of classCandidates) {
-    if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface' || classNode.kind === 'trait' || classNode.kind === 'enum') {
+    if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
 
@@ -466,7 +446,7 @@ export function matchMethodCall(
   if (capitalizedReceiver !== objectOrClass) {
     const fuzzyClassCandidates = context.getNodesByName(capitalizedReceiver);
     for (const classNode of fuzzyClassCandidates) {
-      if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface' || classNode.kind === 'trait' || classNode.kind === 'enum') {
+      if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
 
@@ -503,11 +483,18 @@ export function matchMethodCall(
     const sameLanguageMethods = methods.filter(m => m.language === ref.language);
     const targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
 
-    // Multiple methods: score by receiver name word overlap with class name.
-    // (B13: removed single-match short-circuit — when Strategies 1/2 can't
-    // find a class/struct matching the receiver, a lone same-named method
-    // in the project is almost certainly a false match for an external call.)
-    if (targetMethods.length >= 1) {
+    // If only one same-language method with this name exists, use it
+    if (targetMethods.length === 1 && targetMethods[0]!.language === ref.language) {
+      return {
+        original: ref,
+        targetNodeId: targetMethods[0]!.id,
+        confidence: 0.7,
+        resolvedBy: 'instance-method',
+      };
+    }
+
+    // Multiple methods: score by receiver name word overlap with class name
+    if (targetMethods.length > 1) {
       const receiverWords = splitCamelCase(objectOrClass!);
       let bestMatch: typeof targetMethods[0] | undefined;
       let bestScore = 0;
@@ -635,22 +622,6 @@ function findBestMatch(
         score += 25;
       } else if (candidate.kind === 'class' || candidate.kind === 'interface') {
         score += 15;
-      }
-    }
-
-    // For type argument references (inside `<...>`), prefer type symbols
-    // over value symbols — e.g. `Action<导航上>` should resolve to the
-    // struct 导航上, not the enum_member 导航上.
-    if (ref.referenceKind === 'type_of') {
-      if (
-        candidate.kind === 'struct' ||
-        candidate.kind === 'enum' ||
-        candidate.kind === 'class' ||
-        candidate.kind === 'trait' ||
-        candidate.kind === 'type_alias' ||
-        candidate.kind === 'interface'
-      ) {
-        score += 25;
       }
     }
 

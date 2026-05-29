@@ -14,14 +14,11 @@ import {
   FileRecord,
   ExtractionResult,
   ExtractionError,
-  Node,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { extractComments } from './comment-extractor';
-import { detectLanguage, isSourceFile, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { logDebug, logWarn } from '../errors';
-import { enrichCJKForFTS } from '../search/query-utils';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
@@ -558,6 +555,24 @@ export class ExtractionOrchestrator {
           return null;
         }
       },
+      // Monorepo support — needed by framework detect()s that probe
+      // subpackage manifests (e.g. fabric-view looking at
+      // packages/<sub>/package.json when the root manifest is just a
+      // workspace declaration). Matches the resolver-context shape.
+      listDirectories: (relativePath: string) => {
+        const target =
+          relativePath === '.' || relativePath === ''
+            ? rootDir
+            : path.join(rootDir, relativePath);
+        try {
+          return fs
+            .readdirSync(target, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => entry.name);
+        } catch {
+          return [];
+        }
+      },
     };
   }
 
@@ -911,7 +926,6 @@ export class ExtractionOrchestrator {
         if (result.nodes.length > 0 || result.errors.length === 0) {
           const language = detectLanguage(filePath, content);
           this.storeExtractionResult(filePath, content, language, stats, result);
-          this.extractAndStoreComments(filePath, content, language, result.nodes);
         }
 
         if (result.errors.length > 0) {
@@ -928,7 +942,15 @@ export class ExtractionOrchestrator {
         } else if (result.errors.some((e) => e.severity === 'error')) {
           filesErrored++;
         } else {
-          filesSkipped++;
+          // Files with no symbols but no errors (yaml, twig, properties) are
+          // tracked at the file level — count them as indexed so the CLI
+          // doesn't misleadingly report "No files found to index".
+          const lang = detectLanguage(filePath, content);
+          if (isFileLevelOnlyLanguage(lang)) {
+            filesIndexed++;
+          } else {
+            filesSkipped++;
+          }
         }
       }
     }
@@ -986,7 +1008,6 @@ export class ExtractionOrchestrator {
           const language = detectLanguage(filePath, content);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
           this.storeExtractionResult(filePath, content, language, stats, result);
-          this.extractAndStoreComments(filePath, content, language, result.nodes);
 
           const idx = errors.indexOf(errEntry);
           if (idx >= 0) errors.splice(idx, 1);
@@ -1038,7 +1059,6 @@ export class ExtractionOrchestrator {
             const language = detectLanguage(filePath, fullContent);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
             this.storeExtractionResult(filePath, fullContent, language, stats, result);
-            this.extractAndStoreComments(filePath, fullContent, language, result.nodes);
 
             const idx = errors.indexOf(errEntry);
             if (idx >= 0) errors.splice(idx, 1);
@@ -1096,7 +1116,12 @@ export class ExtractionOrchestrator {
       } else if (result.errors.some((e) => e.severity === 'error')) {
         filesErrored++;
       } else {
-        filesSkipped++;
+        const tracked = this.queries.getFileByPath(filePath);
+        if (tracked && isFileLevelOnlyLanguage(tracked.language)) {
+          filesIndexed++;
+        } else {
+          filesSkipped++;
+        }
       }
     }
 
@@ -1217,9 +1242,6 @@ export class ExtractionOrchestrator {
       this.storeExtractionResult(relativePath, content, language, stats, result);
     }
 
-    // Extract and store comments for FTS search
-    this.extractAndStoreComments(relativePath, content, language, result.nodes);
-
     return result;
   }
 
@@ -1294,56 +1316,6 @@ export class ExtractionOrchestrator {
       errors: result.errors.length > 0 ? result.errors : undefined,
     };
     this.queries.upsertFile(fileRecord);
-  }
-
-  /**
-   * Extract comments from source and store in comments table.
-   * Associates each comment with its nearest enclosing symbol and
-   * enriches CJK text with jieba-segmented tokens for FTS search.
-   */
-  private extractAndStoreComments(filePath: string, content: string, language: string, extractionNodes?: Node[]): void {
-    try {
-      const comments = extractComments(content, filePath, language);
-
-      // Use pre-computed nodes from the current extraction when available
-      // (avoids stale nodes when storeExtractionResult was skipped due to
-      // content-hash match or extraction failure).
-      const fileNodes = extractionNodes ?? this.queries.getNodesByFile(filePath);
-      const enclosingKinds = new Set([
-        'function', 'method', 'class', 'struct', 'interface', 'trait',
-        'enum', 'type_alias', 'component', 'namespace', 'module', 'protocol', 'constant',
-      ]);
-      // Sort by start_line descending so the FIRST node whose start_line <= comment.start_line
-      // is the tightest enclosing symbol.
-      const candidates = fileNodes
-        .filter(n => enclosingKinds.has(n.kind))
-        .sort((a, b) => b.startLine - a.startLine || a.endLine - b.endLine);
-
-      this.queries.transaction(() => {
-        this.queries.deleteComments(filePath);
-        for (const c of comments) {
-          const associatedSymbol = associateCommentWithSymbol(c, candidates);
-
-          // Enrich CJK text for FTS; non-CJK comments don't need duplicate tokens
-          const ftsTokens = /\p{Script=Han}/u.test(c.text) ? enrichCJKForFTS(c.text) : '';
-
-          this.queries.insertComment({
-            ...c,
-            associatedSymbol,
-            ftsTokens,
-          });
-        }
-      });
-    } catch (e) {
-      // Distinguish comment-extractor crashes (bug) from per-file parse
-      // failures (expected on malformed sources) — only debug-log the latter.
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes('comment-extractor') || msg.includes('extractComments')) {
-        logWarn('Comment extraction failed', { filePath, error: msg });
-      } else {
-        logDebug('Comment extraction failed', { filePath, error: msg });
-      }
-    }
   }
 
   /**
@@ -1574,44 +1546,12 @@ export class ExtractionOrchestrator {
 }
 
 /**
- * Associate a comment with the nearest enclosing or following symbol.
- *
- * 1. Enclosing: comment lines fall within a symbol span.
- * 2. Forward-lookup (doc comments only): comment appears before the
- *    symbol (gap <= 3 lines) — covers Rust ///, Go //, JS block doc.
- *
- * @param candidates Must be sorted by startLine **descending** (with
- *  endLine ascending as tiebreaker) so the first enclosing match is the
- *  tightest (innermost) symbol.
+ * Associate a comment with the nearest symbol by position.
+ * Prefers enclosing symbols; for doc comments, falls back to the
+ * nearest following symbol within a gap of 3 lines.
  */
-export function associateCommentWithSymbol(
-  comment: { startLine: number; endLine: number; kind: string },
-  candidates: Array<{ startLine: number; endLine: number; name: string; qualifiedName?: string }>,
-): string | undefined {
-  // Find nearest enclosing symbol
-  for (const node of candidates) {
-    if (node.startLine <= comment.startLine && node.endLine >= comment.endLine) {
-      return node.qualifiedName ?? node.name;
-    }
-  }
-
-  // Doc comments appear BEFORE the documented item. Fall back to the
-  // nearest candidate whose startLine follows the comment's endLine.
-  if (comment.kind === 'doc') {
-    let bestGap = Infinity;
-    let bestSymbol: string | undefined;
-    for (const node of candidates) {
-      const gap = node.startLine - comment.endLine;
-      if (gap >= 1 && gap <= 3 && gap < bestGap) {
-        bestGap = gap;
-        bestSymbol = node.qualifiedName ?? node.name;
-      }
-    }
-    if (bestSymbol) return bestSymbol;
-  }
-
-  return undefined;
-}
+// Re-export fork extension
+export { associateCommentWithSymbol } from './comment-association';
 
 // Re-export useful types and functions
 export { extractFromSource } from './tree-sitter';

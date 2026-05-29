@@ -687,6 +687,37 @@ export class ContextBuilder {
       }
     }
 
+    // Iter7 — Core-directory boost. On projects with one file that holds
+    // the dense majority of internal call edges (e.g. sinatra's
+    // `lib/sinatra/base.rb` at 85% of all in-file edges), the agent's
+    // task usually asks about the framework's core. Without this boost,
+    // ranking favors small focused extension files (e.g. text search
+    // picks `sinatra-contrib/lib/sinatra/multi_route.rb`'s 10-line
+    // `route` method over `base.rb`'s `route!` because the extension
+    // file's `route` matches the query verbatim AND the file is small,
+    // dwarfing the longer name `route!` in a 1500-line file). Boost
+    // results that share a directory prefix with the dominant file's
+    // directory so the core file's siblings outrank sibling-package
+    // extensions.
+    try {
+      const dominant = this.queries.getDominantFile?.();
+      if (dominant && dominant.edgeCount >= 3 * dominant.nextEdgeCount) {
+        // Take the directory of the dominant file (everything up to the
+        // last slash). For `lib/sinatra/base.rb` → `lib/sinatra/`.
+        const slash = dominant.filePath.lastIndexOf('/');
+        if (slash > 0) {
+          const coreDir = dominant.filePath.slice(0, slash + 1);
+          for (const result of searchResults) {
+            if (result.node.filePath.startsWith(coreDir)) {
+              result.score += 25;
+            }
+          }
+        }
+      }
+    } catch {
+      // SQL failure — fall through, scoring works without the boost
+    }
+
     // Similarly deprioritize dependency/patch/vendor files — they flood results
     // with symbols from patched dependencies that aren't the user's code.
     for (const result of searchResults) {
@@ -881,7 +912,7 @@ export class ContextBuilder {
         searchIdSet.add(r.node.id);
       }
 
-      // Step 5d: Compound term matching — find classes whose name contains 2+
+      // Step 5c: Compound term matching — find classes whose name contains 2+
       // query terms at ANY position (not just CamelCase boundaries).
       // The CamelCase step above requires idx > 0, which misses classes that
       // START with a query term (e.g., "SearchShardsRequest" starts with "Search").
@@ -977,6 +1008,55 @@ export class ContextBuilder {
       roots.push(result.node.id);
     }
 
+    // Step 5e: Call-graph expansion for low-confidence CJK seeds.
+    // When CJK FTS results are all low-scoring (abstract queries like "按键重映射完整流程"),
+    // the top seeds may miss the true entry points. Expand from both top seeds AND
+    // dampened results that matched rare tokens — these are specific but crushed by
+    // single-term dampening. Their call-graph neighbors are likely the real flow.
+    if (hasCJKQuery && filteredResults.length > 0) {
+      const seen = new Set(filteredResults.map(r => r.node.id));
+      // Collect expansion seeds: top results + dampened rare-token matches
+      const expansionSeeds = [...filteredResults];
+      for (const result of searchResults) {
+        if (seen.has(result.node.id)) continue;
+        if (!dampenedResultIds.has(result.node.id)) continue;
+        // Check if this result matched a rare term (≤ 3 FTS results)
+        const nameLower = result.node.name.toLowerCase();
+        let matchedRare = false;
+        for (const [term, count] of termResultCounts) {
+          if (count <= 3 && nameLower.includes(term)) {
+            matchedRare = true;
+            break;
+          }
+        }
+        if (matchedRare) {
+          expansionSeeds.push(result);
+          seen.add(result.node.id);
+        }
+      }
+      const expansionBudget = Math.min(8, expansionSeeds.length);
+      for (const seed of expansionSeeds.slice(0, expansionBudget)) {
+        try {
+          const callers = this.traverser.getCallers(seed.node.id, 1);
+          const callees = this.traverser.getCallees(seed.node.id, 1);
+          for (const neighbor of [...callers, ...callees]) {
+            if (!nodes.has(neighbor.node.id) && !resultById.has(neighbor.node.id)) {
+              const expanded: SearchResult = { node: neighbor.node, score: seed.score * 0.5 };
+              filteredResults.push(expanded);
+              resultById.set(neighbor.node.id, expanded);
+            }
+          }
+        } catch (e) {
+          // Seed may lack call-graph edges (benign), but log unexpected errors
+          // (DB failure, corrupt index) so they aren't silently swallowed.
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!msg.includes('no such') && !msg.includes('not found')) {
+            logDebug('context: seed call-graph expansion failed', { nodeId: seed.node.id, error: msg });
+          }
+        }
+      }
+    }
+
     // Expand type hierarchy for class/interface entry points.
     // BFS often exhausts its per-entry-point budget on contained methods
     // before reaching extends/implements neighbors. This dedicated step
@@ -1029,55 +1109,6 @@ export class ContextBuilder {
             if (!exists) {
               edges.push(edge);
             }
-          }
-        }
-      }
-    }
-
-    // Step 5e: Call-graph expansion for low-confidence CJK seeds.
-    // When CJK FTS results are all low-scoring (abstract queries like "按键重映射完整流程"),
-    // the top seeds may miss the true entry points. Expand from both top seeds AND
-    // dampened results that matched rare tokens — these are specific but crushed by
-    // single-term dampening. Their call-graph neighbors are likely the real flow.
-    if (hasCJKQuery && filteredResults.length > 0) {
-      const seen = new Set(filteredResults.map(r => r.node.id));
-      // Collect expansion seeds: top results + dampened rare-token matches
-      const expansionSeeds = [...filteredResults];
-      for (const result of searchResults) {
-        if (seen.has(result.node.id)) continue;
-        if (!dampenedResultIds.has(result.node.id)) continue;
-        // Check if this result matched a rare term (≤ 3 FTS results)
-        const nameLower = result.node.name.toLowerCase();
-        let matchedRare = false;
-        for (const [term, count] of termResultCounts) {
-          if (count <= 3 && nameLower.includes(term)) {
-            matchedRare = true;
-            break;
-          }
-        }
-        if (matchedRare) {
-          expansionSeeds.push(result);
-          seen.add(result.node.id);
-        }
-      }
-      const expansionBudget = Math.min(8, expansionSeeds.length);
-      for (const seed of expansionSeeds.slice(0, expansionBudget)) {
-        try {
-          const callers = this.traverser.getCallers(seed.node.id, 1);
-          const callees = this.traverser.getCallees(seed.node.id, 1);
-          for (const neighbor of [...callers, ...callees]) {
-            if (!nodes.has(neighbor.node.id) && !resultById.has(neighbor.node.id)) {
-              const expanded: SearchResult = { node: neighbor.node, score: seed.score * 0.5 };
-              filteredResults.push(expanded);
-              resultById.set(neighbor.node.id, expanded);
-            }
-          }
-        } catch (e) {
-          // Seed may lack call-graph edges (benign), but log unexpected errors
-          // (DB failure, corrupt index) so they aren't silently swallowed.
-          const msg = e instanceof Error ? e.message : String(e);
-          if (!msg.includes('no such') && !msg.includes('not found')) {
-            logDebug('context: seed call-graph expansion failed', { nodeId: seed.node.id, error: msg });
           }
         }
       }

@@ -324,10 +324,6 @@ export class StdioTransport extends LineBasedJsonRpcTransport {
 export class SocketTransport extends LineBasedJsonRpcTransport {
   private buffer = '';
   private closeHandlers: Array<() => void> = [];
-  // Serialize socket writes so concurrent handleLine calls (line 355 drops
-  // the promise with `void`) don't interleave byte sequences on the wire.
-  // Each write queues behind the previous one via a resolving promise chain.
-  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(private socket: Socket, private prefix: string = 'cg-sock') {
     super();
@@ -384,27 +380,15 @@ export class SocketTransport extends LineBasedJsonRpcTransport {
    * hello/handshake line that precedes the JSON-RPC stream.
    */
   writeRaw(line: string): void {
-    this.writeQueue = this.writeQueue.then(() => {
-      return new Promise<void>((resolve) => {
-        if (!this.socket.destroyed) {
-          this.socket.write(line.endsWith('\n') ? line : line + '\n', () => resolve());
-        } else {
-          resolve();
-        }
-      });
-    });
+    if (!this.socket.destroyed) {
+      this.socket.write(line.endsWith('\n') ? line : line + '\n');
+    }
   }
 
   protected write(line: string): void {
-    this.writeQueue = this.writeQueue.then(() => {
-      return new Promise<void>((resolve) => {
-        if (!this.socket.destroyed) {
-          this.socket.write(line + '\n', () => resolve());
-        } else {
-          resolve();
-        }
-      });
-    });
+    if (!this.socket.destroyed) {
+      this.socket.write(line + '\n');
+    }
   }
 
   protected idPrefix(): string {

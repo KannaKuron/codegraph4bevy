@@ -12,8 +12,8 @@ import {
   type WorktreeIndexMismatch,
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
-import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, EdgeKind, UnresolvedReference } from '../types';
-import { bevySynthEdgeNote, formatSchedule, classifyMutability, classifyBevyEdgeRisk, isBevyPluginStruct, formatBevyWidgetOverview } from './bevy-formatters';
+import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, UnresolvedReference } from '../types';
+import { bevySynthEdgeNote, formatSchedule, classifyMutability } from './bevy-formatters';
 import { createHash } from 'crypto';
 import {
   constants as fsConstants,
@@ -23,14 +23,36 @@ import {
   openSync,
   readFileSync,
   realpathSync,
+  statSync,
   writeSync,
 } from 'fs';
 import { clamp, validatePathWithinRoot, validateProjectPath } from '../utils';
+import { isGeneratedFile } from '../extraction/generated-detection';
 import { tmpdir } from 'os';
 import { join, resolve as resolvePath } from 'path';
+import * as pathModule from 'path';
+import {
+  type ToolContext,
+  formatImpact as forkFormatImpact,
+  formatExternalCallers as forkFormatExternalCallers,
+  handleCallersWithKind as forkHandleCallersWithKind,
+  handleBatchUsagesMode as forkHandleBatchUsagesMode,
+  handleBatchCallers as forkHandleBatchCallers,
+  handleBatchImpact as forkHandleBatchImpact,
+  handleSymbolInfo as forkHandleSymbolInfo,
+  handleBatchNode as forkHandleBatchNode,
+  fetchTopLevelSymbols as forkFetchTopLevelSymbols,
+  formatFileSymbols as forkFormatFileSymbols,
+} from './fork-tools';
+import {
+  FORK_SEARCH_PARAMS,
+  FORK_CALLERS_PARAMS,
+  FORK_CALLEES_PARAMS,
+  FORK_IMPACT_PARAMS,
+} from './fork-schemas';
 
 /** Maximum output length to prevent context bloat (characters) */
-const MAX_OUTPUT_LENGTH = 15000;
+export const MAX_OUTPUT_LENGTH = 15000;
 
 /**
  * Maximum length for free-form string inputs (query, task, symbol).
@@ -281,7 +303,7 @@ export interface ToolDefinition {
   };
 }
 
-interface PropertySchema {
+export interface PropertySchema {
   type: string;
   description: string;
   enum?: string[];
@@ -332,32 +354,11 @@ export const tools: ToolDefinition[] = [
           description: '按节点类型过滤。别名：type（所有类型定义）、variable（变量和常量）。特殊：comment（注释搜索）、macro（宏调用位置）、method_call（方法调用点）。完整枚举值见 MCP Server Instructions。',
           enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'struct', 'enum', 'enum_member', 'field', 'parameter', 'import', 'export', 'type_alias', 'trait', 'protocol', 'namespace', 'constant', 'module', 'file', 'property', 'route', 'component', 'comment', 'macro', 'method_call'],
         },
-        path: {
-          type: 'string',
-          description: '限定搜索此目录下的文件（如 "src/components"）。未指定则搜索全部已索引文件。',
-        },
-        referencesType: {
-          type: 'string',
-          description: '查找引用此类型的所有符号（通过 type_of/references/returns 边）。设置后 query 仅作 fallback。按名称精确/后缀匹配，不支持正则。',
-        },
-        mutability: {
-          type: 'string',
-          description: 'referencesType 时过滤借用模式："mut"（可变借用，ResMut）、"shared"（共享借用，Res、&T）、"owning"（拥有值，返回类型）。用于区分资源的读写者。',
-          enum: ['mut', 'shared', 'owning'],
-        },
-        impl_for: {
-          type: 'string',
-          description: '查找实现指定 trait/interface 的所有类型（通过 implements 边或未解析引用）。设置后 query 仅作 fallback。按名称精确/后缀匹配，不支持正则。',
-        },
+        ...FORK_SEARCH_PARAMS,
         limit: {
           type: 'number',
           description: '返回的最大结果数（默认: 50）',
           default: 50,
-        },
-        offset: {
-          type: 'number',
-          description: '跳过前 N 个结果（默认: 0）',
-          default: 0,
         },
         projectPath: projectPathProperty,
       },
@@ -399,26 +400,7 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: '要查找调用者的函数、方法或类名',
         },
-        symbols: {
-          type: 'array',
-          items: { type: 'string' },
-          description: '批量查询：多个符号名，结果按符号分组',
-        },
-        kind: {
-          type: 'string',
-          description: 'Edge kind 过滤器。不指定时只返回 callers（calls 边）。指定后返回该类型的所有用法（含 incoming 和 outgoing）。kind="all" 仅返回该符号已有入边的种类，不含未产生边的框架关系。完整枚举值见 MCP Server Instructions。',
-          enum: ['calls', 'references', 'type_of', 'instantiates', 'contains', 'pattern_match', 'all', 'bevy:runs_in', 'bevy:on_enter', 'bevy:on_exit', 'bevy:on_transition', 'bevy:registers_system', 'bevy:registers_resource', 'bevy:registers_message', 'bevy:registers_state', 'bevy:registers_observer', 'bevy:contains_plugin', 'bevy:configures_set', 'bevy:registers_type', 'bevy:registers_non_send'],
-        },
-        mutability: {
-          type: 'string',
-          description: '配合 kind="type_of" 过滤借用模式："mut"（可变借用，ResMut、&mut）、"shared"（共享借用，Res、&T）、"owning"（拥有值，返回类型）。用于区分类型的读写者。',
-          enum: ['mut', 'shared', 'owning'],
-        },
-        include_external: {
-          type: 'boolean',
-          description: '包含对当前索引中无定义节点的符号的引用。即第三方依赖、标准库、框架 API 等在项目中没有源码的符号。默认: false。',
-          default: false,
-        },
+        ...FORK_CALLERS_PARAMS,
         limit: {
           type: 'number',
           description: '返回的最大调用者数（默认: 20）',
@@ -443,11 +425,7 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: '要查找被调用者的函数、方法或类名',
         },
-        include_external: {
-          type: 'boolean',
-          description: '包含对当前索引中无定义节点的符号的调用。即第三方依赖、标准库、框架 API、宏等在项目中没有源码的符号。默认: true。设为 false 只显示项目内有定义节点的被调用者。',
-          default: true,
-        },
+        ...FORK_CALLEES_PARAMS,
         limit: {
           type: 'number',
           description: '返回的最大被调用者数（默认: 20）',
@@ -483,11 +461,7 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: '要分析影响的符号名',
         },
-        symbols: {
-          type: 'array',
-          items: { type: 'string' },
-          description: '批量查询：多个符号名，结果按符号分组',
-        },
+        ...FORK_IMPACT_PARAMS,
         depth: {
           type: 'number',
           description: '遍历依赖的层数（默认: 2）',
@@ -954,12 +928,32 @@ export class ToolHandler {
   }
 
   /**
+   * Build a ToolContext for standalone fork-tools functions.
+   * Wraps class helper methods into a single context object.
+   */
+  private buildToolContext(cg: CodeGraph): ToolContext {
+    const self = this;
+    return {
+      cg,
+      findAllSymbols(symbol: string) { return self.findAllSymbols(cg, symbol); },
+      findSymbol(symbol: string) { return self.findSymbol(cg, symbol); },
+      matchesSymbol(node: Node, symbol: string) { return self.matchesSymbol(node, symbol); },
+      validateString(value: unknown, name: string) { return self.validateString(value, name); },
+      textResult(text: string) { return self.textResult(text); },
+      truncateOutput(text: string) { return self.truncateOutput(text); },
+      sourceLineAt(ref: string | undefined, cache: Map<string, string[]>) { return self.sourceLineAt(cg, ref, cache); },
+      sourceRangeAt(filePath: string, startLine: number, endLine: number, cache: Map<string, string[]>, maxLines?: number, maxChars?: number) { return self.sourceRangeAt(cg, filePath, startLine, endLine, cache, maxLines, maxChars); },
+      classifyMutability(signature: string | undefined | null, typeName: string) { return self.classifyMutability(signature, typeName); },
+      formatUsageResults(symbol: string, usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }>, limit: number) { return self.formatUsageResults(symbol, usages, limit); },
+      formatNodeDetails(node: Node, code: string | null, outline?: string | null) { return self.formatNodeDetails(node, code, outline); },
+      formatTrail(node: Node) { return self.formatTrail(cg, node); },
+      formatSchedule(node: Node) { return self.formatSchedule(cg, node); },
+      buildContainerOutline(node: Node) { return self.buildContainerOutline(cg, node); },
+    };
+  }
+
+  /**
    * Validate that a value is a non-empty string within length bounds.
-   *
-   * The `maxLength` cap protects against MCP clients that ship huge
-   * payloads (10MB+ query strings either by accident or maliciously).
-   * Without this, a single oversized input can pin the FTS5 index or
-   * exhaust memory before any real work runs.
    */
   private validateString(
     value: unknown,
@@ -1300,6 +1294,13 @@ export class ToolHandler {
       return this.textResult(label);
     }
 
+    // Down-rank generated files (.pb.go, .pulsar.go, etc.) to bottom
+    results.sort((a, b) => {
+      const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
+      const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+      return aGen - bGen;
+    });
+
     const formatted = this.formatSearchResults(results, (searchOffset > 0 || hasMore) ? { total, offset: searchOffset, hasMore } : undefined);
     return this.textResult(this.truncateOutput(formatted));
   }
@@ -1318,7 +1319,19 @@ export class ToolHandler {
     }
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
-    const maxNodes = (args.maxNodes as number) || 20;
+    // On tiny repos (<150 files), trim maxNodes hard — the entire repo
+    // is grep-able in a turn so a 20-node context is wasted budget.
+    let defaultMaxNodes = 20;
+    let isTinyRepo = false;
+    let isSmallRepo = false;
+    try {
+      const stats = cg.getStats();
+      if (stats.fileCount < 150) { defaultMaxNodes = 8; isTinyRepo = true; }
+      else if (stats.fileCount < 500) { isSmallRepo = true; }
+    } catch {
+      // stats failure — fall back to the standard default
+    }
+    const maxNodes = (args.maxNodes as number) || defaultMaxNodes;
     const includeCode = args.includeCode !== false;
 
     const context = await cg.buildContext(task, {
@@ -1333,13 +1346,135 @@ export class ToolHandler {
       ? '\n\n⚠️ **Ask user:** UX preferences, edge cases, acceptance criteria'
       : '';
 
+    // Auto-trace for flow queries
+    const flowTrace = await this.maybeInlineFlowTrace(task, cg);
+
+    // Sufficiency steering on small repos — tell the agent the context
+    // call IS the comprehensive pass for a project of this size.
+    let smallRepoTail = '';
+    let smallRepoRouteInline = '';
+    if (isTinyRepo || isSmallRepo) {
+      const isRouteQuery = /\b(route|routes|routing|request|handler|endpoint|api|controller|middleware|dispatch|invok)/i.test(task);
+      if (isRouteQuery) {
+        try {
+          const manifest = cg.getRoutingManifest(40);
+          if (manifest) {
+            const lines: string[] = [
+              `\n\n## Routing manifest (${manifest.totalRoutes} routes, top handler file holds ${manifest.topHandlerFileCount})`,
+              '',
+              '| URL | Handler | Location |',
+              '|---|---|---|',
+            ];
+            for (const e of manifest.entries) {
+              lines.push(`| \`${e.url}\` | \`${e.handler}\` | ${e.handlerFile}:${e.handlerLine} |`);
+            }
+            if (manifest.topHandlerFile && manifest.topHandlerFileCount >= 2) {
+              try {
+                const fullPath = pathModule.join(cg.getProjectRoot(), manifest.topHandlerFile);
+                const stat = statSync(fullPath);
+                if (stat.size > 0 && stat.size <= 16000) {
+                  const source = readFileSync(fullPath, 'utf-8');
+                  const capped = source.length > 7000 ? source.slice(0, 7000) + '\n... (truncated)' : source;
+                  const ext = (manifest.topHandlerFile.match(/\.([a-z]+)$/i)?.[1] || '').toLowerCase();
+                  const lang =
+                    ext === 'rb' ? 'ruby' : ext === 'py' ? 'python' :
+                    ext === 'go' ? 'go' : ext === 'rs' ? 'rust' :
+                    ext === 'js' || ext === 'jsx' ? 'javascript' :
+                    ext === 'ts' || ext === 'tsx' ? 'typescript' :
+                    ext === 'java' ? 'java' : ext === 'kt' ? 'kotlin' :
+                    ext === 'cs' ? 'csharp' : ext === 'php' ? 'php' :
+                    ext === 'swift' ? 'swift' : ext === 'yml' || ext === 'yaml' ? 'yaml' : '';
+                  lines.push('');
+                  lines.push(`### Top handler file (\`${manifest.topHandlerFile}\` — ${manifest.topHandlerFileCount}/${manifest.totalRoutes} routes, full source inlined — do NOT Read)`);
+                  lines.push('');
+                  lines.push('```' + lang);
+                  lines.push(capped);
+                  lines.push('```');
+                }
+              } catch { /* file read failed, skip the source inline */ }
+            }
+            smallRepoRouteInline = lines.join('\n');
+          }
+        } catch {
+          // Manifest build failed — drop silently
+        }
+      }
+      const sizeQualifier = isTinyRepo ? 'under 150' : 'under 500';
+      const routingClause = smallRepoRouteInline
+        ? ' The URL→handler manifest and top handler file are also inlined above — answer routing questions from them.'
+        : '';
+      smallRepoTail = `\n\n---\n> **This project is small** (${sizeQualifier} indexed files). The entry points and code above cover the relevant surface — **do NOT call codegraph_explore as a follow-up; its content will largely duplicate this response**. If you need a specific flow, call \`codegraph_trace from→to\`. If you need one specific symbol's body, call \`codegraph_node <name>\`.${routingClause} Otherwise, answer from what is above.`;
+    }
+
     // buildContext returns string when format is 'markdown'
     if (typeof context === 'string') {
-      return this.textResult(this.truncateOutput(context + reminder));
+      return this.textResult(this.truncateOutput(context + flowTrace + reminder + smallRepoRouteInline + smallRepoTail));
     }
 
     // If it returns TaskContext, format it
-    return this.textResult(this.truncateOutput(this.formatTaskContext(context) + reminder));
+    return this.textResult(this.truncateOutput(this.formatTaskContext(context) + flowTrace + reminder + smallRepoRouteInline + smallRepoTail));
+  }
+
+  /**
+   * Detect a flow-style task and pre-run trace between the most likely
+   * endpoints, returning the trace body to splice into the context response.
+   * Returns '' for non-flow queries or when no plausible endpoint pair can
+   * be extracted.
+   */
+  private async maybeInlineFlowTrace(task: string, cg: CodeGraph): Promise<string> {
+    const lower = task.toLowerCase();
+    const FLOW_KEYWORDS = [
+      'trace ', 'from ', 'reach ', 'flow ', 'propagat', 'how does ', 'how do ',
+    ];
+    if (!FLOW_KEYWORDS.some((k) => lower.includes(k))) return '';
+
+    const STOP_WORDS = new Set([
+      'how', 'does', 'the', 'and', 'from', 'through', 'reach', 'reaches',
+      'flow', 'path', 'trace', 'cross', 'module', 'modules', 'where',
+      'update', 'updates', 'updated', 'when', 'what', 'this', 'that',
+    ]);
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    const re = /\b([A-Z][a-z]+(?:[A-Z][a-z]*)+|[a-z]+[A-Z][a-z]*(?:[A-Z][a-z]*)*)\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(task)) !== null) {
+      const sym = m[1]!;
+      if (sym.length < 3) continue;
+      const key = sym.toLowerCase();
+      if (STOP_WORDS.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      ids.push(sym);
+    }
+
+    if (ids.length < 2) return '';
+
+    const fromSym = ids[0]!;
+    const toSym = ids[1]!;
+
+    let traceResult: ToolResult;
+    try {
+      traceResult = await this.handleTrace({
+        from: fromSym,
+        to: toSym,
+        projectPath: cg.getProjectRoot(),
+      } as Record<string, unknown>);
+    } catch {
+      return '';
+    }
+    const body = traceResult.content
+      ?.map((c: { type: string; text: string }) => (c.type === 'text' ? c.text : ''))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (!body) return '';
+    return [
+      '',
+      '## Inline flow trace',
+      '',
+      `Auto-traced \`${fromSym}\` → \`${toSym}\` because the query looks like a flow question. No follow-up codegraph_trace is needed for this pair.`,
+      '',
+      body,
+    ].join('\n');
   }
 
   /**
@@ -1506,322 +1641,21 @@ export class ToolHandler {
    * Checks both incoming and outgoing edges for the specified kind.
    */
   private handleCallersWithKind(cg: CodeGraph, symbol: string, limit: number, kindFilter: string, mutability?: string): ToolResult {
-    // Strip bevy: prefix for internal query (prefix is MCP-layer only)
-    const effectiveKind = kindFilter.startsWith('bevy:') ? kindFilter.slice(5) : kindFilter;
-    const allMatches = this.findAllSymbols(cg, symbol);
-    if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
-    }
-    const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, symbol));
-    if (!exactMatch) {
-      const unresolvedResult = this.handleUsagesFromUnresolved(cg, symbol, limit, effectiveKind);
-      if (unresolvedResult !== null) return unresolvedResult;
-    }
-
-    // Expand container nodes to include their children.
-    // - enum: variant-level edges (e.g. MyEnum::V pattern_match) — always expand
-    // - trait/interface: default method implementations — always expand
-    // - struct/class: DO NOT expand for type_of — field-level type_of edges
-    //   point to the field's own type (e.g. f32), not about the parent struct.
-    //   DO expand for references — field accesses (e.g. config.标题_字号) are
-    //   relevant when querying references to a type (B14 fix).
-    const ALWAYS_EXPAND = new Set(['enum', 'trait', 'interface']);
-    const STRUCT_LIKE = new Set(['struct', 'class']);
-    const nodesToQuery: Node[] = [...allMatches.nodes];
-    for (const node of allMatches.nodes) {
-      if (ALWAYS_EXPAND.has(node.kind) ||
-          (STRUCT_LIKE.has(node.kind) && effectiveKind !== 'type_of')) {
-        for (const child of cg.getChildren(node.id)) {
-          if (!nodesToQuery.some(n => n.id === child.id)) {
-            nodesToQuery.push(child);
-          }
-        }
-      }
-    }
-
-    const seen = new Set<string>();
-    const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
-    // kind="all": no edge kind filter — collect all edge kinds
-    const edgeKinds: EdgeKind[] | undefined = effectiveKind === 'all' ? undefined : [effectiveKind as EdgeKind];
-
-    for (const node of nodesToQuery) {
-      // Incoming: node is the TARGET
-      for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
-        const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const sourceNode = cg.getNode(edge.source);
-        if (sourceNode) {
-          usages.push({ sourceNode, targetNode: node, edgeKind: edge.kind, line: edge.line ?? sourceNode.startLine });
-        }
-      }
-      // Outgoing: node is the SOURCE.
-      // Skip for kind="calls" — outgoing calls are the symbol's own callees,
-      // not callers of the symbol (B17).
-      if (effectiveKind !== 'calls') {
-        for (const edge of cg.getOutgoingEdges(node.id)) {
-          if (edgeKinds !== undefined && !edgeKinds.includes(edge.kind)) continue;
-          const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const targetNode = cg.getNode(edge.target);
-          if (targetNode) {
-            usages.push({ sourceNode: node, targetNode, edgeKind: edge.kind, line: edge.line ?? node.startLine });
-          }
-        }
-      }
-    }
-
-    if (usages.length === 0) {
-      return this.textResult(`No usages of kind "${kindFilter}" found for "${symbol}"${allMatches.note}`);
-    }
-
-    // Mutability filter for type_of queries — classify each usage by its
-    // borrowing pattern (mut/shared/owning) and keep only matching ones.
-    if (mutability && (mutability === 'mut' || mutability === 'shared' || mutability === 'owning')) {
-      const filtered: typeof usages = [];
-      for (const u of usages) {
-        if (this.classifyMutability(u.sourceNode.signature, symbol) === mutability) {
-          filtered.push(u);
-        }
-      }
-      usages.length = 0;
-      usages.push(...filtered.slice(0, limit));
-    }
-
-    if (usages.length === 0) {
-      return this.textResult(`No usages of kind "${kindFilter}" with mutability="${mutability}" found for "${symbol}"${allMatches.note}`);
-    }
-
-    // kind="all": group by edgeKind for structured output
-    if (effectiveKind === 'all') {
-      return this.formatAllKindUsages(usages, symbol, limit, allMatches.note);
-    }
-
-    const byFile = new Map<string, typeof usages>();
-    for (const u of usages) {
-      const existing = byFile.get(u.sourceNode.filePath) || [];
-      existing.push(u);
-      byFile.set(u.sourceNode.filePath, existing);
-    }
-
-    const lines: string[] = [
-      `## ${kindFilter} usages of "${symbol}" (${Math.min(usages.length, limit)} shown, ${usages.length} total)`,
-      '',
-    ];
-
-    let count = 0;
-    for (const [file, fileUsages] of byFile) {
-      if (count >= limit) break;
-      lines.push(`**${file}:**`);
-      for (const u of fileUsages) {
-        if (count >= limit) break;
-        const lineInfo = u.line ? `:${u.line}` : '';
-        lines.push(`- ${u.sourceNode.name} (${u.sourceNode.kind}) ${u.edgeKind}→ ${u.targetNode.name}${lineInfo}`);
-        count++;
-      }
-      lines.push('');
-    }
-
-    if (usages.length > limit) {
-      lines.push(`... and ${usages.length - limit} more usages`);
-    }
-    lines.push(allMatches.note);
-    return this.textResult(this.truncateOutput(lines.join('\n')));
-  }
-
-  /**
-   * Format usages grouped by edge kind for kind="all" output.
-   */
-  private formatAllKindUsages(
-    usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }>,
-    symbol: string, limit: number, note: string,
-  ): ToolResult {
-    const byKind = new Map<string, typeof usages>();
-    for (const u of usages) {
-      const arr = byKind.get(u.edgeKind) || [];
-      arr.push(u);
-      byKind.set(u.edgeKind, arr);
-    }
-
-    const lines: string[] = [
-      `## All usages of "${symbol}" (${usages.length} total across ${byKind.size} edge kinds)`,
-      '',
-    ];
-
-    for (const [kind, kindUsages] of byKind) {
-      lines.push(`### ${kind} (${kindUsages.length})`);
-      for (const u of kindUsages.slice(0, limit)) {
-        const lineInfo = u.line ? `:${u.line}` : '';
-        lines.push(`- ${u.sourceNode.name} (${u.sourceNode.kind}) → ${u.targetNode.name}${lineInfo}`);
-      }
-      if (kindUsages.length > limit) {
-        lines.push(`  ... and ${kindUsages.length - limit} more`);
-      }
-      lines.push('');
-    }
-
-    lines.push(note);
-    return this.textResult(this.truncateOutput(lines.join('\n')));
+    return forkHandleCallersWithKind(this.buildToolContext(cg), symbol, limit, kindFilter, mutability);
   }
 
   /**
    * Batch mode for kind-filtered callers (general usages).
    */
   private handleBatchUsagesMode(cg: CodeGraph, symbols: string[], limit: number, kindFilter: string, mutability?: string): ToolResult {
-    // Strip bevy: prefix for internal query (prefix is MCP-layer only)
-    const effectiveKind = kindFilter.startsWith('bevy:') ? kindFilter.slice(5) : kindFilter;
-    const batchLimit = Math.min(symbols.length, 20);
-    const lines: string[] = [`## Batch ${kindFilter} Usages (${batchLimit} symbols)`, ''];
-    let totalUsages = 0;
-
-    for (const symbol of symbols.slice(0, batchLimit)) {
-      const valid = this.validateString(symbol, 'symbols');
-      if (typeof valid !== 'string') {
-        lines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
-        lines.push('');
-        continue;
-      }
-      const allMatches = this.findAllSymbols(cg, valid);
-      if (allMatches.nodes.length === 0) {
-        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), effectiveKind);
-        if (unresolvedResult !== null) {
-          lines.push((unresolvedResult.content[0] as { type: 'text'; text: string }).text);
-          lines.push('');
-        } else {
-          lines.push(`### ${valid}: not found`); lines.push('');
-        }
-        continue;
-      }
-      const exactMatch = allMatches.nodes.some(n => this.matchesSymbol(n, valid));
-      if (!exactMatch) {
-        const unresolvedResult = this.handleUsagesFromUnresolved(cg, valid, Math.max(3, Math.ceil(limit / batchLimit)), effectiveKind);
-        if (unresolvedResult !== null) {
-          lines.push((unresolvedResult.content[0] as { type: 'text'; text: string }).text);
-          lines.push('');
-          continue;
-        }
-      }
-      const CONTAINER_KINDS_BATCH = new Set(['enum', 'struct', 'trait', 'class', 'interface']);
-      const nodesToQuery: Node[] = [...allMatches.nodes];
-      for (const node of allMatches.nodes) {
-        if (CONTAINER_KINDS_BATCH.has(node.kind)) {
-          for (const child of cg.getChildren(node.id)) {
-            if (!nodesToQuery.some(n => n.id === child.id)) {
-              nodesToQuery.push(child);
-            }
-          }
-        }
-      }
-
-      const seen = new Set<string>();
-      const usages: Array<{ sourceNode: Node; targetNode: Node; edgeKind: string; line: number }> = [];
-      const edgeKinds: EdgeKind[] | undefined = effectiveKind === 'all' ? undefined : [effectiveKind as EdgeKind];
-      for (const node of nodesToQuery) {
-        for (const edge of cg.getIncomingEdges(node.id, edgeKinds)) {
-          const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const sourceNode = cg.getNode(edge.source);
-          if (sourceNode) { usages.push({ sourceNode, targetNode: node, edgeKind: edge.kind, line: edge.line ?? sourceNode.startLine }); }
-        }
-      // Outgoing: node is the SOURCE.
-      // Skip for kind="calls" — outgoing calls are the symbol's own callees,
-      // not callers of the symbol (B17).
-      if (effectiveKind !== 'calls') {
-        for (const edge of cg.getOutgoingEdges(node.id)) {
-          if (edgeKinds !== undefined && !edgeKinds.includes(edge.kind)) continue;
-          const key = `${edge.source}:${edge.target}:${edge.kind}:${edge.line ?? ''}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const targetNode = cg.getNode(edge.target);
-          if (targetNode) { usages.push({ sourceNode: node, targetNode, edgeKind: edge.kind, line: edge.line ?? node.startLine }); }
-        }
-      }
-    }
-
-      if (mutability && (mutability === 'mut' || mutability === 'shared' || mutability === 'owning')) {
-        const filtered: typeof usages = [];
-        for (const u of usages) {
-          if (this.classifyMutability(u.sourceNode.signature, valid) === mutability) {
-            filtered.push(u);
-          }
-        }
-        usages.length = 0;
-        usages.push(...filtered);
-      }
-
-      const perLimit = Math.max(3, Math.ceil(limit / batchLimit));
-      lines.push(this.formatUsageResults(valid, usages, perLimit));
-      lines.push('');
-      if (allMatches.note) lines.push(allMatches.note);
-      totalUsages += usages.length;
-    }
-    lines.push('---');
-    lines.push(`Total: ${totalUsages} usages across ${batchLimit} symbols`);
-    return this.textResult(this.truncateOutput(lines.join('\n')));
+    return forkHandleBatchUsagesMode(this.buildToolContext(cg), symbols, limit, kindFilter, mutability);
   }
 
   /**
    * Handle batch codegraph_callers — multiple symbols in one call
    */
   private handleBatchCallers(cg: CodeGraph, symbols: string[], limit: number): ToolResult {
-    const batchLimit = Math.min(symbols.length, 20);
-    const allLines: string[] = [`## Batch Callers (${batchLimit} symbols)`, ''];
-    const fileCache = new Map<string, string[]>();
-    let totalCallers = 0;
-
-    for (const symbol of symbols.slice(0, batchLimit)) {
-      const valid = this.validateString(symbol, 'symbols');
-      if (typeof valid !== 'string') {
-        allLines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
-        allLines.push('');
-        continue;
-      }
-      const allMatches = this.findAllSymbols(cg, valid);
-      if (allMatches.nodes.length === 0) {
-        allLines.push(`### ${valid}: not found`);
-        allLines.push('');
-        continue;
-      }
-
-      const callSites: Array<{ caller: Node; edge: Edge }> = [];
-      const seen = new Set<string>();
-      for (const node of allMatches.nodes) {
-        for (const c of cg.getCallers(node.id)) {
-          const key = `${c.node.id}:${c.edge.line ?? c.node.startLine}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            callSites.push({ caller: c.node, edge: c.edge });
-          }
-        }
-      }
-
-      const perLimit = Math.max(3, Math.ceil(limit / batchLimit));
-      const shown = callSites.slice(0, perLimit);
-      allLines.push(`### ${valid} (${shown.length} shown, ${callSites.length} total)`);
-      allLines.push('');
-      for (const cs of shown) {
-        const defLine = cs.caller.startLine ? `:${cs.caller.startLine}` : '';
-        const callLine = cs.edge.line ?? cs.caller.startLine;
-        const fileRef = `${cs.caller.filePath}:${callLine}`;
-        const snippet = this.sourceLineAt(cg, fileRef, fileCache);
-        allLines.push(`- **${cs.caller.name}** (${cs.caller.kind})`);
-        allLines.push(`  def: ${cs.caller.filePath}${defLine}`);
-        allLines.push(`  call: ${cs.caller.filePath}:${callLine}${snippet ? ` — \`${snippet}\`` : ''}`);
-        allLines.push('');
-      }
-      if (callSites.length > perLimit) {
-        allLines.push(`... and ${callSites.length - perLimit} more callers`);
-        allLines.push('');
-      }
-      if (allMatches.note) allLines.push(allMatches.note);
-      totalCallers += callSites.length;
-    }
-
-    allLines.push('---');
-    allLines.push(`Total: ${totalCallers} callers across ${batchLimit} symbols`);
-    return this.textResult(this.truncateOutput(allLines.join('\n')));
+    return forkHandleBatchCallers(this.buildToolContext(cg), symbols, limit);
   }
 
   /**
@@ -2001,60 +1835,7 @@ export class ToolHandler {
    * Handle batch codegraph_impact — multiple symbols in one call
    */
   private handleBatchImpact(cg: CodeGraph, symbols: string[], args: Record<string, unknown>): ToolResult {
-    const batchLimit = Math.min(symbols.length, 20);
-    const depth = clamp((args.depth as number) || 2, 1, 10);
-    const includeCode = args.includeCode === true;
-    const allLines: string[] = [`## Batch Impact (${batchLimit} symbols)`, ''];
-    let totalAffected = 0;
-
-    for (const symbol of symbols.slice(0, batchLimit)) {
-      const valid = this.validateString(symbol, 'symbols');
-      if (typeof valid !== 'string') {
-        allLines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
-        allLines.push('');
-        continue;
-      }
-      const allMatches = this.findAllSymbols(cg, valid);
-      if (allMatches.nodes.length === 0) {
-        allLines.push(`### ${valid}: not found`);
-        allLines.push('');
-        continue;
-      }
-
-      const mergedNodes = new Map<string, Node>();
-      const mergedEdges: Edge[] = [];
-      const seenEdges = new Set<string>();
-
-      for (const node of allMatches.nodes) {
-        const impact = cg.getImpactRadius(node.id, depth);
-        for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, n);
-        }
-        for (const e of impact.edges) {
-          const key = `${e.source}->${e.target}:${e.kind}`;
-          if (!seenEdges.has(key)) {
-            seenEdges.add(key);
-            mergedEdges.push(e);
-          }
-        }
-      }
-
-      const mergedImpact = {
-        nodes: mergedNodes,
-        edges: mergedEdges,
-        roots: allMatches.nodes.map(n => n.id),
-      };
-
-      const affectedCount = mergedNodes.size - allMatches.nodes.length;
-      allLines.push(this.formatImpact(valid, mergedImpact, includeCode ? cg : null));
-      if (allMatches.note) allLines.push(allMatches.note);
-      allLines.push('');
-      totalAffected += affectedCount;
-    }
-
-    allLines.push('---');
-    allLines.push(`Total: ${totalAffected} affected nodes across ${batchLimit} symbols`);
-    return this.textResult(this.truncateOutput(allLines.join('\n')));
+    return forkHandleBatchImpact(this.buildToolContext(cg), symbols, args);
   }
 
   /**
@@ -2063,150 +1844,8 @@ export class ToolHandler {
    * outgoing callees, and impact radius in a single call.
    */
   private async handleSymbolInfo(args: Record<string, unknown>): Promise<ToolResult> {
-    const symbol = this.validateString(args.symbol, 'symbol');
-    if (typeof symbol !== 'string') return symbol;
-
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
-    const allMatches = this.findAllSymbols(cg, symbol);
-    if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found`);
-    }
-
-    const lines: string[] = [`## Symbol Info: "${symbol}"`, ''];
-
-    for (const node of allMatches.nodes) {
-      // Issue #9: Bevy Plugin struct → structured widget overview
-      if (isBevyPluginStruct(cg, node)) {
-        const widgetOverview = formatBevyWidgetOverview(cg, node);
-        if (widgetOverview) {
-          lines.push(widgetOverview);
-          lines.push('');
-          // Supplement with incoming edges and impact radius
-          const incoming = cg.getIncomingEdges(node.id);
-          const inByKind = new Map<string, Edge[]>();
-          for (const e of incoming) {
-            const arr = inByKind.get(e.kind) || [];
-            arr.push(e);
-            inByKind.set(e.kind, arr);
-          }
-          if (inByKind.size > 0) {
-            lines.push('#### 引用者 (Incoming Edges)');
-            for (const [kind, edges] of inByKind) {
-              lines.push(`- ${kind}: ${edges.length}`);
-            }
-            lines.push('');
-          }
-          const impact = cg.getImpactRadius(node.id, 2);
-          const rootSet = new Set(impact.roots);
-          let l1 = 0, l2 = 0, l3 = 0;
-          const dist = new Map<string, number>();
-          const queue: string[] = [];
-          for (const rootId of impact.roots) {
-            dist.set(rootId, 0);
-            queue.push(rootId);
-          }
-          const adj = new Map<string, string[]>();
-          for (const e of impact.edges) {
-            if (e.kind === 'contains') continue;
-            const targets = adj.get(e.target) || [];
-            targets.push(e.source);
-            adj.set(e.target, targets);
-          }
-          for (let h = 0; h < queue.length; h++) {
-            const cur = queue[h]!;
-            const curDist = dist.get(cur)!;
-            const sources = adj.get(cur) || [];
-            for (const src of sources) {
-              if (!dist.has(src)) {
-                dist.set(src, curDist + 1);
-                queue.push(src);
-              }
-            }
-          }
-          for (const n of impact.nodes.values()) {
-            if (n.kind === 'file' || rootSet.has(n.id)) continue;
-            const d = dist.get(n.id) ?? 99;
-            if (d <= 1) l1++;
-            else if (d <= 2) l2++;
-            else l3++;
-          }
-          lines.push(`- **影响半径**: ${impact.nodes.size} nodes, L1=${l1}, L2=${l2}, L3=${l3}`);
-          lines.push('');
-          continue;
-        }
-      }
-
-      lines.push(`### ${node.name} (${node.kind})`);
-      lines.push(`- **定义**: ${node.filePath}:${node.startLine}`);
-      if (node.signature) lines.push(`- **签名**: \`${node.signature}\``);
-
-      // Incoming edges grouped by kind
-      const incoming = cg.getIncomingEdges(node.id);
-      const inByKind = new Map<string, Edge[]>();
-      for (const e of incoming) {
-        const arr = inByKind.get(e.kind) || [];
-        arr.push(e);
-        inByKind.set(e.kind, arr);
-      }
-      lines.push(`- **引用者** (${inByKind.size} kinds):`);
-      for (const [kind, edges] of inByKind) {
-        lines.push(`  - ${kind}: ${edges.length}`);
-      }
-
-      // Outgoing callees (top 5)
-      const callees = cg.getCallees(node.id);
-      if (callees.length > 0) {
-        lines.push(`- **被调用者** (${callees.length}):`);
-        for (const c of callees.slice(0, 5)) {
-          lines.push(`  - ${c.node.name} (${c.node.filePath}:${c.edge.line ?? c.node.startLine})`);
-        }
-        if (callees.length > 5) {
-          lines.push(`  ... and ${callees.length - 5} more`);
-        }
-      }
-
-      // Impact radius
-      const impact = cg.getImpactRadius(node.id, 2);
-      const rootSet = new Set(impact.roots);
-      let l1 = 0, l2 = 0, l3 = 0;
-      // Compute BFS distances from roots
-      const dist = new Map<string, number>();
-      const queue: string[] = [];
-      for (const rootId of impact.roots) {
-        dist.set(rootId, 0);
-        queue.push(rootId);
-      }
-      const adj = new Map<string, string[]>();
-      for (const e of impact.edges) {
-        if (e.kind === 'contains') continue;
-        const targets = adj.get(e.target) || [];
-        targets.push(e.source);
-        adj.set(e.target, targets);
-      }
-      for (let h = 0; h < queue.length; h++) {
-        const cur = queue[h]!;
-        const curDist = dist.get(cur)!;
-        const sources = adj.get(cur) || [];
-        for (const src of sources) {
-          if (!dist.has(src)) {
-            dist.set(src, curDist + 1);
-            queue.push(src);
-          }
-        }
-      }
-      for (const node of impact.nodes.values()) {
-        if (node.kind === 'file' || rootSet.has(node.id)) continue;
-        const d = dist.get(node.id) ?? 99;
-        if (d <= 1) l1++;
-        else if (d <= 2) l2++;
-        else l3++;
-      }
-      lines.push(`- **影响半径**: ${impact.nodes.size} nodes, L1=${l1}, L2=${l2}, L3=${l3}`);
-      lines.push('');
-    }
-
-    lines.push(allMatches.note);
-    return this.textResult(this.truncateOutput(lines.join('\n')));
+    return forkHandleSymbolInfo(this.buildToolContext(cg), args);
   }
 
   /**
@@ -2215,113 +1854,7 @@ export class ToolHandler {
   private formatExternalCallers(
     unresolved: UnresolvedReference[], symbol: string, limit: number,
   ): ToolResult {
-    const seen = new Set<string>();
-    const callers: Array<{ name: string; line: number; kind: string; filePath: string }> = [];
-    for (const ref of unresolved) {
-      if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'references'
-          && ref.referenceKind !== 'macro_call' && ref.referenceKind !== 'pattern_match') continue;
-      const key = `${ref.fromNodeId}:${ref.referenceKind}:${ref.line}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      callers.push({
-        name: ref.referenceName,
-        line: ref.line,
-        kind: ref.referenceKind === 'macro_call' ? 'external macro' : 'external',
-        filePath: ref.filePath ?? '',
-      });
-    }
-
-    if (callers.length === 0) {
-      return this.textResult(`No external callers found for "${symbol}"`);
-    }
-
-    const byFile = new Map<string, typeof callers>();
-    for (const c of callers) {
-      const arr = byFile.get(c.filePath) || [];
-      arr.push(c);
-      byFile.set(c.filePath, arr);
-    }
-
-    const shown = callers.slice(0, limit);
-    const lines: string[] = [
-      `## External Callers of "${symbol}" (${shown.length} shown, ${callers.length} total)`,
-      '',
-      '> External symbol — no project-internal node found. Results from unresolved references.',
-      '',
-    ];
-    for (const [file, fileCallers] of byFile) {
-      lines.push(`**${file}:**`);
-      for (const c of fileCallers) {
-        lines.push(`- ${c.name} (${c.kind}) line ${c.line}`);
-      }
-      lines.push('');
-    }
-    if (callers.length > limit) {
-      lines.push(`... and ${callers.length - limit} more callers`);
-    }
-    return this.textResult(this.truncateOutput(lines.join('\n')));
-  }
-
-  private handleUsagesFromUnresolved(
-    cg: CodeGraph, symbol: string, limit: number, kindFilter?: string,
-  ): ToolResult | null {
-    const unresolved = cg.getUnresolvedByName(symbol);
-    if (unresolved.length === 0) {
-      return null;
-    }
-
-    // Deduplicate by source node + kind + line
-    const seen = new Set<string>();
-    const usages: Array<{ sourceNode: Node; edgeKind: string; line: number }> = [];
-    for (const ref of unresolved) {
-      if (kindFilter && ref.referenceKind !== kindFilter) continue;
-      const key = `${ref.fromNodeId}:${ref.referenceKind}:${ref.line}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      const sourceNode = cg.getNode(ref.fromNodeId);
-      if (sourceNode) {
-        usages.push({ sourceNode, edgeKind: ref.referenceKind, line: ref.line });
-      }
-    }
-
-    if (usages.length === 0) {
-      return null;
-    }
-
-    // Group by file
-    const byFile = new Map<string, typeof usages>();
-    for (const u of usages) {
-      const existing = byFile.get(u.sourceNode.filePath) || [];
-      existing.push(u);
-      byFile.set(u.sourceNode.filePath, existing);
-    }
-
-    const lines: string[] = [
-      `## Usages of "${symbol}" (${Math.min(usages.length, limit)} shown, ${usages.length} total)`,
-      '',
-      '> External symbol — no project-internal node found. Results from unresolved references.',
-      '',
-    ];
-
-    let count = 0;
-    for (const [file, fileUsages] of byFile) {
-      if (count >= limit) break;
-      lines.push(`**${file}:**`);
-      for (const u of fileUsages) {
-        if (count >= limit) break;
-        const lineInfo = u.line ? `:${u.line}` : '';
-        lines.push(`- ${u.sourceNode.name} (${u.sourceNode.kind}) ${u.edgeKind}→ ${symbol}${lineInfo}`);
-        count++;
-      }
-      lines.push('');
-    }
-
-    if (usages.length > limit) {
-      lines.push(`... and ${usages.length - limit} more usages`);
-    }
-
-    return this.textResult(this.truncateOutput(lines.join('\n')));
+    return forkFormatExternalCallers(this.buildToolContext(this.cg!), unresolved, symbol, limit);
   }
 
   /**
@@ -3498,71 +3031,7 @@ export class ToolHandler {
    * Handle batch codegraph_node — multiple symbols in one call
    */
   private async handleBatchNode(cg: CodeGraph, symbols: string[], includeCode: boolean): Promise<ToolResult> {
-    const batchLimit = Math.min(symbols.length, 20);
-    const header = `## Batch Node Details (${batchLimit} symbols)`;
-    const allLines: string[] = [header, ''];
-    let totalLen = header.length + 2;
-    const BUDGET = MAX_OUTPUT_LENGTH - 500; // leave room for the trailing summary
-    const skippedNames: string[] = [];
-
-    for (const symbol of symbols.slice(0, batchLimit)) {
-      // Check remaining budget before processing the next symbol
-      if (totalLen > BUDGET) {
-        skippedNames.push(typeof symbol === 'string' ? symbol : String(symbol));
-        continue;
-      }
-
-      const valid = this.validateString(symbol, 'symbols');
-      if (typeof valid !== 'string') {
-        const msg = `### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`;
-        allLines.push(msg, '');
-        totalLen += msg.length + 2;
-        continue;
-      }
-      const match = this.findSymbol(cg, valid);
-      if (!match) {
-        const msg = `### ${valid}: not found`;
-        allLines.push(msg, '');
-        totalLen += msg.length + 2;
-        continue;
-      }
-
-      let code: string | null = null;
-      let outline: string | null = null;
-      if (CONTAINER_NODE_KINDS.has(match.node.kind)) {
-        outline = this.buildContainerOutline(cg, match.node);
-      }
-      if (includeCode) {
-        code = await cg.getCode(match.node.id);
-      }
-
-      const trail = this.formatTrail(cg, match.node);
-      const schedule = this.formatSchedule(cg, match.node);
-      const formatted = this.formatNodeDetails(match.node, code, outline) + schedule + trail + match.note;
-
-      // If this single symbol would push us past the budget, skip it
-      if (totalLen + formatted.length > BUDGET && allLines.length > 2) {
-        skippedNames.push(valid);
-        continue;
-      }
-
-      allLines.push(formatted, '');
-      totalLen += formatted.length + 2;
-    }
-
-    // Also catch symbols that were queued before the budget check triggered
-    // (they were already sliced into skippedNames above)
-
-    if (skippedNames.length > 0) {
-      const nameList = skippedNames.map(n => `"${n}"`).join(', ');
-      allLines.push(`---`);
-      allLines.push(`**${skippedNames.length} symbols not shown** (output budget reached). To get their source, use:`);
-      allLines.push(`  codegraph_node(symbols: [${nameList}], includeCode)`);
-    }
-
-    allLines.push(`---`);
-    allLines.push(`Total: ${batchLimit} symbols${skippedNames.length > 0 ? ` (${batchLimit - skippedNames.length} shown, ${skippedNames.length} deferred)` : ''}`);
-    return this.textResult(this.truncateOutput(allLines.join('\n')));
+    return forkHandleBatchNode(this.buildToolContext(cg), symbols, includeCode, MAX_OUTPUT_LENGTH);
   }
 
   /**
@@ -3914,38 +3383,7 @@ export class ToolHandler {
     cg: CodeGraph,
     files: Array<{ path: string; language: string; nodeCount: number }>
   ): Map<string, Array<{ name: string; kind: string }>> {
-    const symbolMap = new Map<string, Array<{ name: string; kind: string }>>();
-    const fileSet = new Set(files.map(f => f.path));
-
-    // Bulk query: get all top-level symbols. Use a high limit so large
-    // repos don't have symbols truncated for files that sort late alphabetically.
-    // Internal limit is 5× this value (searchAllByFilters multiplier).
-    const results = cg.searchNodes('', {
-      kinds: ['function', 'method', 'class', 'struct', 'enum', 'trait', 'interface', 'type_alias', 'module'] as NodeKind[],
-      limit: Math.min(files.length * 10, 5000),
-    });
-
-    // Per-file cap: 10 for small projects, 5 for large (>1000 files)
-    const perFileCap = files.length > 1000 ? 5 : 10;
-
-    for (const r of results) {
-      const fp = r.node.filePath;
-      if (!fileSet.has(fp)) continue;
-
-      let symbols = symbolMap.get(fp);
-      if (!symbols) {
-        symbols = [];
-        symbolMap.set(fp, symbols);
-      }
-      if (symbols.length >= perFileCap) continue;
-
-      const name = r.node.name.length > 30
-        ? r.node.name.slice(0, 27) + '...'
-        : r.node.name;
-      symbols.push({ name, kind: r.node.kind });
-    }
-
-    return symbolMap;
+    return forkFetchTopLevelSymbols(cg, files);
   }
 
   /**
@@ -3955,24 +3393,7 @@ export class ToolHandler {
     symbolMap: Map<string, Array<{ name: string; kind: string }>>,
     totalFiles: number
   ): string {
-    const lines: string[] = ['### Top-Level Symbols', ''];
-
-    const sorted = [...symbolMap.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]));
-
-    for (const [filePath, symbols] of sorted) {
-      if (symbols.length === 0) continue;
-      const symbolList = symbols.map(s => `${s.name} (${s.kind})`).join(', ');
-      lines.push(`- **${filePath}:** ${symbolList}`);
-    }
-
-    const filesWithSymbols = sorted.filter(([, s]) => s.length > 0).length;
-    if (filesWithSymbols < totalFiles) {
-      lines.push('');
-      lines.push(`*${totalFiles - filesWithSymbols} files have no top-level symbols*`);
-    }
-
-    return lines.join('\n');
+    return forkFormatFileSymbols(symbolMap, totalFiles);
   }
 
   // =========================================================================
@@ -4061,12 +3482,20 @@ export class ToolHandler {
     }
 
     if (exactMatches.length > 1) {
+      // Down-rank generated files (.pb.go, .pulsar.go, _grpc.pb.go, …)
+      // so a query like "Send" prefers the keeper implementation over
+      // the protobuf-generated interface stub.
+      const ranked = [...exactMatches].sort((a, b) => {
+        const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
+        const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+        return aGen - bGen;
+      });
       // Multiple exact matches - pick first, note the others
-      const picked = exactMatches[0]!.node;
-      const others = exactMatches.slice(1).map(r =>
+      const picked = ranked[0]!.node;
+      const others = ranked.slice(1).map(r =>
         `${r.node.name} (${r.node.kind}) at ${r.node.filePath}:${r.node.startLine}`
       );
-      const note = `\n\n> **Note:** ${exactMatches.length} symbols named "${symbol}". Showing results for \`${picked.filePath}:${picked.startLine}\`. Others: ${others.join(', ')}`;
+      const note = `\n\n> **Note:** ${ranked.length} symbols named "${symbol}". Showing results for \`${picked.filePath}:${picked.startLine}\`. Others: ${others.join(', ')}`;
       return { node: picked, note };
     }
 
@@ -4104,33 +3533,18 @@ export class ToolHandler {
       return { nodes: [node], note: '' };
     }
 
-    // Multiple exact matches: rank by reference heat (incoming edge count)
-    // to surface the most-used symbol first and enable auto-disambiguation
-    // when one symbol dominates all others.
-    const withHeat = exactMatches.map(r => ({
-      node: r.node,
-      heat: cg.getIncomingEdgeCount(r.node.id),
-    }));
-    withHeat.sort((a, b) => b.heat - a.heat);
+    // Same generated-file down-rank as findSymbol
+    const ranked = [...exactMatches].sort((a, b) => {
+      const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
+      const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+      return aGen - bGen;
+    });
 
-    // When one symbol dominates (>3× the runner-up), note it as the likely
-    // intended target but keep ALL matches in the node list. Aggregation tools
-    // (callers, callees, impact, usages) need the full set to avoid silently
-    // dropping edges from less-used symbols.
-    let note = '';
-    if (withHeat.length >= 2 && withHeat[0]!.heat > withHeat[1]!.heat * 3) {
-      const top = withHeat[0]!.node;
-      const others = withHeat.slice(1).map(r =>
-        `${r.node.kind} at ${r.node.filePath}:${r.node.startLine} (${r.heat} refs)`
-      );
-      note = `\n\n> **Heads-up:** "${symbol}" matched ${exactMatches.length} symbols, ranked by reference heat. \`${top.name}\` (${withHeat[0]!.heat} incoming refs — ${withHeat[0]!.heat > 0 && withHeat[1]!.heat > 0 ? `${Math.round(withHeat[0]!.heat / withHeat[1]!.heat)}×` : 'dominates'} the next best) is almost certainly the intended target. Other matches: ${others.join(', ')}`;
-    } else {
-      const locations = withHeat.map(r =>
-        `${r.node.kind} at ${r.node.filePath}:${r.node.startLine} (${r.heat} refs)`
-      );
-      note = `\n\n> **Note:** Aggregated results across ${exactMatches.length} symbols named "${symbol}", ranked by reference heat (most-referenced first): ${locations.join(', ')}`;
-    }
-    return { nodes: withHeat.map(r => r.node), note };
+    const locations = ranked.map(r =>
+      `${r.node.kind} at ${r.node.filePath}:${r.node.startLine}`
+    );
+    const note = `\n\n> **Note:** Aggregated results across ${ranked.length} symbols named "${symbol}": ${locations.join(', ')}`;
+    return { nodes: ranked.map(r => r.node), note };
   }
 
   /**
@@ -4168,201 +3582,10 @@ export class ToolHandler {
   }
 
   private formatImpact(symbol: string, impact: Subgraph, codeSource: CodeGraph | null): string {
-    const nodeCount = impact.nodes.size;
-
-    // Compute BFS distance from root nodes to all affected nodes
-    const rootSet = new Set(impact.roots);
-    const distance = new Map<string, number>();
-    const queue: string[] = [];
-    for (const rootId of impact.roots) {
-      distance.set(rootId, 0);
-      queue.push(rootId);
-    }
-    // Build reverse adjacency: target → sources (following incoming edges)
-    const adj = new Map<string, string[]>();
-    for (const e of impact.edges) {
-      if (e.kind === 'contains') continue;
-      const targets = adj.get(e.target) || [];
-      targets.push(e.source);
-      adj.set(e.target, targets);
-    }
-    for (let h = 0; h < queue.length; h++) {
-      const cur = queue[h]!;
-      const curDist = distance.get(cur)!;
-      const sources = adj.get(cur) || [];
-      for (const src of sources) {
-        if (!distance.has(src)) {
-          distance.set(src, curDist + 1);
-          queue.push(src);
-        }
-      }
-    }
-
-    // Group by risk level
-    const ENVELOPE_KINDS = new Set(['class', 'struct', 'interface', 'enum', 'namespace', 'module', 'trait', 'protocol', 'component']);
-    const levels: Array<{ label: string; desc: string; nodes: Map<string, Node[]> }> = [
-      { label: 'Level 1 (direct)', desc: 'Directly references — must review if changing', nodes: new Map() },
-      { label: 'Level 2 (indirect)', desc: 'One hop away — likely affected', nodes: new Map() },
-      { label: 'Level 3 (transitive)', desc: 'Two or more hops — may be affected', nodes: new Map() },
-    ];
-
-    for (const node of impact.nodes.values()) {
-      if (node.kind === 'file' || rootSet.has(node.id)) continue;
-      const d = distance.get(node.id) ?? 99;
-      const levelIdx = d <= 1 ? 0 : d <= 2 ? 1 : 2;
-      const byFile = levels[levelIdx]!.nodes;
-      const existing = byFile.get(node.filePath) || [];
-      existing.push(node);
-      byFile.set(node.filePath, existing);
-    }
-
-    // Build nodeId → incoming edge kinds mapping for risk classification
-    const nodeIncomingKinds = new Map<string, EdgeKind[]>();
-    for (const e of impact.edges) {
-      if (e.kind === 'contains') continue;
-      const kinds = nodeIncomingKinds.get(e.target) || [];
-      kinds.push(e.kind);
-      nodeIncomingKinds.set(e.target, kinds);
-    }
-
-    // Overall risk breakdown (count symbols, not edges)
-    let totalHigh = 0, totalMedium = 0, totalLow = 0;
-    for (const [nodeId, kinds] of nodeIncomingKinds.entries()) {
-      if (kinds.length === 0) continue;
-      if (nodeId.startsWith('file:') || rootSet.has(nodeId)) continue;
-      let hasHigh = false, hasMedium = false;
-      for (const k of kinds) {
-        const risk = this.classifyEdgeRisk(k);
-        if (risk === 'high') hasHigh = true;
-        else if (risk === 'medium') hasMedium = true;
-      }
-      if (hasHigh) totalHigh++;
-      else if (hasMedium) totalMedium++;
-      else totalLow++;
-    }
-
-    const lines: string[] = [
-      `## Impact: "${symbol}" affects ${nodeCount} symbols`,
-      '',
-    ];
-    if (totalHigh > 0 || totalMedium > 0 || totalLow > 0) {
-      const parts: string[] = [];
-      if (totalHigh > 0) parts.push(`${totalHigh} high-risk`);
-      if (totalMedium > 0) parts.push(`${totalMedium} medium-risk`);
-      if (totalLow > 0) parts.push(`${totalLow} low-risk`);
-      lines.push(`**Risk breakdown:** ${parts.join(', ')}`, '');
-    }
-
-    for (const level of levels) {
-      // Deduplicate file entries
-      const files: Array<{ filePath: string; nodes: Node[] }> = [];
-      for (const [filePath, fileNodes] of level.nodes) {
-        // Drop whole-file envelope nodes when more specific symbols exist
-        const specific = fileNodes.filter(n => !ENVELOPE_KINDS.has(n.kind));
-        if (specific.length > 0) {
-          files.push({ filePath, nodes: specific });
-        } else {
-          files.push({ filePath, nodes: fileNodes });
-        }
-      }
-      if (files.length === 0) continue;
-
-      let levelNodeCount = 0;
-      for (const f of files) levelNodeCount += f.nodes.length;
-
-      // Per-level risk breakdown (count symbols, not edges)
-      const levelNodeIds = new Set(files.flatMap(f => f.nodes.map(n => n.id)));
-      let lvlHigh = 0, lvlMedium = 0, lvlLow = 0;
-      const lvlByKind = new Map<string, number>();
-      for (const nid of levelNodeIds) {
-        const kinds = nodeIncomingKinds.get(nid) || [];
-        if (kinds.length === 0) continue;
-        let hasHigh = false, hasMedium = false;
-        const seenKinds = new Set<string>();
-        for (const k of kinds) {
-          if (seenKinds.has(k)) continue;
-          seenKinds.add(k);
-          const risk = this.classifyEdgeRisk(k);
-          if (risk === 'high') hasHigh = true;
-          else if (risk === 'medium') hasMedium = true;
-          lvlByKind.set(k, (lvlByKind.get(k) || 0) + 1);
-        }
-        if (hasHigh) lvlHigh++;
-        else if (hasMedium) lvlMedium++;
-        else lvlLow++;
-      }
-      const riskParts: string[] = [];
-      if (lvlHigh > 0) {
-        const highKinds = [...lvlByKind.entries()]
-          .filter(([k]) => this.classifyEdgeRisk(k as EdgeKind) === 'high')
-          .sort((a, b) => b[1] - a[1])
-          .map(([k, c]) => `${c} ${k}`).join(', ');
-        riskParts.push(`${lvlHigh} high-risk (${highKinds})`);
-      }
-      if (lvlMedium > 0) {
-        const medKinds = [...lvlByKind.entries()]
-          .filter(([k]) => this.classifyEdgeRisk(k as EdgeKind) === 'medium')
-          .sort((a, b) => b[1] - a[1])
-          .map(([k, c]) => `${c} ${k}`).join(', ');
-        riskParts.push(`${lvlMedium} medium-risk (${medKinds})`);
-      }
-      if (lvlLow > 0) riskParts.push(`${lvlLow} low-risk`);
-      const riskSuffix = riskParts.length > 0 ? ` [${riskParts.join('; ')}]` : '';
-
-      lines.push(`### ${level.label} — ${level.desc} (${levelNodeCount} symbols)${riskSuffix}`);
-      lines.push('');
-      const isLevel1 = level.label.startsWith('Level 1');
-      const fileCache = new Map<string, string[]>();
-      for (const { filePath, nodes } of files) {
-        const nodeList = nodes.slice(0, 10).map(n => `${n.name}:${n.startLine}`).join(', ');
-        const tail = nodes.length > 10 ? `, +${nodes.length - 10} more` : '';
-        lines.push(`- **${filePath}:** ${nodeList}${tail}`);
-        // For Level 1 with includeCode, inline source snippets for each node
-        if (isLevel1 && codeSource) {
-          for (const n of nodes.slice(0, 10)) {
-            const src = this.sourceRangeAt(codeSource, n.filePath, n.startLine, n.endLine, fileCache, 8, 400);
-            if (src) {
-              lines.push(`  \`${n.name}\`: ${src.split('\n').map(l => '  ' + l.trim()).join('\n')}`);
-            }
-          }
-        }
-      }
-      lines.push('');
-    }
-
-    return lines.join('\n');
+    return forkFormatImpact(this.buildToolContext(codeSource ?? this.cg!), symbol, impact, codeSource);
   }
 
   /**
-   * Classify an edge kind by risk level for impact analysis.
-   *
-   * When adding a new EdgeKind, add a case here so it isn't silently
-   * treated as low risk.
-   */
-  private classifyEdgeRisk(kind: EdgeKind): 'high' | 'medium' | 'low' {
-    const bevy = classifyBevyEdgeRisk(kind);
-    if (bevy) return bevy;
-    switch (kind) {
-      case 'calls':
-      case 'extends':
-      case 'implements':
-      case 'overrides':
-      case 'pattern_match':
-        return 'high';
-      case 'instantiates':
-      case 'imports':
-      case 'exports':
-      case 'decorates':
-        return 'medium';
-      case 'references':
-      case 'type_of':
-      case 'returns':
-        return 'low';
-      default:
-        console.warn(`[CodeGraph] classifyEdgeRisk: unhandled EdgeKind "${kind}", defaulting to 'low'`);
-        return 'low';
-    }
-  }
 
   /**
    * Build a compact structural outline of a container symbol from its

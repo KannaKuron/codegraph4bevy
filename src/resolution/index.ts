@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Node, UnresolvedReference, Edge, NodeKind } from '../types';
+import { Node, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -16,17 +16,10 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-
-// B13: Node kinds that can be the target of a calls edge.
-// Fields, variables, constants, and other non-callable symbols
-// should not be resolved as call targets.
-const CALLABLE_NODE_KINDS = new Set<NodeKind>([
-  'function', 'method', 'class', 'struct', 'trait', 'interface',
-]);
 import { matchReference } from './name-matcher';
+import { PRESERVED_UNRESOLVED_KINDS } from './fork-config';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
 import { detectFrameworks } from './frameworks';
-import { RUST_STD_MACROS } from './frameworks/rust';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
@@ -590,9 +583,6 @@ export class ReferenceResolver {
       return null;
     }
 
-    // Skip macro_call references — they are not resolved to project symbols
-    if (ref.referenceKind === 'macro_call') return null;
-
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -649,8 +639,7 @@ export class ReferenceResolver {
    * Create edges from resolved references
    */
   createEdges(resolved: ResolvedRef[]): Edge[] {
-    return resolved
-      .map((ref) => {
+    return resolved.map((ref) => {
       let kind = ref.original.referenceKind;
 
       // Promote "extends" to "implements" when a class/struct targets an interface
@@ -665,15 +654,14 @@ export class ReferenceResolver {
       }
 
       // Promote "calls" to "instantiates" when the resolved target is a
-      // class/struct.
+      // class/struct. Languages without a `new` keyword (Python, Ruby)
+      // express instantiation as `Foo()` — extraction can't tell that
+      // apart from a function call without symbol info, but resolution
+      // can: if `Foo` resolves to a class, the call IS an instantiation.
       if (kind === 'calls') {
         const targetNode = this.queries.getNodeById(ref.targetNodeId);
         if (targetNode && (targetNode.kind === 'class' || targetNode.kind === 'struct')) {
           kind = 'instantiates';
-        }
-        // B13: Reject calls edges to non-callable nodes (fields, variables, etc.)
-        if (targetNode && !CALLABLE_NODE_KINDS.has(targetNode.kind)) {
-          return null;
         }
       }
 
@@ -688,8 +676,7 @@ export class ReferenceResolver {
           resolvedBy: ref.resolvedBy,
         },
       };
-    })
-    .filter((e) => e !== null) as Edge[];
+    });
   }
 
   /**
@@ -716,28 +703,11 @@ export class ReferenceResolver {
           fromNodeId: r.original.fromNodeId,
           referenceName: r.original.referenceName,
           referenceKind: r.original.referenceKind,
-          line: r.original.line,
-          col: r.original.column,
         }))
       );
     }
 
     return result;
-  }
-
-  /**
-   * Re-synthesize heuristic callback/dispatcher edges after scoped resolution.
-   * These edges (e.g., Bevy state transitions) cross file boundaries and are
-   * cascade-deleted when nodes are removed during re-extraction. Must be called
-   * after any scoped resolveAndPersist to restore whole-graph synthesized edges.
-   * Best-effort — failures are silently ignored.
-   */
-  synthesizeCallbackEdges(): number {
-    try {
-      return synthesizeCallbackEdges(this.queries, this.context);
-    } catch {
-      return 0;
-    }
   }
 
   /**
@@ -781,16 +751,14 @@ export class ReferenceResolver {
             fromNodeId: r.original.fromNodeId,
             referenceName: r.original.referenceName,
             referenceKind: r.original.referenceKind,
-            line: r.original.line,
-            col: r.original.column,
           }))
         );
       }
 
-      // Delete unresolved refs, but preserve type_of and calls — type_of
-      // are structural relationships; calls to external symbols (e.g. Bevy
-      // API, std library) are valuable for usages/search even when unresolved.
-      const PRESERVED_KINDS = new Set(['type_of', 'calls', 'macro_call', 'method_call']);
+      // Delete unresolvable refs from this batch to avoid re-processing them,
+      // but preserve type_of, calls, macro_call, method_call — these are
+      // structural relationships valuable for usages/search even when unresolved.
+      const PRESERVED_KINDS = PRESERVED_UNRESOLVED_KINDS;
       if (result.unresolved.length > 0) {
         const deletable = result.unresolved.filter(r => !PRESERVED_KINDS.has(r.referenceKind));
         if (deletable.length > 0) {
@@ -799,8 +767,6 @@ export class ReferenceResolver {
               fromNodeId: r.fromNodeId,
               referenceName: r.referenceName,
               referenceKind: r.referenceKind,
-              line: r.line,
-              col: r.column,
             }))
           );
         }
@@ -932,11 +898,6 @@ export class ReferenceResolver {
       if (PASCAL_BUILT_INS.has(name)) {
         return true;
       }
-    }
-
-    // Rust standard library macros — only suppress if no project symbol has this name
-    if (ref.language === 'rust' && RUST_STD_MACROS.has(name) && !this.knownNames?.has(name)) {
-      return true;
     }
 
     // C/C++ standard library symbols (printf, malloc, std::vector, etc.).

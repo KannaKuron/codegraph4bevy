@@ -291,6 +291,15 @@ export function isGrammarLoaded(language: Language): boolean {
 }
 
 /**
+ * Languages whose extraction is file-level only (no inner symbols).
+ * Matches the skip branch in `extractFileRecursive` — languages listed
+ * here produce a single `file` node and are never parsed for symbols.
+ */
+export function isFileLevelOnlyLanguage(language: Language): boolean {
+  return language === 'yaml' || language === 'twig' || language === 'properties';
+}
+
+/**
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {

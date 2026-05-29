@@ -416,8 +416,8 @@ function writeErrorLog(projectPath: string, errors: Array<{ message: string; fil
  */
 program
   .command('init [path]')
-  .description('Initialize CodeGraph in a project directory')
-  .option('-i, --index', 'Run initial indexing after initialization')
+  .description('Initialize CodeGraph in a project directory and build the initial index')
+  .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
@@ -429,15 +429,6 @@ program
       if (isInitialized(projectPath)) {
         clack.log.warn(`Already initialized in ${projectPath}`);
         clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
-        // Re-run agent surface wiring so re-running `init` is the
-        // documented way to recover a project that's missing its
-        // Cursor rules file (or future per-agent project surfaces).
-        try {
-          const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
-          for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
-            clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
-          }
-        } catch { /* non-fatal */ }
         try {
           const { offerWatchFallback } = await import('../installer');
           await offerWatchFallback(clack, projectPath);
@@ -450,41 +441,24 @@ program
       const cg = await CodeGraph.init(projectPath, { index: false });
       clack.log.success(`Initialized in ${projectPath}`);
 
-      // Bootstrap project-local surfaces for any agent that's
-      // configured globally (Cursor needs ./.cursor/rules/codegraph.mdc
-      // to actually prefer codegraph over native grep). Silent when
-      // there's nothing to write.
-      try {
-        const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
-        for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
-          clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        clack.log.warn(`Skipped wiring project-local agent surfaces: ${msg}`);
-      }
-
-      if (options.index) {
-        let result: IndexResult;
-
-        if (options.verbose) {
-          result = await cg.indexAll({
-            onProgress: createVerboseProgress(),
-            verbose: true,
-          });
-        } else {
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          result = await cg.indexAll({
-            onProgress: progress.onProgress,
-          });
-          await progress.stop();
-        }
-
-        printIndexResult(clack, result, projectPath);
+      // Indexing runs by default now. The legacy -i/--index flag is still
+      // accepted (so existing muscle memory and scripts don't break) but is a
+      // no-op — initializing always builds the initial index.
+      let result: IndexResult;
+      if (options.verbose) {
+        result = await cg.indexAll({
+          onProgress: createVerboseProgress(),
+          verbose: true,
+        });
       } else {
-        clack.log.info('Run "codegraph index" to index the project');
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+        result = await cg.indexAll({
+          onProgress: progress.onProgress,
+        });
+        await progress.stop();
       }
+      printIndexResult(clack, result, projectPath);
 
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -843,9 +817,19 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       const limit = parseInt(options.limit || '10', 10);
-      const results = cg.searchNodes(search, {
+      const rawResults = cg.searchNodes(search, {
         limit,
         kinds: options.kind ? [options.kind as any] : undefined,
+      });
+
+      // Mirror the MCP search down-rank so the CLI also surfaces the
+      // hand-written implementation before protobuf/gRPC scaffolding
+      // when both share a name. See extraction/generated-detection.ts.
+      const { isGeneratedFile } = await import('../extraction/generated-detection');
+      const results = [...rawResults].sort((a, b) => {
+        const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
+        const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+        return aGen - bGen;
       });
 
       if (options.json) {
@@ -1259,11 +1243,7 @@ program
       const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol
-          || match.node.name.endsWith(`.${symbol}`)
-          || match.node.name.endsWith(`::${symbol}`)
-          || match.node.qualifiedName === symbol
-          || match.node.qualifiedName?.endsWith(`::${symbol}`);
+        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
         if (!exactMatch && matches.length > 1) continue;
         for (const c of cg.getCallers(match.node.id)) {
           if (!seen.has(c.node.id)) {
@@ -1342,11 +1322,7 @@ program
       const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol
-          || match.node.name.endsWith(`.${symbol}`)
-          || match.node.name.endsWith(`::${symbol}`)
-          || match.node.qualifiedName === symbol
-          || match.node.qualifiedName?.endsWith(`::${symbol}`);
+        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
         if (!exactMatch && matches.length > 1) continue;
         for (const c of cg.getCallees(match.node.id)) {
           if (!seen.has(c.node.id)) {
@@ -1426,11 +1402,7 @@ program
       let edgeCount = 0;
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol
-          || match.node.name.endsWith(`.${symbol}`)
-          || match.node.name.endsWith(`::${symbol}`)
-          || match.node.qualifiedName === symbol
-          || match.node.qualifiedName?.endsWith(`::${symbol}`);
+        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
         if (!exactMatch && matches.length > 1) continue;
         const impact = cg.getImpactRadius(match.node.id, depth);
         for (const [id, n] of impact.nodes) {

@@ -18,15 +18,42 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
-import { kindBonus, nameMatchBonus, scorePathRelevance, escapeLike, enrichCJKForFTS } from '../search/query-utils';
+import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
+import { isGeneratedFile } from '../extraction/generated-detection';
+import * as forkQueries from './fork-queries';
+
+/**
+ * Path-only heuristic for files that should not be candidates for
+ * "dominant file" detection: test/spec files and tool-generated files.
+ * Generated files (`*.pb.go`, `*.pulsar.go`, mock outputs, …) often
+ * have huge in-file edge counts that dwarf the real source — etcd's
+ * `rpc.pb.go` has 4× the in-file edges of `server.go`.
+ */
+function isLowValueFile(filePath: string): boolean {
+  const lp = filePath.toLowerCase();
+  return (
+    /(?:^|\/)(tests?|__tests?__|spec)\//.test(lp) ||
+    /_test\.go$/.test(lp) ||
+    /(?:^|\/)test_[^/]+\.py$/.test(lp) ||
+    /_test\.py$/.test(lp) ||
+    /_spec\.rb$/.test(lp) ||
+    /_test\.rb$/.test(lp) ||
+    /\.(test|spec)\.[jt]sx?$/.test(lp) ||
+    /(test|spec|tests)\.(java|kt|scala)$/.test(lp) ||
+    /(tests?|spec)\.cs$/.test(lp) ||
+    /tests?\.swift$/.test(lp) ||
+    /_test\.dart$/.test(lp) ||
+    isGeneratedFile(filePath)
+  );
+}
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
 
 /**
  * Database row types (snake_case from SQLite)
  */
-interface NodeRow {
+export interface NodeRow {
   id: string;
   kind: string;
   name: string;
@@ -71,7 +98,7 @@ interface FileRow {
   errors: string | null;
 }
 
-interface UnresolvedRefRow {
+export interface UnresolvedRefRow {
   id: number;
   from_node_id: string;
   reference_name: string;
@@ -86,7 +113,7 @@ interface UnresolvedRefRow {
 /**
  * Convert database row to Node object
  */
-function rowToNode(row: NodeRow): Node {
+export function rowToNode(row: NodeRow): Node {
   return {
     id: row.id,
     kind: row.kind as NodeKind,
@@ -152,11 +179,6 @@ export class QueryBuilder {
   private nodeCache: Map<string, Node> = new Map();
   private readonly maxCacheSize = 1000;
 
-  // Whether the 'nodes' table has a 'fts_tokens' column (fork schema).
-  // Upstream schema omits it; detect at construction so both prepared-statement
-  // paths coexist and upstream edits to queries.ts merge cleanly.
-  private readonly hasFtsTokens: boolean;
-
   // Prepared statements (lazily initialized)
   private stmts: {
     insertNode?: SqliteStatement;
@@ -180,7 +202,6 @@ export class QueryBuilder {
     insertUnresolved?: SqliteStatement;
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
-    getUnresolvedByNode?: SqliteStatement;
     getNodesByName?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
@@ -188,27 +209,13 @@ export class QueryBuilder {
     getUnresolvedBatch?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
+    getDominantFile?: SqliteStatement;
+    getTopRouteFile?: SqliteStatement;
+    getRoutingManifest?: SqliteStatement;
   } = {};
 
   constructor(db: SqliteDatabase) {
     this.db = db;
-    // Detect fork-specific fts_tokens column.
-    // pragma() uses .get() which returns only the first row, so we
-    // use prepare().all() instead since table_info returns one row per column.
-    try {
-      const cols = this.db.prepare('PRAGMA table_info(nodes)').all() as Array<{ name: string }>;
-      this.hasFtsTokens = cols.some(c => c.name === 'fts_tokens');
-    } catch {
-      this.hasFtsTokens = false;
-    }
-  }
-
-  /**
-   * Run a function inside a database transaction.
-   * If the function throws, the transaction is rolled back automatically.
-   */
-  transaction<T>(fn: () => T): T {
-    return this.db.transaction(fn)();
   }
 
   // ===========================================================================
@@ -220,39 +227,21 @@ export class QueryBuilder {
    */
   insertNode(node: Node): void {
     if (!this.stmts.insertNode) {
-      if (this.hasFtsTokens) {
-        this.stmts.insertNode = this.db.prepare(`
-          INSERT OR REPLACE INTO nodes (
-            id, kind, name, qualified_name, file_path, language,
-            start_line, end_line, start_column, end_column,
-            docstring, signature, visibility,
-            is_exported, is_async, is_static, is_abstract,
-            decorators, type_parameters, updated_at, fts_tokens
-          ) VALUES (
-            @id, @kind, @name, @qualifiedName, @filePath, @language,
-            @startLine, @endLine, @startColumn, @endColumn,
-            @docstring, @signature, @visibility,
-            @isExported, @isAsync, @isStatic, @isAbstract,
-            @decorators, @typeParameters, @updatedAt, @ftsTokens
-          )
-        `);
-      } else {
-        this.stmts.insertNode = this.db.prepare(`
-          INSERT OR REPLACE INTO nodes (
-            id, kind, name, qualified_name, file_path, language,
-            start_line, end_line, start_column, end_column,
-            docstring, signature, visibility,
-            is_exported, is_async, is_static, is_abstract,
-            decorators, type_parameters, updated_at
-          ) VALUES (
-            @id, @kind, @name, @qualifiedName, @filePath, @language,
-            @startLine, @endLine, @startColumn, @endColumn,
-            @docstring, @signature, @visibility,
-            @isExported, @isAsync, @isStatic, @isAbstract,
-            @decorators, @typeParameters, @updatedAt
-          )
-        `);
-      }
+      this.stmts.insertNode = this.db.prepare(`
+        INSERT OR REPLACE INTO nodes (
+          id, kind, name, qualified_name, file_path, language,
+          start_line, end_line, start_column, end_column,
+          docstring, signature, visibility,
+          is_exported, is_async, is_static, is_abstract,
+          decorators, type_parameters, updated_at
+        ) VALUES (
+          @id, @kind, @name, @qualifiedName, @filePath, @language,
+          @startLine, @endLine, @startColumn, @endColumn,
+          @docstring, @signature, @visibility,
+          @isExported, @isAsync, @isStatic, @isAbstract,
+          @decorators, @typeParameters, @updatedAt
+        )
+      `);
     }
 
     // Validate required fields to prevent SQLite bind errors
@@ -294,7 +283,6 @@ export class QueryBuilder {
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
       updatedAt: node.updatedAt ?? Date.now(),
-      ...(this.hasFtsTokens ? { ftsTokens: enrichCJKForFTS(node.name) } : {}),
     });
   }
 
@@ -314,56 +302,29 @@ export class QueryBuilder {
    */
   updateNode(node: Node): void {
     if (!this.stmts.updateNode) {
-      if (this.hasFtsTokens) {
-        this.stmts.updateNode = this.db.prepare(`
-          UPDATE nodes SET
-            kind = @kind,
-            name = @name,
-            qualified_name = @qualifiedName,
-            file_path = @filePath,
-            language = @language,
-            start_line = @startLine,
-            end_line = @endLine,
-            start_column = @startColumn,
-            end_column = @endColumn,
-            docstring = @docstring,
-            signature = @signature,
-            visibility = @visibility,
-            is_exported = @isExported,
-            is_async = @isAsync,
-            is_static = @isStatic,
-            is_abstract = @isAbstract,
-            decorators = @decorators,
-            type_parameters = @typeParameters,
-            fts_tokens = @ftsTokens,
-            updated_at = @updatedAt
-          WHERE id = @id
-        `);
-      } else {
-        this.stmts.updateNode = this.db.prepare(`
-          UPDATE nodes SET
-            kind = @kind,
-            name = @name,
-            qualified_name = @qualifiedName,
-            file_path = @filePath,
-            language = @language,
-            start_line = @startLine,
-            end_line = @endLine,
-            start_column = @startColumn,
-            end_column = @endColumn,
-            docstring = @docstring,
-            signature = @signature,
-            visibility = @visibility,
-            is_exported = @isExported,
-            is_async = @isAsync,
-            is_static = @isStatic,
-            is_abstract = @isAbstract,
-            decorators = @decorators,
-            type_parameters = @typeParameters,
-            updated_at = @updatedAt
-          WHERE id = @id
-        `);
-      }
+      this.stmts.updateNode = this.db.prepare(`
+        UPDATE nodes SET
+          kind = @kind,
+          name = @name,
+          qualified_name = @qualifiedName,
+          file_path = @filePath,
+          language = @language,
+          start_line = @startLine,
+          end_line = @endLine,
+          start_column = @startColumn,
+          end_column = @endColumn,
+          docstring = @docstring,
+          signature = @signature,
+          visibility = @visibility,
+          is_exported = @isExported,
+          is_async = @isAsync,
+          is_static = @isStatic,
+          is_abstract = @isAbstract,
+          decorators = @decorators,
+          type_parameters = @typeParameters,
+          updated_at = @updatedAt
+        WHERE id = @id
+      `);
     }
 
     // Invalidate cache before update
@@ -395,7 +356,6 @@ export class QueryBuilder {
       isAbstract: node.isAbstract ? 1 : 0,
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
-      ...(this.hasFtsTokens ? { ftsTokens: enrichCJKForFTS(node.name) } : {}),
       updatedAt: node.updatedAt ?? Date.now(),
     });
   }
@@ -560,6 +520,158 @@ export class QueryBuilder {
   }
 
   /**
+   * Find the file that holds the densest concentration of the project's
+   * internal call graph — the "core" file. Used by context-builder to
+   * boost ranking of symbols in that file's directory (so e.g. sinatra
+   * queries surface `lib/sinatra/base.rb`'s `route!` instead of
+   * `sinatra-contrib/lib/sinatra/multi_route.rb`'s `route` extension).
+   *
+   * Returns null if no file has a meaningful concentration (e.g. spread
+   * evenly across many files, or empty index).
+   *
+   * "Internal" = source and target are in the same file. Cross-file
+   * edges aren't useful here — they don't tell us which file is the
+   * functional center.
+   *
+   * Excludes test/spec files from candidacy via path-pattern. The agent's
+   * typical question is "how does X work", not "how is X tested", so
+   * boosting a test file's directory would be a misfire.
+   */
+  getDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
+    if (!this.stmts.getDominantFile) {
+      // Pull top 20 candidates; we then filter out test/generated files
+      // in code (regex-grade matching that SQL LIKE can't express). The
+      // generated-file filter is critical — without it, etcd's
+      // `api/etcdserverpb/rpc.pb.go` (1916 in-file edges, generated
+      // protobuf stub) outranks the real `server/etcdserver/server.go`
+      // (470 edges) by 4×, and the boost would push the agent toward
+      // generated code.
+      this.stmts.getDominantFile = this.db.prepare(`
+        SELECT n.file_path AS file_path, COUNT(*) AS edge_count
+        FROM edges e
+        JOIN nodes n ON e.source = n.id
+        JOIN nodes m ON e.target = m.id
+        WHERE n.file_path = m.file_path
+        GROUP BY n.file_path
+        ORDER BY edge_count DESC
+        LIMIT 20
+      `);
+    }
+    const rows = this.stmts.getDominantFile.all() as Array<{ file_path: string; edge_count: number }>;
+    const filtered = rows.filter(r => !isLowValueFile(r.file_path));
+    if (filtered.length === 0 || filtered[0]!.edge_count < 20) return null;
+    return {
+      filePath: filtered[0]!.file_path,
+      edgeCount: filtered[0]!.edge_count,
+      nextEdgeCount: filtered[1]?.edge_count ?? 0,
+    };
+  }
+
+  /**
+   * Find the file that holds the densest concentration of the project's
+   * `route` nodes (framework-emitted: Express/Gin/Flask/Rails/Drupal/etc.).
+   * Used by handleContext on small repos to inline the project's routing
+   * config when the agent's query is about request flow — eliminating the
+   * "Glob + Read routes.rb" pattern that beats codegraph on tiny realworld
+   * template repos.
+   *
+   * Excludes test/generated files from candidacy. Returns null if there
+   * are fewer than 3 non-test routes total, or if no file holds at least
+   * 30% of them (diffuse routing → no single answer file).
+   */
+  getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
+    if (!this.stmts.getTopRouteFile) {
+      this.stmts.getTopRouteFile = this.db.prepare(`
+        SELECT file_path, COUNT(*) AS cnt
+        FROM nodes
+        WHERE kind = 'route'
+        GROUP BY file_path
+        ORDER BY cnt DESC
+        LIMIT 20
+      `);
+    }
+    const rows = this.stmts.getTopRouteFile.all() as Array<{ file_path: string; cnt: number }>;
+    const filtered = rows.filter(r => !isLowValueFile(r.file_path));
+    if (filtered.length === 0) return null;
+    const totalRoutes = filtered.reduce((sum, r) => sum + r.cnt, 0);
+    const top = filtered[0]!;
+    if (totalRoutes < 3 || top.cnt < 3) return null;
+    if (top.cnt / totalRoutes < 0.30) return null;
+    return { filePath: top.file_path, routeCount: top.cnt, totalRoutes };
+  }
+
+  /**
+   * Build a URL → handler manifest from the index. Each route node's
+   * `references` edge points at the function/method that handles the
+   * request. We join them in one pass; the agent gets the canonical
+   * routing answer ("POST /users/login → AuthController#login") without
+   * having to parse the framework's route DSL itself.
+   *
+   * Also returns the file with the most handler endpoints — used as the
+   * "top handler file" to inline source for, so the agent has both the
+   * mapping AND the handler implementations.
+   */
+  getRoutingManifest(limit: number = 40): {
+    entries: Array<{ url: string; handler: string; handlerFile: string; handlerLine: number; handlerKind: string }>;
+    topHandlerFile: string | null;
+    topHandlerFileCount: number;
+    totalRoutes: number;
+  } | null {
+    if (!this.stmts.getRoutingManifest) {
+      // Edge kind varies across framework resolvers: Spring/Rails/
+      // Laravel/Drupal emit `references`, Express emits `calls`. Accept
+      // both — the semantic is the same (route → its handler).
+      this.stmts.getRoutingManifest = this.db.prepare(`
+        SELECT
+          r.name AS url,
+          h.name AS handler,
+          h.file_path AS handler_file,
+          h.start_line AS handler_line,
+          h.kind AS handler_kind
+        FROM nodes r
+        JOIN edges e ON e.source = r.id
+        JOIN nodes h ON e.target = h.id
+        WHERE r.kind = 'route'
+          AND e.kind IN ('references', 'calls')
+          AND h.kind IN ('function', 'method', 'class')
+        ORDER BY r.file_path, r.start_line
+        LIMIT ?
+      `);
+    }
+    const rows = this.stmts.getRoutingManifest.all(limit) as Array<{
+      url: string; handler: string; handler_file: string; handler_line: number; handler_kind: string;
+    }>;
+    // Drop test/generated handlers — same hygiene as elsewhere.
+    const filtered = rows.filter(r => !isLowValueFile(r.handler_file));
+    if (filtered.length < 3) return null;
+    // Identify the file holding the most handlers (the "primary handler file").
+    const fileCounts = new Map<string, number>();
+    for (const r of filtered) {
+      fileCounts.set(r.handler_file, (fileCounts.get(r.handler_file) ?? 0) + 1);
+    }
+    let topHandlerFile: string | null = null;
+    let topHandlerFileCount = 0;
+    for (const [file, count] of fileCounts) {
+      if (count > topHandlerFileCount) {
+        topHandlerFile = file;
+        topHandlerFileCount = count;
+      }
+    }
+    return {
+      entries: filtered.map(r => ({
+        url: r.url,
+        handler: r.handler,
+        handlerFile: r.handler_file,
+        handlerLine: r.handler_line,
+        handlerKind: r.handler_kind,
+      })),
+      topHandlerFile,
+      topHandlerFileCount,
+      totalRoutes: filtered.length,
+    };
+  }
+
+  /**
    * Get all nodes of a specific kind
    */
   getNodesByKind(kind: NodeKind): Node[] {
@@ -624,7 +736,7 @@ export class QueryBuilder {
    * 3. Score results based on match quality
    */
   searchNodes(query: string, options: SearchOptions = {}): SearchResult[] {
-    const { limit = 500, offset = 0 } = options;
+    const { limit = 100, offset = 0 } = options;
 
     // Parse field-qualified bits out of the raw query (kind:, lang:,
     // path:, name:). Anything not recognised stays in `text` and goes
@@ -649,84 +761,18 @@ export class QueryBuilder {
     const kinds = mergedKinds;
     const languages = mergedLanguages;
 
-    // Try FTS5 with prefix matching.
-    // unicode61 tokenizer + jieba fts_tokens handles CJK correctly,
-    // so FTS works for all languages.
-    let results: SearchResult[];
+    // First try FTS5 with prefix matching
+    let results = text
+      ? this.searchNodesFTS(text, { kinds, languages, limit, offset })
+      // Over-fetch by 5× when running filter-only (no text). The
+      // post-scoring path: + name: filters can be very selective, so
+      // a smaller multiplier risks returning fewer than `limit`
+      // results despite the DB having plenty of matches.
+      : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
 
-    // Regex path: detect /pattern/flags or heuristic metacharacters.
-    // Early return with shared post-processing (rescoring, offset, filters).
-    if (text) {
-      const regexSpec = this.isRegexQuery(text);
-      if (regexSpec) {
-        const regexResults = this.searchNodesRegex(text, regexSpec, { kinds, languages, limit });
-        if (regexResults.length > 0) {
-          results = regexResults;
-          // Apply exact-match supplement (same as FTS path below)
-          if (query) {
-            const existingIds = new Set(results.map(r => r.node.id));
-            const maxScore = Math.max(...results.map(r => r.score));
-            const terms = query.split(/\s+/).filter(t => t.length >= 2);
-            for (const term of terms) {
-              let sql = 'SELECT * FROM nodes WHERE name = ? COLLATE NOCASE';
-              const params: (string | number)[] = [term];
-              if (kinds && kinds.length > 0) {
-                sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
-                params.push(...kinds);
-              }
-              if (languages && languages.length > 0) {
-                sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
-                params.push(...languages);
-              }
-              sql += ' LIMIT 20';
-              const rows = this.db.prepare(sql).all(...params) as NodeRow[];
-              for (const row of rows) {
-                if (!existingIds.has(row.id)) {
-                  results.push({ node: rowToNode(row), score: maxScore });
-                  existingIds.add(row.id);
-                }
-              }
-            }
-          }
-          // Apply multi-signal rescoring (same as FTS path below)
-          if (query) {
-            results = results.map(r => ({
-              ...r,
-              score: r.score
-                + kindBonus(r.node.kind)
-                + scorePathRelevance(r.node.filePath, query)
-                + nameMatchBonus(r.node.name, query),
-            }));
-            results.sort((a, b) => b.score - a.score);
-            if (results.length > limit) results = results.slice(0, limit);
-          }
-          // Apply path/name filters + offset (same as FTS path below)
-          if (pathFilters.length > 0) {
-            const lowered = pathFilters.map((p) => p.toLowerCase());
-            results = results.filter((r) => lowered.some((p) => r.node.filePath.toLowerCase().includes(p)));
-          }
-          if (nameFilters.length > 0) {
-            const lowered = nameFilters.map((n) => n.toLowerCase());
-            results = results.filter((r) => lowered.some((n) => r.node.name.toLowerCase().includes(n)));
-          }
-          if (offset > 0 && results.length > offset) {
-            results = results.slice(offset);
-          }
-          return results;
-        }
-        // If regex found nothing (e.g., invalid pattern), fall through to FTS
-      }
-    }
-
-    if (text) {
-      results = this.searchNodesFTS(text, { kinds, languages, limit, offset });
-      if (results.length === 0 && text.length >= 2) {
-        results = this.searchNodesLike(text, { kinds, languages, limit, offset });
-      }
-    } else {
-      // No text portion — filter-only query (kind:, lang:, path:)
-      // Over-fetch by 5× so post-scoring has enough candidates to narrow from
-      results = this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
+    // If no FTS results, try LIKE-based substring search
+    if (results.length === 0 && text.length >= 2) {
+      results = this.searchNodesLike(text, { kinds, languages, limit, offset });
     }
 
     // Final fuzzy fallback: scan all known names and keep those within
@@ -837,66 +883,7 @@ export class QueryBuilder {
   }
 
   /**
-   * Detect whether a query string is a regex pattern.
-   * Returns { pattern, flags } if it looks like a regex, or null otherwise.
-   *
-   * Explicit syntax: /pattern/flags
-   * Heuristic: contains regex metacharacters ($, |, [..., (?...)
-   */
-  private isRegexQuery(query: string): { pattern: string; flags: string } | null {
-    // Explicit /pattern/flags syntax
-    const slashMatch = query.match(/^\/(.+)\/([gimsuy]*)$/);
-    if (slashMatch) {
-      return { pattern: slashMatch[1]!, flags: slashMatch[2] || 'i' };
-    }
-    // Heuristic: regex metacharacters that FTS can't handle
-    if (/[|]|[?]\(|\.\*|\.\+|\[.*\]|\(\?:|\$$/.test(query) ||
-        (query.startsWith('^') && query.length > 2)) {
-      return { pattern: query, flags: 'i' };
-    }
-    return null;
-  }
-
-  /**
-   * Regex search: fetch candidates via SQL filters, then JS-side RegExp match on node.name.
-   * Falls back to empty results if the pattern is invalid.
-   */
-  private searchNodesRegex(
-    query: string,
-    spec: { pattern: string; flags: string },
-    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number }
-  ): SearchResult[] {
-    const { kinds, languages, limit } = options;
-    let re: RegExp;
-    try {
-      re = new RegExp(spec.pattern, spec.flags);
-    } catch {
-      return []; // invalid regex — let caller fall back to FTS
-    }
-
-    // Over-fetch candidates from SQL so regex has a broad pool to filter.
-    // Use searchAllByFilters when kinds/languages are set; otherwise scan all.
-    const candidates = this.searchAllByFilters({
-      kinds,
-      languages,
-      limit: limit * 3,
-    });
-
-    const results: SearchResult[] = [];
-    for (const r of candidates) {
-      if (re.test(r.node.name)) {
-        results.push({
-          node: r.node,
-          score: kindBonus(r.node.kind) + nameMatchBonus(r.node.name, query) + scorePathRelevance(r.node.filePath, query),
-        });
-      }
-      if (results.length >= limit) break;
-    }
-    results.sort((a, b) => b.score - a.score);
-    return results;
-  }
-
-  /**
+   * Fuzzy fallback: when zero FTS/LIKE hits, try an edit-distance
    * sweep over the distinct symbol-name set. Caps `maxDist` at 2 so
    * `getUssr` finds `getUser` but `process` doesn't match `prosody`.
    * Bounded edit distance keeps each comparison cheap; the per-query
@@ -974,7 +961,7 @@ export class QueryBuilder {
     // are stripped without splitting) and find nothing. See #173.
     const ftsQuery = query
       .replace(/::/g, ' ') // Rust/C++/Ruby qualifier separator
-      .replace(/['"*():^\\]/g, '') // Remove FTS5 special chars
+      .replace(/['"*():^]/g, '') // Remove FTS5 special chars
       .split(/\s+/)
       .filter(term => term.length > 0)
       // Strip FTS5 boolean operators to prevent query manipulation
@@ -986,21 +973,15 @@ export class QueryBuilder {
       return [];
     }
 
-    // BM25 column weights depend on FTS table schema.
-    // With fts_tokens (fork): id=0, name=20, qualified_name=5, docstring=1, signature=2, fts_tokens=15
-    // Without fts_tokens (upstream): id=0, name=20, qualified_name=5, docstring=1, signature=2
-    const bm25Weights = this.hasFtsTokens
-      ? 'bm25(nodes_fts, 0, 20, 5, 1, 2, 15)'
-      : 'bm25(nodes_fts, 0, 20, 5, 1, 2)';
+    // BM25 column weights: id=0, name=20, qualified_name=5, docstring=1, signature=2
     // Heavy name weight ensures exact/prefix name matches rank above incidental
     // mentions in long docstrings or qualified names of nested symbols.
-    // fts_tokens gets high weight so jieba-segmented CJK tokens contribute meaningfully.
     // Fetch 5x requested limit so post-hoc rescoring (kindBonus, pathRelevance,
     // nameMatchBonus) can promote results that BM25 alone undervalues.
     const ftsLimit = Math.max(limit * 5, 100);
 
     let sql = `
-      SELECT nodes.*, ${bm25Weights} as score
+      SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2) as score
       FROM nodes_fts
       JOIN nodes ON nodes_fts.id = nodes.id
       WHERE nodes_fts MATCH ?
@@ -1040,40 +1021,36 @@ export class QueryBuilder {
   private searchNodesLike(query: string, options: SearchOptions): SearchResult[] {
     const { kinds, languages, limit = 100, offset = 0 } = options;
 
-    // LIKE uses ESCAPE '\' so that _ and % in user queries are treated
-    // literally after escapeLike. The = clause uses the raw query since
-    // = does not treat _ / % as wildcards.
-    const escaped = escapeLike(query);
     let sql = `
       SELECT nodes.*,
         CASE
           WHEN name = ? THEN 1.0
-          WHEN name LIKE ? ESCAPE '\\' THEN 0.9
-          WHEN name LIKE ? ESCAPE '\\' THEN 0.8
-          WHEN qualified_name LIKE ? ESCAPE '\\' THEN 0.7
+          WHEN name LIKE ? THEN 0.9
+          WHEN name LIKE ? THEN 0.8
+          WHEN qualified_name LIKE ? THEN 0.7
           ELSE 0.5
         END as score
       FROM nodes
       WHERE (
-        name LIKE ? ESCAPE '\\' OR
-        qualified_name LIKE ? ESCAPE '\\' OR
-        name LIKE ? ESCAPE '\\'
+        name LIKE ? OR
+        qualified_name LIKE ? OR
+        name LIKE ?
       )
     `;
 
     // Pattern variants for better matching
-    const exactMatch = query;             // raw — = does not use wildcards
-    const startsWith = `${escaped}%`;
-    const contains = `%${escaped}%`;
+    const exactMatch = query;
+    const startsWith = `${query}%`;
+    const contains = `%${query}%`;
 
     const params: (string | number)[] = [
-      exactMatch,     // Exact match score (=)
-      startsWith,     // Starts with score (LIKE ... ESCAPE '\')
-      contains,       // Contains score (LIKE ... ESCAPE '\')
-      contains,       // Qualified name score (LIKE ... ESCAPE '\')
-      contains,       // WHERE: name contains (LIKE ... ESCAPE '\')
-      contains,       // WHERE: qualified_name contains (LIKE ... ESCAPE '\')
-      startsWith,     // WHERE: name starts with (LIKE ... ESCAPE '\')
+      exactMatch,     // Exact match score
+      startsWith,     // Starts with score
+      contains,       // Contains score
+      contains,       // Qualified name score
+      contains,       // WHERE: name contains
+      contains,       // WHERE: qualified_name contains
+      startsWith,     // WHERE: name starts with
     ];
 
     if (kinds && kinds.length > 0) {
@@ -1201,18 +1178,17 @@ export class QueryBuilder {
   ): SearchResult[] {
     const { kinds, languages, limit = 30, excludePrefix } = options;
 
-    const escaped = escapeLike(substring);
     let sql = `
       SELECT nodes.*, 1.0 as score
       FROM nodes
-      WHERE name LIKE ? ESCAPE '\\'
+      WHERE name LIKE ?
     `;
-    const params: (string | number)[] = [`%${escaped}%`];
+    const params: (string | number)[] = [`%${substring}%`];
 
     // Exclude prefix matches (handled by FTS-based prefix search in Step 2b)
     if (excludePrefix) {
-      sql += ` AND name NOT LIKE ? ESCAPE '\\'`;
-      params.push(`${escaped}%`);
+      sql += ` AND name NOT LIKE ?`;
+      params.push(`${substring}%`);
     }
 
     if (kinds && kinds.length > 0) {
@@ -1230,135 +1206,6 @@ export class QueryBuilder {
 
     const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
     return rows.map((row) => ({
-      node: rowToNode(row),
-      score: row.score,
-    }));
-  }
-
-  /**
-   * Find nodes that reference a given type through type_of, references, or returns edges.
-   * For example, find all functions whose parameters include a Commands type.
-   */
-  findNodesByReferencedType(
-    typeName: string,
-    options: SearchOptions & { edgeKinds?: EdgeKind[] } = {}
-  ): SearchResult[] {
-    const { kinds, languages, limit = 50, edgeKinds } = options;
-    const targetKinds = edgeKinds ?? ['type_of', 'references', 'returns'];
-
-    // Build shared filter clauses for both sides of the UNION.
-    let filterSql = '';
-    const filterParams: (string | number)[] = [];
-    if (kinds && kinds.length > 0) {
-      filterSql += ` AND n.kind IN (${kinds.map(() => '?').join(',')})`;
-      filterParams.push(...kinds);
-    }
-    if (languages && languages.length > 0) {
-      filterSql += ` AND n.language IN (${languages.map(() => '?').join(',')})`;
-      filterParams.push(...languages);
-    }
-
-    // Side A: resolved edges — project-internal types with a matching node.
-    // Side B: unresolved references — external/dependency types (e.g. Bevy
-    //   Commands, Res, Query) that were extracted but never resolved to a
-    //   project node. Scored slightly lower so resolved matches sort first.
-    const kindPlaceholders = targetKinds.map(() => '?').join(',');
-    const sql = `
-      SELECT DISTINCT n.*, 1.0 as score
-      FROM nodes n
-      JOIN edges e ON n.id = e.source
-      JOIN nodes t ON e.target = t.id
-      WHERE t.name = ? COLLATE NOCASE
-      AND e.kind IN (${kindPlaceholders})
-      ${filterSql}
-      UNION
-      SELECT DISTINCT n.*, 0.8 as score
-      FROM nodes n
-      JOIN unresolved_refs u ON n.id = u.from_node_id
-      WHERE u.reference_name = ? COLLATE NOCASE
-      AND u.reference_kind IN (${kindPlaceholders})
-      ${filterSql}
-      ORDER BY score DESC, n.name ASC LIMIT ?
-    `;
-
-    const params: (string | number)[] = [
-      typeName, ...targetKinds, ...filterParams,
-      typeName, ...targetKinds, ...filterParams,
-      limit,
-    ];
-
-    const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
-    const seen = new Set<string>();
-    const deduped: (NodeRow & { score: number })[] = [];
-    for (const row of rows) {
-      if (!seen.has(row.id)) {
-        seen.add(row.id);
-        deduped.push(row);
-      }
-    }
-    return deduped.map((row) => ({
-      node: rowToNode(row),
-      score: row.score,
-    }));
-  }
-
-  /**
-   * Find nodes that implement a given trait/interface.
-   * Searches both resolved `implements` edges and `unresolved_refs`
-   * (for external/dependency traits like std::fmt::Display).
-   */
-  findImplementors(
-    traitName: string,
-    options: SearchOptions = {}
-  ): SearchResult[] {
-    const { kinds, languages, limit = 50 } = options;
-
-    let filterSql = '';
-    const filterParams: (string | number)[] = [];
-    if (kinds && kinds.length > 0) {
-      filterSql += ` AND n.kind IN (${kinds.map(() => '?').join(',')})`;
-      filterParams.push(...kinds);
-    }
-    if (languages && languages.length > 0) {
-      filterSql += ` AND n.language IN (${languages.map(() => '?').join(',')})`;
-      filterParams.push(...languages);
-    }
-
-    const escapedTrait = escapeLike(traitName);
-
-    const sql = `
-      SELECT DISTINCT n.*, 1.0 as score FROM nodes n
-      JOIN edges e ON n.id = e.source
-      JOIN nodes t ON e.target = t.id
-      WHERE t.name = ? COLLATE NOCASE AND e.kind = 'implements' ${filterSql}
-      UNION
-      SELECT DISTINCT n.*, 0.8 as score FROM nodes n
-      JOIN unresolved_refs u ON n.id = u.from_node_id
-      WHERE u.reference_name = ? COLLATE NOCASE AND u.reference_kind = 'implements' ${filterSql}
-      UNION
-      SELECT DISTINCT n.*, 0.6 as score FROM nodes n
-      WHERE n.signature LIKE '%implements ' || ? || '%' ESCAPE '\\' COLLATE NOCASE
-        AND n.kind IN ('struct', 'enum', 'class') ${filterSql}
-      ORDER BY score DESC, n.name ASC LIMIT ?
-    `;
-
-    const params: (string | number)[] = [
-      traitName, ...filterParams,
-      traitName, ...filterParams,
-      escapedTrait, ...filterParams,
-      limit,
-    ];
-
-    const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
-    const seen = new Set<string>();
-    const deduped: (NodeRow & { score: number })[] = [];
-    for (const row of rows) {
-      if (!seen.has(row.id)) {
-        seen.add(row.id);
-        deduped.push(row);
-      }
-    }
-    return deduped.map((row) => ({
       node: rowToNode(row),
       score: row.score,
     }));
@@ -1474,15 +1321,7 @@ export class QueryBuilder {
    * because it uses COUNT(*) instead of fetching all rows).
    */
   getIncomingEdgeCount(targetId: string, kinds?: EdgeKind[]): number {
-    if (kinds && kinds.length > 0) {
-      const sql = `SELECT COUNT(*) as cnt FROM edges WHERE target = ? AND kind IN (${kinds.map(() => '?').join(',')})`;
-      const row = this.db.prepare(sql).get(targetId, ...kinds) as { cnt: number } | undefined;
-      return row?.cnt ?? 0;
-    }
-    const row = this.db.prepare(
-      'SELECT COUNT(*) as cnt FROM edges WHERE target = ?'
-    ).get(targetId) as { cnt: number } | undefined;
-    return row?.cnt ?? 0;
+    return forkQueries.getIncomingEdgeCount(this.db, targetId, kinds);
   }
 
   /**
@@ -1546,7 +1385,6 @@ export class QueryBuilder {
   deleteFile(filePath: string): void {
     this.db.transaction(() => {
       this.deleteNodesByFile(filePath);
-      this.deleteComments(filePath);
       if (!this.stmts.deleteFile) {
         this.stmts.deleteFile = this.db.prepare('DELETE FROM files WHERE path = ?');
       }
@@ -1665,22 +1503,7 @@ export class QueryBuilder {
    * Get unresolved references by source node ID
    */
   getUnresolvedByNode(nodeId: string): UnresolvedReference[] {
-    if (!this.stmts.getUnresolvedByNode) {
-      this.stmts.getUnresolvedByNode = this.db.prepare(
-        'SELECT * FROM unresolved_refs WHERE from_node_id = ?'
-      );
-    }
-    const rows = this.stmts.getUnresolvedByNode.all(nodeId) as UnresolvedRefRow[];
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-    }));
+    return forkQueries.getUnresolvedByNode(this.db, nodeId);
   }
 
   /**
@@ -1802,14 +1625,14 @@ export class QueryBuilder {
    * Delete specific resolved references by (fromNodeId, referenceName, referenceKind) tuples.
    * More precise than deleteResolvedReferences — only removes refs that were actually resolved.
    */
-  deleteSpecificResolvedReferences(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; line: number; col: number }>): void {
+  deleteSpecificResolvedReferences(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>): void {
     if (refs.length === 0) return;
     const stmt = this.db.prepare(
-      'DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ? AND line = ? AND col = ?'
+      'DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?'
     );
     const deleteMany = this.db.transaction((items: typeof refs) => {
       for (const ref of items) {
-        stmt.run(ref.fromNodeId, ref.referenceName, ref.referenceKind, ref.line, ref.col);
+        stmt.run(ref.fromNodeId, ref.referenceName, ref.referenceKind);
       }
     });
     deleteMany(refs);
@@ -1913,20 +1736,30 @@ export class QueryBuilder {
     return result;
   }
 
+  // ===========================================================================
+  // Fork Extension: Search & Trait/Type Operations
+  // ===========================================================================
+
   /**
-   * Delete all comments for a file (call before re-indexing).
+   * Find nodes that reference a given type name (via type_of, references, returns edges).
+   * For example, find all functions whose parameters include a Commands type.
    */
-  deleteComments(filePath: string): void {
-    this.db.prepare('DELETE FROM comments WHERE file_path = ?').run(filePath);
+  findNodesByReferencedType(
+    typeName: string,
+    options: SearchOptions & { edgeKinds?: EdgeKind[] } = {}
+  ): SearchResult[] {
+    return forkQueries.findNodesByReferencedType(this.db, typeName, options);
   }
 
   /**
-   * Insert a comment entry.
+   * Find nodes that implement a given trait/interface.
+   * Searches both resolved `implements` edges and `unresolved_refs`.
    */
-  insertComment(comment: { filePath: string; startLine: number; endLine: number; text: string; kind: string; associatedSymbol?: string; ftsTokens?: string }): void {
-    this.db.prepare(
-      'INSERT INTO comments (file_path, start_line, end_line, text, kind, associated_symbol, fts_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(comment.filePath, comment.startLine, comment.endLine, comment.text, comment.kind, comment.associatedSymbol ?? null, comment.ftsTokens ?? '');
+  findImplementors(
+    traitName: string,
+    options: SearchOptions = {}
+  ): SearchResult[] {
+    return forkQueries.findImplementors(this.db, traitName, options);
   }
 
   /**
@@ -1940,64 +1773,15 @@ export class QueryBuilder {
     kind: string;
     associatedSymbol: string | null;
   }> {
-    // Sanitize FTS5 query — same logic as searchNodesFTS
-    const ftsQuery = query
-      .replace(/::/g, ' ')
-      .replace(/['"*():^\\]/g, '')
-      .split(/\s+/)
-      .filter(term => term.length > 0)
-      .filter(term => !/^(AND|OR|NOT|NEAR)$/i.test(term))
-      .map(term => `"${term}"*`)
-      .join(' OR ');
-
-    if (!ftsQuery) return [];
-
-    const sql = `
-      SELECT c.file_path, c.start_line, c.end_line, c.text, c.kind, c.associated_symbol
-      FROM comments_fts f
-      JOIN comments c ON c.rowid = f.rowid
-      WHERE comments_fts MATCH ?
-      ORDER BY rank
-      LIMIT ?
-    `;
-    const rows = this.db.prepare(sql).all(ftsQuery, limit) as Array<{
-      file_path: string;
-      start_line: number;
-      end_line: number;
-      text: string;
-      kind: string;
-      associated_symbol: string | null;
-    }>;
-    return rows.map(r => ({
-      filePath: r.file_path,
-      startLine: r.start_line,
-      endLine: r.end_line,
-      text: r.text,
-      kind: r.kind,
-      associatedSymbol: r.associated_symbol,
-    }));
-  }
-
-  /**
-   * Clear all data from the database
-   */
-  clear(): void {
-    this.nodeCache.clear();
-    this.db.transaction(() => {
-      this.db.exec('DELETE FROM unresolved_refs');
-      this.db.exec('DELETE FROM edges');
-      this.db.exec('DELETE FROM nodes');
-      this.db.exec('DELETE FROM files');
-      this.db.exec('DELETE FROM comments');
-    })();
+    return forkQueries.searchComments(this.db, query, limit);
   }
 
   // ===========================================================================
-  // External Symbol Operations (shallow crate indexing)
+  // Fork Extension: External Symbol Operations
   // ===========================================================================
 
   /**
-   * Get all external symbols for a type (all methods, constructors, etc.).
+   * Get all external symbols for a type.
    */
   getExternalSymbolsForType(typeName: string): Array<{
     crateName: string;
@@ -2008,27 +1792,7 @@ export class QueryBuilder {
     paramTypes: string | null;
     returnType: string | null;
   }> {
-    const rows = this.db.prepare(
-      `SELECT crate_name, crate_version, symbol_name, symbol_kind, method_name, param_types, return_type
-       FROM external_symbols WHERE symbol_name = ?`
-    ).all(typeName) as Array<{
-      crate_name: string;
-      crate_version: string;
-      symbol_name: string;
-      symbol_kind: string;
-      method_name: string | null;
-      param_types: string | null;
-      return_type: string | null;
-    }>;
-    return rows.map(r => ({
-      crateName: r.crate_name,
-      crateVersion: r.crate_version,
-      symbolName: r.symbol_name,
-      symbolKind: r.symbol_kind,
-      methodName: r.method_name,
-      paramTypes: r.param_types,
-      returnType: r.return_type,
-    }));
+    return forkQueries.getExternalSymbolsForType(this.db, typeName);
   }
 
   /**
@@ -2044,53 +1808,35 @@ export class QueryBuilder {
     returnType?: string;
     signature?: string;
   }): void {
-    this.db.prepare(`
-      INSERT INTO external_symbols
-        (crate_name, crate_version, symbol_name, symbol_kind, method_name, param_types, return_type, signature)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(crate_name, crate_version, symbol_name, method_name) DO UPDATE SET
-        symbol_kind = excluded.symbol_kind,
-        param_types = excluded.param_types,
-        return_type = excluded.return_type,
-        signature = excluded.signature
-    `).run(
-      params.crateName,
-      params.crateVersion,
-      params.symbolName,
-      params.symbolKind,
-      params.methodName ?? '',
-      params.paramTypes ?? null,
-      params.returnType ?? null,
-      params.signature ?? null,
-    );
+    return forkQueries.upsertExternalSymbol(this.db, params);
   }
 
   /**
    * Clear external symbols, optionally filtered by crate name.
    */
   clearExternalSymbols(crateName?: string): void {
-    if (crateName) {
-      this.db.prepare('DELETE FROM external_symbols WHERE crate_name = ?').run(crateName);
-    } else {
-      this.db.exec('DELETE FROM external_symbols');
-    }
+    return forkQueries.clearExternalSymbols(this.db, crateName);
   }
 
   /**
    * Find all types that have a method with the given name.
-   * Returns distinct (symbol_name, param_types) pairs, newest crate versions first.
-   * Used by resolveReceiverType Tiers 1.5 and 2 for generalized receiver type inference.
+   * Used by resolveReceiverType for generalized receiver type inference.
    */
   findTypesByMethod(methodName: string): Array<{ symbolName: string; paramTypes: string | null }> {
-    const rows = this.db.prepare(
-      `SELECT symbol_name, param_types FROM (
-         SELECT symbol_name, param_types,
-           ROW_NUMBER() OVER (PARTITION BY symbol_name ORDER BY crate_version DESC) as rn
-         FROM external_symbols
-         WHERE method_name = ? AND method_name != ''
-       ) WHERE rn = 1
-       LIMIT 30`
-    ).all(methodName) as Array<{ symbol_name: string; param_types: string | null }>;
-    return rows.map(r => ({ symbolName: r.symbol_name, paramTypes: r.param_types }));
+    return forkQueries.findTypesByMethod(this.db, methodName);
+  }
+
+  /**
+   * Clear all data from the database
+   */
+  clear(): void {
+    this.nodeCache.clear();
+    this.db.transaction(() => {
+      this.db.exec('DELETE FROM unresolved_refs');
+      this.db.exec('DELETE FROM edges');
+      this.db.exec('DELETE FROM nodes');
+      this.db.exec('DELETE FROM files');
+      this.db.exec('DELETE FROM comments');
+    })();
   }
 }

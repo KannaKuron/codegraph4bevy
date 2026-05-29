@@ -9,28 +9,6 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 import { stripCommentsForRegex } from '../strip-comments';
 import { getCargoWorkspaceCrateMap } from './cargo-workspace';
 
-export const RUST_STD_MACROS = new Set([
-  // Core formatting/output
-  'println', 'eprintln', 'print', 'eprint', 'format', 'format_args',
-  'write', 'writeln',
-  // Collection/constructor
-  'vec', 'boxed', 'pin', 'rc', 'arc',
-  // Assert/panic
-  'assert', 'assert_eq', 'assert_ne', 'debug_assert', 'debug_assert_eq', 'debug_assert_ne',
-  'panic', 'todo', 'unimplemented', 'unreachable',
-  // Compiler/utility
-  'compile_error', 'concat', 'concat_idents', 'env', 'option_env',
-  'include', 'include_str', 'include_bytes', 'cfg', 'cfg_attr',
-  'stringify', 'line', 'column', 'file', 'module_path',
-  // Test
-  'test', 'bench',
-  // Logging (log crate + tracing crate)
-  'log', 'warn', 'info', 'error', 'debug', 'trace',
-  'info_span', 'warn_span', 'error_span', 'debug_span', 'trace_span',
-  // Debug
-  'dbg',
-]);
-
 const cargoWorkspaceMapCache = new WeakMap<ResolutionContext, Map<string, string>>();
 
 function getCachedCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
@@ -90,8 +68,8 @@ export const rustResolver: FrameworkResolver = {
       }
     }
 
-    // Pattern 4: Module references (exclude stdlib macro names)
-    if (/^[a-z_]+$/.test(ref.referenceName) && !RUST_STD_MACROS.has(ref.referenceName)) {
+    // Pattern 4: Module references
+    if (/^[a-z_]+$/.test(ref.referenceName)) {
       const result = resolveModule(ref.referenceName, context);
       if (result) {
         // Workspace-manifest hits are an exact crate-name -> crate-root

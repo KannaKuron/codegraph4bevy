@@ -4,7 +4,8 @@
  * Formats TaskContext as markdown or JSON for consumption by Claude.
  */
 
-import { Node, Edge, TaskContext, Subgraph, EntryPointUsage } from '../types';
+import { Node, Edge, TaskContext, Subgraph } from '../types';
+import { isGeneratedFile } from '../extraction/generated-detection';
 
 /**
  * Format context as markdown
@@ -21,29 +22,19 @@ export function formatContextAsMarkdown(context: TaskContext): string {
   lines.push('## Code Context\n');
   lines.push(`**Query:** ${context.query}\n`);
 
-  // Entry points - compact format
-  if (context.entryPoints.length > 0) {
+  // Entry points - compact format. Re-sort so generated files (.pb.go,
+  // .pulsar.go, mocks, …) rank LAST — a flow query should lead with the
+  // hand-written implementation, not protobuf scaffolding.
+  const orderedEntries = [...context.entryPoints].sort((a, b) => {
+    const aGen = isGeneratedFile(a.filePath) ? 1 : 0;
+    const bGen = isGeneratedFile(b.filePath) ? 1 : 0;
+    return aGen - bGen;
+  });
+  if (orderedEntries.length > 0) {
     lines.push('### Entry Points\n');
-    const usageMap = new Map<string, EntryPointUsage>();
-    if (context.entryPointUsage) {
-      for (const u of context.entryPointUsage) usageMap.set(u.nodeId, u);
-    }
-    for (const node of context.entryPoints) {
+    for (const node of orderedEntries) {
       const location = node.startLine ? `:${node.startLine}` : '';
-      const usage = usageMap.get(node.id);
-      const parts: string[] = [];
-      if (usage) {
-        if (usage.topCallerNames.length > 0) {
-          parts.push(`called by: ${usage.topCallerNames.join(', ')}`);
-        }
-        const counts: string[] = [];
-        if (usage.callerCount > 0) counts.push(`${usage.callerCount} callers`);
-        if (usage.refCount > 0) counts.push(`${usage.refCount} refs`);
-        if (usage.patternCount > 0) counts.push(`${usage.patternCount} patterns`);
-        if (counts.length > 0) parts.push(counts.join(', '));
-      }
-      const suffix = parts.length > 0 ? ` — ${parts.join(' | ')}` : '';
-      lines.push(`- **${node.name}** (${node.kind}) - ${node.filePath}${location}${suffix}`);
+      lines.push(`- **${node.name}** (${node.kind}) - ${node.filePath}${location}`);
       if (node.signature) {
         lines.push(`  \`${node.signature}\``);
       }
@@ -51,9 +42,14 @@ export function formatContextAsMarkdown(context: TaskContext): string {
     lines.push('');
   }
 
-  // Related symbols - compact list (skip verbose structure tree)
+  // Related symbols - compact list (skip verbose structure tree). Drop nodes
+  // in generated source files (`.pb.go` / `.pulsar.go` / mocks / …) — agents
+  // chasing a flow never want to land on protobuf scaffolding (cosmos-Q3 used
+  // to list `gov.pulsar.go::GetExpeditedThreshold` and `1.pulsar.go::Get` in
+  // Related Symbols, pure noise that displaced real-flow entries).
   const otherSymbols = Array.from(context.subgraph.nodes.values())
     .filter(n => !context.entryPoints.some(e => e.id === n.id))
+    .filter(n => !isGeneratedFile(n.filePath))
     .slice(0, 10); // Limit to 10 related symbols
 
   if (otherSymbols.length > 0) {
@@ -72,10 +68,16 @@ export function formatContextAsMarkdown(context: TaskContext): string {
     lines.push('');
   }
 
-  // Code blocks - only for key entry points
+  // Code blocks - only for key entry points. Re-sort so non-generated blocks
+  // show first (consistent with Entry Points reordering above).
   if (context.codeBlocks.length > 0) {
+    const orderedBlocks = [...context.codeBlocks].sort((a, b) => {
+      const aGen = isGeneratedFile(a.filePath) ? 1 : 0;
+      const bGen = isGeneratedFile(b.filePath) ? 1 : 0;
+      return aGen - bGen;
+    });
     lines.push('### Code\n');
-    for (const block of context.codeBlocks) {
+    for (const block of orderedBlocks) {
       const nodeName = block.node?.name ?? 'Unknown';
       lines.push(`#### ${nodeName} (${block.filePath}:${block.startLine})\n`);
       lines.push('```' + block.language);
@@ -110,7 +112,6 @@ export function formatContextAsJson(context: TaskContext): string {
       nodeKind: block.node?.kind,
     })),
     relatedFiles: context.relatedFiles,
-    entryPointUsage: context.entryPointUsage,
     stats: context.stats,
   };
 

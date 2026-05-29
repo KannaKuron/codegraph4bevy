@@ -56,7 +56,7 @@ import { indexExternalCrates } from './extraction/external-crates';
 
 // Fork extensions — side-effect import triggers Bevy synthesizer registration
 import './bevy';
-import { resolveReceiverType } from './bevy/receiver-resolver';
+import { searchMacroCalls as forkSearchMacroCalls, searchMethodCalls as forkSearchMethodCalls } from './fork-api';
 
 // Re-export types for consumers
 export * from './types';
@@ -370,23 +370,23 @@ export class CodeGraph {
               total,
             });
           });
+        }
 
-          // B4: Index external crate symbols (Bevy method signatures)
-          // Runs after resolution so external symbols are available for
-          // resolveReceiverType Tier 2 lookups.
-          try {
-            // Ensure Rust grammar is loaded before tree-sitter based shallow indexing
-            if (!isGrammarLoaded('rust')) {
-              await loadGrammarsForLanguages(['rust']);
-            }
-            const crateResult = indexExternalCrates(this.projectRoot, this.queries);
-            if (crateResult.cratesIndexed > 0 || crateResult.errors.length > 0) {
-              logWarn(`External crate indexing: ${crateResult.cratesIndexed} crates, ${crateResult.symbolsIndexed} symbols` +
-                (crateResult.errors.length > 0 ? `, ${crateResult.errors.length} errors` : ''));
-            }
-          } catch {
-            // Crate indexing is best-effort; failures don't block indexing
+        // B4: Index external crate symbols (Bevy method signatures)
+        // Runs after resolution so external symbols are available for
+        // resolveReceiverType Tier 2 lookups.
+        try {
+          // Ensure Rust grammar is loaded before tree-sitter based shallow indexing
+          if (!isGrammarLoaded('rust')) {
+            await loadGrammarsForLanguages(['rust']);
           }
+          const crateResult = indexExternalCrates(this.projectRoot, this.queries);
+          if (crateResult.cratesIndexed > 0 || crateResult.errors.length > 0) {
+            logWarn(`External crate indexing: ${crateResult.cratesIndexed} crates, ${crateResult.symbolsIndexed} symbols` +
+              (crateResult.errors.length > 0 ? `, ${crateResult.errors.length} errors` : ''));
+          }
+        } catch {
+          // Crate indexing is best-effort; failures don't block indexing
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -473,12 +473,6 @@ export class CodeGraph {
                 total,
               });
             });
-
-            // N13: Re-synthesize heuristic callback/dispatcher edges (e.g.,
-            // Bevy state transitions). These cross file boundaries and were
-            // cascade-deleted when the changed file's nodes were removed
-            // during re-extraction.
-            this.resolver.synthesizeCallbackEdges();
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -573,21 +567,28 @@ export class CodeGraph {
   }
 
   /**
-   * Return the watcher's current set of files that changed since the last
-   * sync cycle completed. Empty when there is no active watcher.
+   * Files seen by the file watcher since the last successful sync —
+   * the per-file "stale" signal MCP tools attach to responses so an agent
+   * can fall back to {@link Read} for just the affected file without
+   * waiting for a debounced sync to complete (issue #403).
+   *
+   * Returns an empty list when the watcher isn't active, or no events have
+   * arrived. Each entry includes `firstSeenMs` and `lastSeenMs` (wall-clock
+   * `Date.now()` values) so callers can render "edited Nms ago", plus an
+   * `indexing` flag indicating whether the in-flight sync (if any) will
+   * absorb that file.
    */
   getPendingFiles(): PendingFile[] {
     return this.watcher?.getPendingFiles() ?? [];
   }
 
   /**
-   * Resolve when the file watcher is ready (chokidar has finished its
-   * initial scan). Rejects after timeoutMs (default 10s) if the watcher
-   * never becomes ready. Used by tests that need to trigger file writes
-   * after the watcher is guaranteed to detect them.
+   * Resolves once the file watcher has finished its initial chokidar scan.
+   * Useful for tests that need a deterministic boundary before asserting on
+   * `getPendingFiles()`. Resolves immediately when no watcher is active.
    */
-  async waitUntilWatcherReady(timeoutMs?: number): Promise<void> {
-    return this.watcher?.waitUntilReady(timeoutMs);
+  waitUntilWatcherReady(timeoutMs?: number): Promise<void> {
+    return this.watcher ? this.watcher.waitUntilReady(timeoutMs) : Promise.resolve();
   }
 
   /**
@@ -742,97 +743,18 @@ export class CodeGraph {
    * Returns deduplicated call locations from unresolved macro_call references.
    */
   searchMacroCalls(name: string, limit: number = 500): Array<{ filePath: string; line: number; column: number; fromNodeId: string }> {
-    // Normalize: strip trailing ! — macro names are stored without it (tree-sitter
-    // parses info! as macro_name=info + bang), but users naturally search info!
-    const normalized = name.endsWith('!') ? name.slice(0, -1) : name;
-    const refs = this.queries.getUnresolvedByName(normalized);
-    const seen = new Set<string>();
-    const results: Array<{ filePath: string; line: number; column: number; fromNodeId: string }> = [];
-    for (const ref of refs) {
-      if (ref.referenceKind !== 'macro_call') continue;
-      const key = `${ref.filePath}:${ref.line}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      results.push({ filePath: ref.filePath ?? '', line: ref.line, column: ref.column, fromNodeId: ref.fromNodeId });
-      if (results.length >= limit) break;
-    }
-    return results;
+    return forkSearchMacroCalls(this.queries, name, limit);
   }
 
   /**
    * Search for method call sites by method name.
-   * Returns deduplicated call locations from both unresolved method_call references
-   * and resolved calls edges (when the underlying ref was resolved and deleted).
    */
   searchMethodCalls(name: string, limit: number = 500): Array<{ filePath: string; line: number; column: number; fromNodeId: string; receiverHint: string; declaredType?: string }> {
-    const seen = new Set<string>();
-    const results: Array<{ filePath: string; line: number; column: number; fromNodeId: string; receiverHint: string; declaredType?: string }> = [];
-
-    // ── Phase 1: Unresolved method_call refs ──────────────────────────
-    const refs = this.queries.getUnresolvedByName(name);
-    for (const ref of refs) {
-      if (ref.referenceKind !== 'method_call') continue;
-      const key = `${ref.filePath}:${ref.line}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      // Look up the corresponding calls ref for receiver context
-      const callerRefs = this.queries.getUnresolvedByNode(ref.fromNodeId);
-      let receiverHint = '';
-      for (const cr of callerRefs) {
-        if (cr.referenceKind === 'calls' && cr.line === ref.line && cr.referenceName.endsWith(`.${name}`)) {
-          receiverHint = cr.referenceName.slice(0, -(name.length + 1));
-          break;
-        }
-      }
-      // Resolve declared type from the receiver variable's type_of edge
-      const declaredType = receiverHint ? resolveReceiverType(ref.fromNodeId, receiverHint, this.queries, this.traverser, name) : undefined;
-      results.push({ filePath: ref.filePath ?? '', line: ref.line, column: ref.column, fromNodeId: ref.fromNodeId, receiverHint, declaredType });
-      if (results.length >= limit) return results;
-    }
-
-    // ── Phase 2: Resolved calls edges ─────────────────────────────────
-    // When a method_call reference is resolved to a project-internal symbol,
-    // the unresolved ref is deleted and a calls edge is created. Search for
-    // nodes named `name` (any kind — resolution may map to fields, methods,
-    // or functions) that have incoming calls edges, then extract the declared
-    // type from the target's qualified name where available.
-    const methodNodes = this.queries.getNodesByName(name);
-    for (const methodNode of methodNodes) {
-      const incomingCalls = this.queries.getIncomingEdges(methodNode.id, ['calls']);
-      for (const edge of incomingCalls) {
-        const sourceNode = this.queries.getNodeById(edge.source);
-        if (!sourceNode) continue;
-        const key = `${sourceNode.filePath}:${edge.line}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        // Extract the declared type from the target's qualified name
-        // (e.g. "Commands::spawn" → declaredType = "Commands")
-        let declaredType: string | undefined;
-        const qn = methodNode.qualifiedName;
-        if (qn) {
-          const lastColon = qn.lastIndexOf('::');
-          if (lastColon > 0) {
-            declaredType = qn.slice(0, lastColon);
-          }
-        }
-        results.push({
-          filePath: sourceNode.filePath,
-          line: edge.line ?? sourceNode.startLine,
-          column: 0,
-          fromNodeId: edge.source,
-          receiverHint: '',
-          declaredType,
-        });
-        if (results.length >= limit) return results;
-      }
-    }
-
-    return results;
+    return forkSearchMethodCalls(this.queries, this.traverser, name, limit);
   }
 
   /**
    * Get unresolved references by reference name.
-   * Used for finding usages of external symbols (no project-internal node).
    */
   getUnresolvedByName(name: string): UnresolvedReference[] {
     return this.queries.getUnresolvedByName(name);
@@ -840,10 +762,36 @@ export class CodeGraph {
 
   /**
    * Get unresolved references originating from a specific node.
-   * Used for callees of external symbols.
    */
   getUnresolvedByNode(nodeId: string): UnresolvedReference[] {
     return this.queries.getUnresolvedByNode(nodeId);
+  }
+
+  /**
+   * Find the project's "primary route file" — the file with the densest
+   * concentration of framework-emitted `route` nodes (≥3 routes, ≥30%
+   * of all non-test routes). Used to inline the routing config in
+   * `codegraph_context` responses on small realworld template repos
+   * (rails-realworld, laravel-realworld, drupal-admintoolbar, …) where
+   * Glob+Read of `routes.rb`/`urls.py`/etc. otherwise beats codegraph.
+   */
+  getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
+    return this.queries.getTopRouteFile();
+  }
+
+  /**
+   * Build a URL → handler routing manifest from the index. Each entry
+   * pairs a route node (URL + method) with its handler function/method
+   * via the `references` edge that framework resolvers emit. Returns
+   * null when fewer than 3 valid (non-test) routes exist.
+   */
+  getRoutingManifest(limit?: number): {
+    entries: Array<{ url: string; handler: string; handlerFile: string; handlerLine: number; handlerKind: string }>;
+    topHandlerFile: string | null;
+    topHandlerFileCount: number;
+    totalRoutes: number;
+  } | null {
+    return this.queries.getRoutingManifest(limit);
   }
 
   // ===========================================================================
@@ -1031,14 +979,6 @@ export class CodeGraph {
   getChildren(nodeId: string): Node[] {
     return this.traverser.getChildren(nodeId);
   }
-
-  /**
-   * Get all descendants of a node recursively (following contains edges).
-   */
-  getDescendantsRecursive(nodeId: string, maxDepth?: number): Node[] {
-    return this.traverser.getDescendantsRecursive(nodeId, maxDepth);
-  }
-
 
   /**
    * Get dependencies of a file
