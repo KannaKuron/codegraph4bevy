@@ -28,6 +28,7 @@ import { logDebug } from '../errors';
 import { validatePathWithinRoot } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDependencyFile } from '../search/query-utils';
 import { segmentChinese } from '../search/jieba-helper';
+import { buildUITreeSection } from '../mcp/bevy-ui-tree';
 
 /**
  * Extract likely symbol names from a natural language query
@@ -328,7 +329,8 @@ export class ContextBuilder {
 
     // Return formatted output or raw context
     if (opts.format === 'markdown') {
-      return formatContextAsMarkdown(context) + this.buildCallPathsSection(subgraph);
+      const uiTree = buildUITreeSection(context, this.projectRoot);
+      return formatContextAsMarkdown(context) + this.buildCallPathsSection(subgraph) + uiTree;
     } else if (opts.format === 'json') {
       return formatContextAsJson(context);
     }

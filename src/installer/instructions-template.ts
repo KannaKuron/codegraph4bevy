@@ -30,8 +30,7 @@ export const INSTRUCTIONS_TEMPLATE = `${CODEGRAPH_SECTION_START}
 - **直接回答，不要委托探索。** 架构问题：先 \`codegraph_context\`，再 ONE \`codegraph_explore\`。流程问题：先 \`codegraph_trace\` from→to，再 ONE \`codegraph_explore\`。不要用 \`codegraph_search\` + \`codegraph_callers\` 手动重建路径。
 - **信任 codegraph 结果。** 来自完整 AST 解析。不要用 grep 重新验证。
 - **查符号名时不要先用 grep。** \`codegraph_search\` 更快，一次返回 kind + 位置 + 签名。支持正则（\`/pattern/flags\`）、后缀匹配，无需退回 grep。
-- **不要 \`codegraph_search\` + \`codegraph_node\` 链式调用** — 一个 \`codegraph_context\` 就够。
-- **不要对多个符号循环调 \`codegraph_node\`** — 一次 \`codegraph_explore\` 返回多个符号的源码。\`codegraph_impact\`、\`codegraph_callers\`、\`codegraph_node\` 也支持 \`symbols\` 数组批量查询。
+- **\`codegraph_explore\` 裁剪时用 \`codegraph_node\` 补全。** explore 受输出预算限制，大文件可能裁剪。对 gap 中需要的函数，用 \`codegraph_node(name, includeCode)\` 获取完整源码 + Trail 调用链。多个符号用 \`symbols\` 数组一次调完，不要逐个调。
 - **explore 返回原始源码** — 与 Read 字节一致，带行号。explore 展示过的文件视为已 Read，不要重复打开。
 - **结果分页**：\`codegraph_search\` 支持 \`offset\` 翻页，返回 \`total\` 总数。需要更多结果时用 \`offset\` 续传，不要换查询词重搜。
 - **索引延迟**：文件监视器写入后约 500ms 去抖；同一轮内编辑文件后不要立即重新查询。

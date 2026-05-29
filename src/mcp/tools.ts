@@ -564,6 +564,15 @@ export const tools: ToolDefinition[] = [
           description: '跳过前 N 个文件（0-indexed），配合"Not shown above"列表分页',
           default: 0,
         },
+        maxItems: {
+          type: 'number',
+          description: '每页返回的代码段数（默认: 3）。配合 itemsOffset 翻页获取更多',
+        },
+        itemsOffset: {
+          type: 'number',
+          description: '跳过前 N 个代码段（按重要性排序），用于翻页（默认: 0）',
+          default: 0,
+        },
         sourceOnly: {
           type: 'boolean',
           description: '跳过关系图，只返回源码（默认: false）',
@@ -2763,6 +2772,8 @@ export class ToolHandler {
     }
     const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
     const filesOffset = Math.max(0, (args.filesOffset as number) || 0);
+    const maxItems = clamp((args.maxItems as number) || 3, 1, 20);
+    const itemsOffset = Math.max(0, (args.itemsOffset as number) || 0);
 
     // Step 1: Find relevant context with generous parameters.
     // Use a large maxNodes budget — explore has its own 35k char output limit
@@ -2967,6 +2978,7 @@ export class ToolHandler {
     let totalChars = lines.join('\n').length;
     let filesIncluded = 0;
     let anyFileTrimmed = false;
+    let hasMoreItemsGlobal = false;
 
     for (let fileIdx = 0; fileIdx < sortedFiles.length; fileIdx++) {
       if (filesIncluded >= maxFiles) break;
@@ -3149,6 +3161,8 @@ export class ToolHandler {
 
       const chosenIndices = new Set<number>();
       let projectedChars = 0;
+      let skippedByCharCap = false;
+      let hitMaxItems = false;
       for (const rc of rankedClusters) {
         const sectionLen = buildSection(rc.c).length + (chosenIndices.size > 0 ? GAP_MARKER.length : 0);
         // Always take the top-ranked cluster, even if oversize, so we don't
@@ -3159,17 +3173,79 @@ export class ToolHandler {
           projectedChars += sectionLen;
           continue;
         }
-        if (projectedChars + sectionLen > budget.maxCharsPerFile) continue;
+        // Stop at item count limit (primary) or character safety cap (secondary)
+        if (chosenIndices.size >= maxItems) { hitMaxItems = true; break; }
+        if (projectedChars + sectionLen > budget.maxCharsPerFile) { skippedByCharCap = true; continue; }
         chosenIndices.add(rc.idx);
         projectedChars += sectionLen;
       }
+
+      // File-head guarantee: ensure the first 15% of the file's structural
+      // code is included (entry function at the top of the file is often lost
+      // when query matches later sections).
+      // Check: does any chosen cluster START within the head region?
+      // (A cluster that starts at line 199 but spans backward doesn't help
+      // the agent see the actual file-opening code.)
+      const headThreshold = Math.max(1, Math.floor(fileLines.length * 0.15));
+      const sortedChosenStarts = [...chosenIndices].map(i => clusters[i]!.start).sort((a, b) => a - b);
+      const earliestChosenStart = sortedChosenStarts[0] ?? Infinity;
+
+      if (earliestChosenStart > headThreshold) {
+        // Find the first cluster that covers the head region
+        let headIdx = -1;
+        for (let i = 0; i < clusters.length; i++) {
+          if (!chosenIndices.has(i) && clusters[i]!.start <= headThreshold) { headIdx = i; break; }
+        }
+        if (headIdx >= 0) {
+          const headLen = buildSection(clusters[headIdx]!).length;
+          if (chosenIndices.size < maxItems && projectedChars + headLen <= budget.maxCharsPerFile) {
+            chosenIndices.add(headIdx);
+            projectedChars += headLen;
+          } else if (chosenIndices.size > 0) {
+            // Swap out the lowest-ranked chosen cluster (last in the ranked
+            // order that was actually chosen) for the file-head cluster.
+            // This preserves higher-ranked query matches while ensuring
+            // the file opening structure is visible.
+            // Build a map from cluster index → rank position (0 = best)
+            const rankOf = new Map<number, number>();
+            for (let r = 0; r < rankedClusters.length; r++) {
+              rankOf.set(rankedClusters[r]!.idx, r);
+            }
+            // Find the chosen cluster with the worst (highest) rank
+            let worstIdx = -1;
+            let worstRank = -1;
+            for (const ci of chosenIndices) {
+              const rank = rankOf.get(ci) ?? Infinity;
+              if (rank > worstRank) { worstRank = rank; worstIdx = ci; }
+            }
+            if (worstIdx >= 0) {
+              chosenIndices.delete(worstIdx);
+              chosenIndices.add(headIdx);
+            }
+          }
+        }
+      }
+
+      // Apply itemsOffset pagination: rank all chosen clusters by importance,
+      // then skip itemsOffset and take maxItems for THIS page.
+      const allChosenRanked = [...chosenIndices]
+        .map(i => ({ idx: i, c: clusters[i]! }))
+        .sort((a, b) => {
+          if (b.c.maxImportance !== a.c.maxImportance) return b.c.maxImportance - a.c.maxImportance;
+          return a.c.start - b.c.start; // tiebreak: source order
+        });
+
+      const pageStart = Math.min(itemsOffset, allChosenRanked.length);
+      const pageEnd = Math.min(pageStart + maxItems, allChosenRanked.length);
+      const pageIndices = new Set(allChosenRanked.slice(pageStart, pageEnd).map(r => r.idx));
+      const totalChosenItems = allChosenRanked.length;
 
       // Emit chosen clusters in source order so the file reads top-to-bottom.
       let fileSection = '';
       const allSymbols: string[] = [];
       let fileTrimmed = false;
       for (let i = 0; i < clusters.length; i++) {
-        if (!chosenIndices.has(i)) continue;
+        if (!pageIndices.has(i)) continue;
         const cluster = clusters[i]!;
         const section = buildSection(cluster);
         if (fileSection.length > 0) fileSection += GAP_MARKER;
@@ -3249,6 +3325,17 @@ export class ToolHandler {
       lines.push('```' + lang);
       lines.push(fileSection);
       lines.push('```');
+
+      // Per-file pagination hint: guide agents to codegraph_node for specific symbols.
+      // Note: itemsOffset still works but node is more efficient for targeted retrieval.
+      const omittedThisPage = totalChosenItems - pageEnd;
+      // Are there more ranked clusters that could be shown on a future page?
+      const hasMoreRanked = hitMaxItems && rankedClusters.length > chosenIndices.size;
+      if (omittedThisPage > 0 || hasMoreRanked || skippedByCharCap) {
+        lines.push('');
+        lines.push(`[... more code sections in this file. For specific symbols, use codegraph_node(name, includeCode).]`);
+        hasMoreItemsGlobal = true;
+      }
       lines.push('');
 
       totalChars += fileSection.length + 200;
@@ -3259,8 +3346,21 @@ export class ToolHandler {
     if (exploreGaps && exploreGaps.size > 0) {
       lines.push('### Gap Summary');
       lines.push('');
-      lines.push('The following symbols were omitted due to output budget limits. Use `codegraph_explore` with more specific query terms or increase `maxFiles` to include them.');
-      lines.push('');
+      lines.push('The following symbols were omitted due to output budget limits.');
+
+      // Collect all gap symbol names and suggest a ready-to-run codegraph_node call
+      const allGapNames = new Set<string>();
+      for (const gap of exploreGaps.values()) {
+        for (const sym of gap.symbolsInGap) allGapNames.add(sym.name);
+      }
+      if (allGapNames.size > 0) {
+        const nameList = [...allGapNames].slice(0, 20).map(n => `"${n}"`).join(', ');
+        const suffix = allGapNames.size > 20 ? ', ...' : '';
+        lines.push(`To get their complete source, use:`);
+        lines.push(`  codegraph_node(symbols: [${nameList}${suffix}], includeCode)`);
+        lines.push('');
+      }
+
       for (const [file, gap] of exploreGaps) {
         lines.push(`**${file}** — ${gap.totalTopLevelSymbols} total symbols, ${gap.fullyShown} fully shown, ${gap.symbolsInGap.length} in gap:`);
         for (const sym of gap.symbolsInGap.slice(0, 15)) {
@@ -3325,6 +3425,12 @@ export class ToolHandler {
       }
     }
 
+    // Global pagination hint: guide to codegraph_node for targeted retrieval
+    if (hasMoreItemsGlobal) {
+      lines.push('');
+      lines.push(`**More items available.** For omitted symbols, use \`codegraph_node\` with their names and \`includeCode=true\`.`);
+    }
+
     // Hard-cap to the adaptive budget. The per-file loop bounds the source
     // sections, but the relationship map, additional-files list, and
     // completeness/budget notes can still push the assembled output past
@@ -3377,10 +3483,9 @@ export class ToolHandler {
     }
 
     if (includeCode) {
-      // For containers, outline suffices; for leaf symbols, fetch full source
-      if (!outline) {
-        code = await cg.getCode(match.node.id);
-      }
+      // Always fetch source when includeCode is true, even for containers
+      // (outline shows members, source shows the actual implementation)
+      code = await cg.getCode(match.node.id);
     }
 
     const trail = this.formatTrail(cg, match.node);
@@ -3394,19 +3499,31 @@ export class ToolHandler {
    */
   private async handleBatchNode(cg: CodeGraph, symbols: string[], includeCode: boolean): Promise<ToolResult> {
     const batchLimit = Math.min(symbols.length, 20);
-    const allLines: string[] = [`## Batch Node Details (${batchLimit} symbols)`, ''];
+    const header = `## Batch Node Details (${batchLimit} symbols)`;
+    const allLines: string[] = [header, ''];
+    let totalLen = header.length + 2;
+    const BUDGET = MAX_OUTPUT_LENGTH - 500; // leave room for the trailing summary
+    const skippedNames: string[] = [];
 
     for (const symbol of symbols.slice(0, batchLimit)) {
+      // Check remaining budget before processing the next symbol
+      if (totalLen > BUDGET) {
+        skippedNames.push(typeof symbol === 'string' ? symbol : String(symbol));
+        continue;
+      }
+
       const valid = this.validateString(symbol, 'symbols');
       if (typeof valid !== 'string') {
-        allLines.push(`### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`);
-        allLines.push('');
+        const msg = `### \`${String(symbol).slice(0, 80)}\`: ${(valid as ToolResult).content[0]?.text ?? 'invalid'}`;
+        allLines.push(msg, '');
+        totalLen += msg.length + 2;
         continue;
       }
       const match = this.findSymbol(cg, valid);
       if (!match) {
-        allLines.push(`### ${valid}: not found`);
-        allLines.push('');
+        const msg = `### ${valid}: not found`;
+        allLines.push(msg, '');
+        totalLen += msg.length + 2;
         continue;
       }
 
@@ -3416,20 +3533,35 @@ export class ToolHandler {
         outline = this.buildContainerOutline(cg, match.node);
       }
       if (includeCode) {
-        if (!outline) {
-          code = await cg.getCode(match.node.id);
-        }
+        code = await cg.getCode(match.node.id);
       }
 
       const trail = this.formatTrail(cg, match.node);
       const schedule = this.formatSchedule(cg, match.node);
       const formatted = this.formatNodeDetails(match.node, code, outline) + schedule + trail + match.note;
-      allLines.push(formatted);
-      allLines.push('');
+
+      // If this single symbol would push us past the budget, skip it
+      if (totalLen + formatted.length > BUDGET && allLines.length > 2) {
+        skippedNames.push(valid);
+        continue;
+      }
+
+      allLines.push(formatted, '');
+      totalLen += formatted.length + 2;
     }
 
-    allLines.push('---');
-    allLines.push(`Total: ${batchLimit} symbols`);
+    // Also catch symbols that were queued before the budget check triggered
+    // (they were already sliced into skippedNames above)
+
+    if (skippedNames.length > 0) {
+      const nameList = skippedNames.map(n => `"${n}"`).join(', ');
+      allLines.push(`---`);
+      allLines.push(`**${skippedNames.length} symbols not shown** (output budget reached). To get their source, use:`);
+      allLines.push(`  codegraph_node(symbols: [${nameList}], includeCode)`);
+    }
+
+    allLines.push(`---`);
+    allLines.push(`Total: ${batchLimit} symbols${skippedNames.length > 0 ? ` (${batchLimit - skippedNames.length} shown, ${skippedNames.length} deferred)` : ''}`);
     return this.textResult(this.truncateOutput(allLines.join('\n')));
   }
 
@@ -4279,8 +4411,13 @@ export class ToolHandler {
     }
 
     if (outline) {
-      lines.push('', outline, '',
-        `> Structural outline only. Read \`${node.filePath}\` or call codegraph_node on a specific member for its body.`);
+      lines.push('', outline, '');
+      if (code) {
+        const numbered = node.startLine ? numberSourceLines(code, node.startLine) : code;
+        lines.push('```' + node.language, numbered, '```');
+      } else {
+        lines.push(`> Structural outline only. Read \`${node.filePath}\` or call codegraph_node on a specific member for its body.`);
+      }
     } else if (code) {
       // Line-numbered (cat -n style, like codegraph_explore and Read) so the
       // agent can cite/edit exact lines without re-Reading the file for them.
