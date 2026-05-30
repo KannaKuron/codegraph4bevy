@@ -707,6 +707,16 @@ export class ReferenceResolver {
       );
     }
 
+    // Dynamic-edge synthesis — same as resolveAndPersistBatched.
+    // The batched path also runs this, but resolveAndPersist (git fast path
+    // in `sync()`) doesn't, so Bevy registers_system / registers_observer
+    // and other synthesized edges would silently drop on incremental sync.
+    try {
+      result.stats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
+    } catch {
+      // synthesis is additive and optional; ignore failures
+    }
+
     return result;
   }
 
